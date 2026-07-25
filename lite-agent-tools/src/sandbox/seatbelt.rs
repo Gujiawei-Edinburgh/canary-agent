@@ -348,8 +348,10 @@ async fn terminate_child(
     terminate_descendants: bool,
 ) -> SandboxResult<std::process::ExitStatus> {
     if terminate_descendants {
+        #[cfg(not(unix))]
+        let _ = child_pid;
+        #[cfg(unix)]
         if let Some(pid) = child_pid {
-            #[cfg(unix)]
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }

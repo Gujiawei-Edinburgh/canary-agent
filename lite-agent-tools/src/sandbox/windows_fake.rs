@@ -70,7 +70,7 @@ impl SandboxBackend for WindowsFakeBackend {
                     Ok::<_, std::io::Error>((out, err, child.wait().await?))
                 } => {
                     let (out, err, status) = result?;
-                    let code = status.code();
+                    let code = status.code().unwrap_or(-1);
                     (out, err, SandboxStatus::Exited { code })
                 }
             };

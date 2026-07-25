@@ -52,7 +52,7 @@ jobs:
       matrix:
         include:
           - name: macOS Intel
-            os: macos-13
+            os: macos-15-intel
             args: --target x86_64-apple-darwin
             target: x86_64-apple-darwin
             artifact: lite-agent-macos-intel
@@ -81,8 +81,6 @@ jobs:
       - name: Build desktop bundle
         working-directory: lite-agent-desktop
         run: npm run tauri build -- ${{ matrix.args }}
-        env:
-          LITE_AGENT_DDG_API_KEY: ${{ secrets.LITE_AGENT_DDG_API_KEY }}
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:

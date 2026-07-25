@@ -183,6 +183,7 @@ impl Shell {
             Some(path) if path.ends_with("/fish") => Self::Fish,
             #[cfg(windows)]
             _ => Self::PowerShell,
+            #[cfg(not(windows))]
             _ => Self::Sh,
         }
     }
