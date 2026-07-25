@@ -19,6 +19,8 @@ pub struct Thread {
     #[serde(default)]
     pub revision: RevisionToken,
     pub id: ThreadId,
+    #[serde(default)]
+    pub metadata: Value,
     pub turns: Vec<Turn>,
     #[serde(default)]
     pub token_usage: TokenUsage,
@@ -33,6 +35,7 @@ impl Thread {
             schema_version: current_schema_version(),
             revision: RevisionToken::initial(),
             id: id.into(),
+            metadata: Value::Object(serde_json::Map::new()),
             turns: Vec::new(),
             token_usage: TokenUsage::default(),
             created_at: now.clone(),

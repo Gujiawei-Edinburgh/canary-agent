@@ -16,7 +16,8 @@ pub mod sandbox;
 
 pub use exec_command::{
     ApprovalHandling, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
-    ExecRequest, Shell, ThreadExecAuthorizer,
+    ExecRequest, FixedWorkspaceResolver, ResolvedWorkspace, Shell, ThreadExecAuthorizer,
+    WorkspaceResolveRequest, WorkspaceResolver,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +86,7 @@ mod tests {
                 json!({}),
                 FunctionContext {
                     thread_id: "thread".to_string(),
+                    metadata: serde_json::Value::Null,
                     turn_id: "turn".to_string(),
                     call_id: "call".to_string(),
                     projection: ThreadProjection::default(),

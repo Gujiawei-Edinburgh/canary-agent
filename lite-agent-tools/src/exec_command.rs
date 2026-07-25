@@ -23,6 +23,78 @@ pub struct ExecRequest {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkspaceResolveRequest {
+    /// The durable thread identifier. Resolvers may use it as an opaque key
+    /// when deriving a workspace path.
+    pub thread_id: String,
+    /// Application-owned metadata persisted on the thread. The tools crate
+    /// does not interpret or mutate this value.
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedWorkspace {
+    /// Absolute host path used as the command working directory.
+    pub cwd: PathBuf,
+    /// Effective sandbox policy for this invocation. A resolver can derive it
+    /// from the same metadata as the workspace path.
+    pub policy: SandboxPolicy,
+}
+
+impl ResolvedWorkspace {
+    fn validate(&self) -> Result<()> {
+        if !self.cwd.is_absolute() {
+            return Err(AgentError::Function {
+                name: "workspace_resolver".to_string(),
+                message: "resolved workspace cwd must be an absolute host path".to_string(),
+            });
+        }
+        self.policy
+            .validate()
+            .map_err(|error| AgentError::Function {
+                name: "workspace_resolver".to_string(),
+                message: format!("invalid sandbox policy: {error}"),
+            })
+    }
+}
+
+pub trait WorkspaceResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        request: WorkspaceResolveRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ResolvedWorkspace>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedWorkspaceResolver {
+    cwd: PathBuf,
+    policy: SandboxPolicy,
+}
+
+impl FixedWorkspaceResolver {
+    pub fn new(cwd: impl Into<PathBuf>, policy: SandboxPolicy) -> Self {
+        Self {
+            cwd: cwd.into(),
+            policy,
+        }
+    }
+}
+
+impl WorkspaceResolver for FixedWorkspaceResolver {
+    fn resolve<'a>(
+        &'a self,
+        _request: WorkspaceResolveRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ResolvedWorkspace>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(ResolvedWorkspace {
+                cwd: self.cwd.clone(),
+                policy: self.policy.clone(),
+            })
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalHandling {
     Suspend,
@@ -156,10 +228,9 @@ impl Shell {
 
 #[derive(Clone)]
 pub struct ExecCommandConfig {
-    pub cwd: PathBuf,
     pub shell: Shell,
     pub sandbox: Arc<dyn SandboxBackend>,
-    pub policy: SandboxPolicy,
+    pub workspace_resolver: Arc<dyn WorkspaceResolver>,
     pub authorizer: Arc<dyn ExecAuthorizer>,
     pub approval_handling: ApprovalHandling,
     pub environment: BTreeMap<String, String>,
@@ -180,10 +251,9 @@ impl ExecCommandConfig {
             environment.insert("PATH".to_string(), path.to_string_lossy().into_owned());
         }
         Self {
-            cwd: cwd.into(),
             shell: Shell::detect(),
             sandbox,
-            policy,
+            workspace_resolver: Arc::new(FixedWorkspaceResolver::new(cwd, policy)),
             authorizer,
             approval_handling: ApprovalHandling::ReturnToolError,
             environment,
@@ -200,6 +270,14 @@ impl ExecCommandConfig {
 
     pub fn with_shell(mut self, shell: Shell) -> Self {
         self.shell = shell;
+        self
+    }
+
+    pub fn with_workspace_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: WorkspaceResolver + 'static,
+    {
+        self.workspace_resolver = Arc::new(resolver);
         self
     }
 
@@ -279,18 +357,27 @@ impl ExecCommandTool {
             .and_then(Value::as_u64)
             .map(Duration::from_millis)
             .unwrap_or(self.config.default_timeout);
+        let workspace = self
+            .config
+            .workspace_resolver
+            .resolve(WorkspaceResolveRequest {
+                thread_id: context.thread_id.clone(),
+                metadata: context.metadata.clone(),
+            })
+            .await
+            .map_err(|error| tool_error(format!("workspace resolution failed: {error}")))?;
+        workspace
+            .validate()
+            .map_err(|error| tool_error(format!("invalid resolved workspace: {error}")))?;
         let request = ExecRequest {
             command: command.to_string(),
-            cwd: self.config.cwd.clone(),
+            cwd: workspace.cwd,
             shell: self.config.shell,
             timeout,
         };
 
-        let preflight_request = self.sandbox_request(
-            &request,
-            self.config.policy.clone(),
-            CancellationToken::new(),
-        );
+        let preflight_request =
+            self.sandbox_request(&request, workspace.policy.clone(), CancellationToken::new());
         let preflight = self
             .config
             .sandbox
@@ -300,19 +387,15 @@ impl ExecCommandTool {
             let decision = self
                 .config
                 .authorizer
-                .authorize(&request, &self.config.policy, &reason, &context)
+                .authorize(&request, &workspace.policy, &reason, &context)
                 .await
                 .map_err(|error| tool_error(format!("authorization lookup failed: {error}")))?;
             return self
-                .handle_policy_violation(request, reason, decision, &mut context)
+                .handle_policy_violation(request, workspace.policy, reason, decision, &mut context)
                 .await;
         }
         let output = self
-            .run_sandbox(
-                &request,
-                self.config.policy.clone(),
-                &mut context.abort_signal,
-            )
+            .run_sandbox(&request, workspace.policy, &mut context.abort_signal)
             .await?;
         let output = self.limit_output(output);
         if let SandboxStatus::PolicyViolation { reason } = &output.status {
@@ -357,6 +440,7 @@ impl ExecCommandTool {
     async fn handle_policy_violation(
         &self,
         request: ExecRequest,
+        current_policy: SandboxPolicy,
         violation: String,
         decision: AuthorizationDecision,
         context: &mut FunctionContext,
@@ -391,7 +475,7 @@ impl ExecCommandTool {
                 Ok(FunctionExecution::SuspendedBeforeExecution { suspension })
             }
             AuthorizationDecision::Allow { policy } => {
-                if policy == self.config.policy {
+                if policy == current_policy {
                     return Err(tool_error(
                         "authorization allowed the command without changing the sandbox policy, but the same policy already rejected it".to_string(),
                     ));
@@ -491,15 +575,18 @@ fn tool_error(message: String) -> AgentError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorizationDecision, ExecAuthorizer, ExecCommandTool, ExecRequest};
+    use super::{
+        AuthorizationDecision, ExecAuthorizer, ExecCommandTool, ExecRequest, ResolvedWorkspace,
+        WorkspaceResolveRequest, WorkspaceResolver,
+    };
     use crate::sandbox::{
         SandboxBackend, SandboxOutput, SandboxPolicy, SandboxPreflight, SandboxStatus,
     };
     use lite_agent_kernel::projection::ThreadProjection;
     use lite_agent_runtime::{
-        turn_abort_pair, AgentFunction, FunctionContext, FunctionExecution, Result,
+        turn_abort_pair, AgentError, AgentFunction, FunctionContext, FunctionExecution, Result,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -517,6 +604,30 @@ mod tests {
             Box::pin(async {
                 Ok(AuthorizationDecision::Deny {
                     reason: "test".to_string(),
+                })
+            })
+        }
+    }
+
+    struct MetadataWorkspaceResolver;
+
+    impl WorkspaceResolver for MetadataWorkspaceResolver {
+        fn resolve<'a>(
+            &'a self,
+            request: WorkspaceResolveRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ResolvedWorkspace>> + Send + 'a>> {
+            Box::pin(async move {
+                let cwd = request
+                    .metadata
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AgentError::Function {
+                        name: "workspace_resolver".to_string(),
+                        message: format!("missing cwd metadata for {}", request.thread_id),
+                    })?;
+                Ok(ResolvedWorkspace {
+                    cwd: cwd.into(),
+                    policy: SandboxPolicy::default(),
                 })
             })
         }
@@ -586,6 +697,7 @@ mod tests {
         let (_, abort_signal) = turn_abort_pair();
         FunctionContext {
             thread_id: "thread".to_string(),
+            metadata: Value::Null,
             turn_id: "turn".to_string(),
             call_id: "call".to_string(),
             projection: ThreadProjection::default(),
@@ -625,5 +737,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("command denied"));
+    }
+
+    #[tokio::test]
+    async fn resolves_workspace_from_opaque_metadata() {
+        let config = super::ExecCommandConfig::new(
+            "/tmp",
+            Arc::new(FakeBackend { violation: false }),
+            SandboxPolicy::default(),
+            Arc::new(DenyAuthorizer),
+        )
+        .with_workspace_resolver(MetadataWorkspaceResolver);
+        let mut context = context();
+        context.metadata = json!({ "cwd": "/resolved/workspace" });
+        let execution = ExecCommandTool::new(config)
+            .call(json!({"cmd": "pwd"}), context)
+            .await
+            .expect("execution");
+        let FunctionExecution::Completed { output } = execution else {
+            panic!("expected completed")
+        };
+        assert_eq!(output["cwd"], "/resolved/workspace");
     }
 }

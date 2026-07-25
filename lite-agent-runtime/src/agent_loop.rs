@@ -505,6 +505,7 @@ impl Agent {
                     }));
                     let context = FunctionContext {
                         thread_id: thread.id.clone(),
+                        metadata: thread.metadata.clone(),
                         turn_id: pending.turn_id.clone(),
                         call_id: call.call_id.clone(),
                         projection: projection.clone(),
@@ -871,6 +872,7 @@ impl Agent {
                                 Ok(()) => {
                                     let context = FunctionContext {
                                         thread_id: thread.id.clone(),
+                                        metadata: thread.metadata.clone(),
                                         turn_id: turn_id.clone(),
                                         call_id: call_id.clone(),
                                         projection: hook_context.projection.clone(),

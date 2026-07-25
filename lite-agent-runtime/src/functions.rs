@@ -13,6 +13,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct FunctionContext {
     pub thread_id: String,
+    pub metadata: Value,
     pub turn_id: String,
     pub call_id: String,
     pub projection: ThreadProjection,
@@ -392,6 +393,7 @@ mod tests {
                 json!({ "objective": "ship v1", "status": "active" }),
                 FunctionContext {
                     thread_id: "t".to_string(),
+                    metadata: serde_json::Value::Null,
                     turn_id: "turn".to_string(),
                     call_id: "call".to_string(),
                     projection: ThreadProjection::from_thread(&Thread::new("t")),
@@ -419,6 +421,7 @@ mod tests {
                 json!({ "prompt": "Which thread?" }),
                 FunctionContext {
                     thread_id: "t".to_string(),
+                    metadata: serde_json::Value::Null,
                     turn_id: "turn".to_string(),
                     call_id: "call".to_string(),
                     projection: ThreadProjection::from_thread(&Thread::new("t")),
