@@ -10,7 +10,7 @@ use super::{
     SandboxError, SandboxOutput, SandboxPolicy, SandboxPolicyDimension, SandboxPolicyResolution,
     SandboxRequest, SandboxResult, SandboxStatus, SandboxWarning, UnsupportedPolicyBehavior,
 };
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::Read;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -54,17 +54,6 @@ impl SandboxBackend for LinuxNativeBackend {
                 &mut effective,
                 &mut warnings,
                 |effective| effective.filesystem = FilesystemPolicy::Host,
-            )?;
-        }
-
-        if has_denied_filesystem_rule(&effective.filesystem) {
-            unsupported(
-                SandboxPolicyDimension::Filesystem,
-                &policy.filesystem,
-                "Landlock path-deny rules are not enabled in the first Linux launcher",
-                &mut effective,
-                &mut warnings,
-                |effective| soften_denied_filesystem(&mut effective.filesystem),
             )?;
         }
 
@@ -344,36 +333,109 @@ fn unsupported<T>(
     }
 }
 
-fn has_denied_filesystem_rule(policy: &FilesystemPolicy) -> bool {
-    match policy {
-        FilesystemPolicy::Workspace {
-            default_access,
-            rules,
-        } => {
-            *default_access == FilesystemAccess::Denied
-                || rules
-                    .iter()
-                    .any(|rule| rule.access == FilesystemAccess::Denied)
-        }
-        FilesystemPolicy::Isolated | FilesystemPolicy::Host => false,
-    }
+struct PreparedScopedWorkspace {
+    base: std::path::PathBuf,
+    target: std::path::PathBuf,
+    staging: std::path::PathBuf,
+    access: FilesystemAccess,
 }
 
-fn soften_denied_filesystem(policy: &mut FilesystemPolicy) {
-    if let FilesystemPolicy::Workspace {
-        default_access,
-        rules,
+fn prepare_scoped_workspace(
+    policy: &FilesystemPolicy,
+) -> std::io::Result<Option<PreparedScopedWorkspace>> {
+    let FilesystemPolicy::WorkspaceScoped {
+        base,
+        visible,
+        access,
     } = policy
-    {
-        if *default_access == FilesystemAccess::Denied {
-            *default_access = FilesystemAccess::ReadOnly;
-        }
-        for rule in rules {
-            if rule.access == FilesystemAccess::Denied {
-                rule.access = FilesystemAccess::ReadOnly;
-            }
-        }
+    else {
+        return Ok(None);
+    };
+
+    let base = base
+        .canonicalize()
+        .map_err(|error| io_context("resolve scoped workspace base", error))?;
+    let visible = visible
+        .canonicalize()
+        .map_err(|error| io_context("resolve scoped workspace path", error))?;
+    let relative = visible.strip_prefix(&base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "scoped workspace path is outside its base",
+        )
+    })?;
+
+    // A scope equal to its base already has the desired visibility and needs
+    // no staging mount.
+    if relative.as_os_str().is_empty() {
+        return Ok(None);
     }
+
+    let staging = create_staging_directory()?;
+    if let Err(error) = mount(
+        Some(&visible),
+        &staging,
+        None,
+        libc::MS_BIND | libc::MS_REC,
+        None,
+    ) {
+        let _ = std::fs::remove_dir(&staging);
+        return Err(io_context("stage scoped workspace", error));
+    }
+
+    Ok(Some(PreparedScopedWorkspace {
+        target: base.join(relative),
+        base,
+        staging,
+        access: *access,
+    }))
+}
+
+fn create_staging_directory() -> std::io::Result<std::path::PathBuf> {
+    let template = CString::new(format!("/tmp/.lite-agent-workspace-{}-XXXXXX", unsafe {
+        libc::getpid()
+    }))
+    .map_err(invalid_cstring)?;
+    let mut template = template.into_bytes_with_nul();
+    let directory = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    if directory.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let directory = unsafe { CStr::from_ptr(directory) };
+    Ok(std::path::PathBuf::from(
+        directory.to_string_lossy().into_owned(),
+    ))
+}
+
+fn apply_prepared_scoped_workspace(prepared: PreparedScopedWorkspace) -> std::io::Result<()> {
+    let result = (|| {
+        mount(
+            Some(Path::new("tmpfs")),
+            &prepared.base,
+            Some("tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            Some("mode=0755"),
+        )?;
+        std::fs::create_dir_all(&prepared.target)?;
+        mount(
+            Some(&prepared.staging),
+            &prepared.target,
+            None,
+            libc::MS_BIND | libc::MS_REC,
+            None,
+        )?;
+        let remount_flags = match prepared.access {
+            FilesystemAccess::ReadOnly | FilesystemAccess::Denied => {
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY
+            }
+            FilesystemAccess::ReadWrite => libc::MS_BIND | libc::MS_REMOUNT,
+        };
+        mount(None, &prepared.target, None, remount_flags, None)?;
+        Ok(())
+    })();
+    let unmount_result = umount(&prepared.staging);
+    let remove_result = std::fs::remove_dir(&prepared.staging);
+    result.and(unmount_result).and(remove_result)
 }
 
 fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
@@ -407,9 +469,18 @@ fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
         unshare(libc::CLONE_NEWNS).map_err(|error| io_context("create mount namespace", error))?;
         make_mounts_private().map_err(|error| io_context("make mounts private", error))?;
         if isolates_filesystem {
+            let prepared_scoped_workspace = prepare_scoped_workspace(&policy.filesystem)?;
+            if let Some(prepared) = prepared_scoped_workspace {
+                apply_prepared_scoped_workspace(prepared)
+                    .map_err(|error| io_context("apply scoped workspace", error))?;
+            }
             make_root_read_only().map_err(|error| io_context("make root read-only", error))?;
-            apply_filesystem_rules(&policy.filesystem)
-                .map_err(|error| io_context("apply filesystem rules", error))?;
+            if matches!(&policy.filesystem, FilesystemPolicy::WorkspaceScoped { base, visible, .. } if base == visible)
+                || matches!(&policy.filesystem, FilesystemPolicy::Isolated)
+            {
+                apply_filesystem_rules(&policy.filesystem)
+                    .map_err(|error| io_context("apply filesystem rules", error))?;
+            }
         }
         if isolates_processes {
             mount_private_procfs().map_err(|error| io_context("mount private procfs", error))?;
@@ -603,31 +674,39 @@ fn make_root_read_only() -> std::io::Result<()> {
 }
 
 fn apply_filesystem_rules(policy: &FilesystemPolicy) -> std::io::Result<()> {
-    let FilesystemPolicy::Workspace { rules, .. } = policy else {
+    let FilesystemPolicy::WorkspaceScoped {
+        base,
+        visible,
+        access,
+    } = policy
+    else {
         return Ok(());
     };
-    let mut rules = rules.clone();
-    rules.sort_by_key(|rule| rule.path.components().count());
-    for rule in rules {
-        let path = rule
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| rule.path.clone());
-        mount(
-            Some(path.as_path()),
-            path.as_path(),
-            None,
-            libc::MS_BIND | libc::MS_REC,
-            None,
-        )?;
-        let remount_flags = match rule.access {
-            FilesystemAccess::ReadOnly => libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-            FilesystemAccess::ReadWrite => libc::MS_BIND | libc::MS_REMOUNT,
-            FilesystemAccess::Denied => libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-        };
-        mount(None, path.as_path(), None, remount_flags, None)?;
+    let base = base.canonicalize().unwrap_or_else(|_| base.clone());
+    let visible = visible.canonicalize().unwrap_or_else(|_| visible.clone());
+    if base != visible {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nested scoped workspace requires a prepared mount",
+        ));
     }
+    mount(Some(&base), &base, None, libc::MS_BIND | libc::MS_REC, None)?;
+    let remount_flags = match access {
+        FilesystemAccess::ReadOnly | FilesystemAccess::Denied => {
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY
+        }
+        FilesystemAccess::ReadWrite => libc::MS_BIND | libc::MS_REMOUNT,
+    };
+    mount(None, &base, None, remount_flags, None)?;
     Ok(())
+}
+
+fn umount(path: &Path) -> std::io::Result<()> {
+    if unsafe { libc::umount2(path_to_cstring(path)?.as_ptr(), libc::MNT_DETACH) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn mount(
@@ -785,7 +864,7 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CancellationToken, FilesystemRule, ProcessPolicy};
+    use super::super::{CancellationToken, FilesystemAccess, ProcessPolicy};
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -865,6 +944,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_workspace_hides_sibling_paths() {
+        let base = tempfile::tempdir().expect("workspace base");
+        let visible = base.path().join("user-a/thread-a");
+        let sibling = base.path().join("user-a/thread-b");
+        std::fs::create_dir_all(&visible).expect("visible workspace");
+        std::fs::create_dir_all(&sibling).expect("sibling workspace");
+        std::fs::write(visible.join("visible.txt"), "visible").expect("visible file");
+        std::fs::write(sibling.join("secret.txt"), "secret").expect("sibling file");
+
+        let policy =
+            SandboxPolicy::workspace_scoped(base.path(), &visible, FilesystemAccess::ReadWrite)
+                .expect("scoped policy");
+        let command = format!(
+            "printf 'cwd='; pwd; printf '\\nbase='; ls -ld '{}'; printf 'visible_file='; if test -f '{}'; then printf present; else printf missing; fi; printf '\\nsibling_file='; if test -e '{}'; then printf present; else printf hidden; fi; printf '\\nbase_entries=\\n'; ls -la '{}'; printf 'visible_entries=\\n'; ls -la '{}'; test -f '{}' && test ! -e '{}'",
+            base.path().display(),
+            visible.join("visible.txt").display(),
+            sibling.join("secret.txt").display(),
+            base.path().display(),
+            visible.display(),
+            visible.join("visible.txt").display(),
+            sibling.join("secret.txt").display()
+        );
+        let output = run_shell(policy, &visible, command, CancellationToken::default())
+            .await
+            .expect("sandbox execution");
+
+        assert_eq!(
+            output.status,
+            SandboxStatus::Exited { code: 0 },
+            "scoped workspace diagnostic: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
     async fn enforces_workspace_write_boundary() {
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::tempdir().expect("outside");
@@ -915,53 +1030,6 @@ mod tests {
         .expect("sandbox execution");
 
         assert!(!file.exists(), "read-only workspace accepted a write");
-        assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
-    }
-
-    #[tokio::test]
-    async fn filesystem_rules_use_longest_matching_path() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let child = workspace.path().join("child");
-        std::fs::create_dir(&child).expect("child directory");
-
-        let parent_file = workspace.path().join("parent.txt");
-        let child_file = child.join("child.txt");
-        let policy = SandboxPolicy {
-            filesystem: PolicySetting::strict(FilesystemPolicy::Workspace {
-                default_access: FilesystemAccess::ReadOnly,
-                rules: vec![
-                    FilesystemRule {
-                        path: workspace.path().to_path_buf(),
-                        access: FilesystemAccess::ReadWrite,
-                    },
-                    FilesystemRule {
-                        path: child.clone(),
-                        access: FilesystemAccess::ReadOnly,
-                    },
-                ],
-            }),
-            ..SandboxPolicy::default()
-        };
-        let command = format!(
-            "printf parent > '{}'; parent_status=$?; printf child > '{}'; child_status=$?; test $parent_status -eq 0 -a $child_status -ne 0",
-            parent_file.display(),
-            child_file.display()
-        );
-
-        let output = run_shell(
-            policy,
-            workspace.path(),
-            command,
-            CancellationToken::default(),
-        )
-        .await
-        .expect("sandbox execution");
-
-        assert!(parent_file.exists(), "parent read-write rule was ignored");
-        assert!(
-            !child_file.exists(),
-            "more specific read-only rule was ignored"
-        );
         assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
     }
 

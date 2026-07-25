@@ -180,6 +180,19 @@ impl SandboxPolicy {
         }
     }
 
+    pub fn workspace_scoped(
+        base: impl Into<PathBuf>,
+        visible: impl Into<PathBuf>,
+        access: FilesystemAccess,
+    ) -> SandboxResult<Self> {
+        Ok(Self {
+            filesystem: PolicySetting::strict(FilesystemPolicy::workspace_scoped(
+                base, visible, access,
+            )?),
+            ..Self::default()
+        })
+    }
+
     pub fn validate(&self) -> SandboxResult<()> {
         self.filesystem.requested.validate()
     }
@@ -263,12 +276,12 @@ pub enum FilesystemPolicy {
     /// the command.
     #[default]
     Isolated,
-    /// The host filesystem is visible with hierarchical access rules. The
-    /// longest matching rule wins; paths without a matching rule inherit the
-    /// default access.
-    Workspace {
-        default_access: FilesystemAccess,
-        rules: Vec<FilesystemRule>,
+    /// Expose only one subtree of a managed workspace. Paths outside the
+    /// base remain read-only, while sibling paths below the base are hidden.
+    WorkspaceScoped {
+        base: PathBuf,
+        visible: PathBuf,
+        access: FilesystemAccess,
     },
     /// The command can access the host filesystem without filesystem
     /// isolation. This must be selected explicitly.
@@ -277,13 +290,33 @@ pub enum FilesystemPolicy {
 
 impl FilesystemPolicy {
     pub fn workspace(host_path: impl Into<PathBuf>, access: FilesystemAccess) -> Self {
-        Self::Workspace {
-            default_access: FilesystemAccess::ReadOnly,
-            rules: vec![FilesystemRule {
-                path: host_path.into(),
-                access,
-            }],
+        let host_path = host_path.into();
+        Self::WorkspaceScoped {
+            base: host_path.clone(),
+            visible: host_path,
+            access,
         }
+    }
+
+    pub fn workspace_scoped(
+        base: impl Into<PathBuf>,
+        visible: impl Into<PathBuf>,
+        access: FilesystemAccess,
+    ) -> SandboxResult<Self> {
+        let base = normalize_absolute_path(&base.into())?;
+        let visible = normalize_absolute_path(&visible.into())?;
+        if !visible.starts_with(&base) {
+            return Err(SandboxError::InvalidRequest(format!(
+                "visible workspace path {} must be inside base path {}",
+                visible.display(),
+                base.display()
+            )));
+        }
+        Ok(Self::WorkspaceScoped {
+            base,
+            visible,
+            access,
+        })
     }
 
     /// Resolve the effective access for an absolute path using longest-prefix
@@ -293,50 +326,44 @@ impl FilesystemPolicy {
         match self {
             Self::Isolated => Ok(FilesystemAccess::Denied),
             Self::Host => Ok(FilesystemAccess::ReadWrite),
-            Self::Workspace {
-                default_access,
-                rules,
+            Self::WorkspaceScoped {
+                base,
+                visible,
+                access,
             } => {
                 self.validate()?;
-                Ok(rules
-                    .iter()
-                    .filter_map(|rule| {
-                        normalize_absolute_path(&rule.path)
-                            .ok()
-                            .filter(|rule_path| path.starts_with(rule_path))
-                            .map(|rule_path| (rule_path.components().count(), rule.access))
-                    })
-                    .max_by_key(|(depth, _)| *depth)
-                    .map(|(_, access)| access)
-                    .unwrap_or(*default_access))
+                if path.starts_with(visible) {
+                    Ok(*access)
+                } else if path.starts_with(base) {
+                    Ok(FilesystemAccess::Denied)
+                } else {
+                    Ok(FilesystemAccess::ReadOnly)
+                }
             }
         }
     }
 
     fn validate(&self) -> SandboxResult<()> {
-        let rules = match self {
-            Self::Workspace { rules, .. } => rules,
-            Self::Isolated | Self::Host => return Ok(()),
-        };
-
-        let mut normalized_paths = std::collections::BTreeSet::new();
-        for rule in rules {
-            let normalized = normalize_absolute_path(&rule.path)?;
-            if !normalized_paths.insert(normalized.clone()) {
-                return Err(SandboxError::InvalidRequest(format!(
-                    "duplicate filesystem rule: {}",
-                    normalized.display()
-                )));
+        match self {
+            Self::WorkspaceScoped {
+                base,
+                visible,
+                access: _,
+            } => {
+                let base = normalize_absolute_path(base)?;
+                let visible = normalize_absolute_path(visible)?;
+                if !visible.starts_with(&base) {
+                    return Err(SandboxError::InvalidRequest(format!(
+                        "visible workspace path {} must be inside base path {}",
+                        visible.display(),
+                        base.display()
+                    )));
+                }
             }
+            Self::Isolated | Self::Host => {}
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilesystemRule {
-    pub path: PathBuf,
-    pub access: FilesystemAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,79 +402,33 @@ fn normalize_absolute_path(path: &std::path::Path) -> SandboxResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemAccess, FilesystemPolicy, FilesystemRule};
+    use super::{FilesystemAccess, FilesystemPolicy};
 
     #[test]
-    fn filesystem_rules_use_longest_matching_path() {
-        let policy = FilesystemPolicy::Workspace {
-            default_access: FilesystemAccess::Denied,
-            rules: vec![
-                FilesystemRule {
-                    path: "/project".into(),
-                    access: FilesystemAccess::ReadWrite,
-                },
-                FilesystemRule {
-                    path: "/project/src".into(),
-                    access: FilesystemAccess::ReadOnly,
-                },
-                FilesystemRule {
-                    path: "/project/src/generated".into(),
-                    access: FilesystemAccess::ReadWrite,
-                },
-            ],
-        };
+    fn scoped_workspace_resolves_visibility_by_path() {
+        let policy = FilesystemPolicy::workspace_scoped(
+            "/workspace",
+            "/workspace/user-a/thread-a",
+            FilesystemAccess::ReadWrite,
+        )
+        .expect("valid scoped workspace");
 
         assert_eq!(
-            policy.access_for("/project/main.rs").unwrap(),
+            policy
+                .access_for("/workspace/user-a/thread-a/file")
+                .unwrap(),
             FilesystemAccess::ReadWrite
         );
         assert_eq!(
-            policy.access_for("/project/src/main.rs").unwrap(),
+            policy
+                .access_for("/workspace/user-a/thread-b/file")
+                .unwrap(),
+            FilesystemAccess::Denied
+        );
+        assert_eq!(
+            policy.access_for("/etc/hosts").unwrap(),
             FilesystemAccess::ReadOnly
         );
-        assert_eq!(
-            policy.access_for("/project/src/generated/file.rs").unwrap(),
-            FilesystemAccess::ReadWrite
-        );
-        assert_eq!(
-            policy.access_for("/project-other/file").unwrap(),
-            FilesystemAccess::Denied
-        );
-    }
-
-    #[test]
-    fn filesystem_rules_match_path_components_not_string_prefixes() {
-        let policy = FilesystemPolicy::Workspace {
-            default_access: FilesystemAccess::Denied,
-            rules: vec![FilesystemRule {
-                path: "/project/src".into(),
-                access: FilesystemAccess::ReadWrite,
-            }],
-        };
-
-        assert_eq!(
-            policy.access_for("/project/src-old/file").unwrap(),
-            FilesystemAccess::Denied
-        );
-    }
-
-    #[test]
-    fn filesystem_rules_reject_duplicate_normalized_paths() {
-        let policy = FilesystemPolicy::Workspace {
-            default_access: FilesystemAccess::Denied,
-            rules: vec![
-                FilesystemRule {
-                    path: "/project/src".into(),
-                    access: FilesystemAccess::ReadOnly,
-                },
-                FilesystemRule {
-                    path: "/project/./src".into(),
-                    access: FilesystemAccess::ReadWrite,
-                },
-            ],
-        };
-
-        assert!(policy.validate().is_err());
     }
 }
 

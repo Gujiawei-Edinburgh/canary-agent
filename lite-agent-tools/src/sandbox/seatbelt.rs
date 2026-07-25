@@ -277,24 +277,22 @@ fn render_profile(policy: &EffectiveSandboxPolicy) -> SandboxResult<String> {
 
     match &policy.filesystem {
         FilesystemPolicy::Host => {}
-        FilesystemPolicy::Workspace { rules, .. } => {
-            profile.push_str("(deny file-write*)\n");
-            let mut rules = rules.clone();
-            rules.sort_by_key(|rule| rule.path.components().count());
-            for rule in rules {
-                let path = canonical_existing_path(&rule.path);
-                let path = escape_profile_path(&path)?;
-                match rule.access {
-                    super::FilesystemAccess::ReadWrite => profile.push_str(&format!(
-                        "(allow file-write* (subpath \"{path}\"))\n"
-                    )),
-                    super::FilesystemAccess::ReadOnly => profile.push_str(&format!(
-                        "(deny file-write* (subpath \"{path}\"))\n"
-                    )),
-                    super::FilesystemAccess::Denied => profile.push_str(&format!(
-                        "(deny file-read* (subpath \"{path}\"))\n(deny file-write* (subpath \"{path}\"))\n"
-                    )),
+        FilesystemPolicy::WorkspaceScoped {
+            base,
+            visible,
+            access,
+        } => {
+            let base = escape_profile_path(&canonical_existing_path(base))?;
+            let visible = escape_profile_path(&canonical_existing_path(visible))?;
+            profile.push_str(&format!(
+                "(deny file-read* (subpath \"{base}\"))\n(deny file-write* (subpath \"{base}\"))\n"
+            ));
+            profile.push_str(&format!("(allow file-read* (subpath \"{visible}\"))\n"));
+            match access {
+                super::FilesystemAccess::ReadWrite => {
+                    profile.push_str(&format!("(allow file-write* (subpath \"{visible}\"))\n"))
                 }
+                super::FilesystemAccess::ReadOnly | super::FilesystemAccess::Denied => {}
             }
         }
         FilesystemPolicy::Isolated => {
@@ -389,7 +387,7 @@ mod tests {
             identity: IdentityIsolation::Host,
         };
         let profile = render_profile(&policy).expect("profile");
-        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(deny file-write* (subpath \"/tmp/workspace\"))"));
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("(allow file-write* (subpath \"/tmp/workspace\"))"));
     }
@@ -405,6 +403,29 @@ mod tests {
         let profile = render_profile(&policy).expect("profile");
         assert!(profile.contains("(allow file-write* (subpath \"/tmp/workspace\"))"));
         assert!(!profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn renders_scoped_workspace_visibility_profile() {
+        let policy = EffectiveSandboxPolicy {
+            filesystem: FilesystemPolicy::workspace_scoped(
+                "/tmp/workspaces",
+                "/tmp/workspaces/user-a/thread-a",
+                FilesystemAccess::ReadWrite,
+            )
+            .expect("scoped policy"),
+            network: NetworkAccess::Denied,
+            process: ProcessPolicy::default(),
+            identity: IdentityIsolation::Host,
+        };
+        let profile = render_profile(&policy).expect("profile");
+        assert!(profile.contains("(deny file-read* (subpath \"/tmp/workspaces\"))"));
+        assert!(
+            profile.contains("(allow file-read* (subpath \"/tmp/workspaces/user-a/thread-a\"))")
+        );
+        assert!(
+            profile.contains("(allow file-write* (subpath \"/tmp/workspaces/user-a/thread-a\"))")
+        );
     }
 
     #[test]
