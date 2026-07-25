@@ -20,7 +20,7 @@ pub use exec_command::{
     ExecRequest, FixedWorkspaceResolver, ResolvedWorkspace, Shell, ThreadExecAuthorizer,
     WorkspaceResolveRequest, WorkspaceResolver,
 };
-pub use web_search::{DuckDuckGoSearch, WebSearchConfig};
+pub use web_search::{BaiduSearchConfig, BaiduWebSearch};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GetCurrentTime;
@@ -61,8 +61,8 @@ pub fn register_time_tools(registry: &mut FunctionRegistry) {
     registry.register(GetCurrentTime);
 }
 
-pub fn register_web_search(registry: &mut FunctionRegistry, config: WebSearchConfig) {
-    registry.register(DuckDuckGoSearch::new(config));
+pub fn register_web_search(registry: &mut FunctionRegistry, config: BaiduSearchConfig) {
+    registry.register(BaiduWebSearch::new(config));
 }
 
 #[cfg(test)]

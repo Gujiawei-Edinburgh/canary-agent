@@ -1,1 +1,1 @@
-{"scripts":{"dev":"vite --host 0.0.0.0","build":"tsc && vite build","tauri":"tauri"},"devDependencies":{"@tauri-apps/api":"^2","@tauri-apps/cli":"^2","typescript":"^5","vite":"^6"},"dependencies":{}}
+{"scripts":{"dev":"vite --host 0.0.0.0","build":"tsc && vite build","tauri":"tauri"},"devDependencies":{"@tauri-apps/api":"^2","@tauri-apps/cli":"^2","typescript":"^5","vite":"^6"},"dependencies":{"dompurify":"^3.4.12","highlight.js":"^11.11.1","katex":"^0.17.0","marked":"^18.0.7","marked-highlight":"^2.2.4","marked-katex-extension":"^5.1.10","mermaid":"^11.16.0"}}

@@ -5,31 +5,35 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+const TOOL_NAME: &str = "web_search";
+
 #[derive(Debug, Clone)]
-pub struct WebSearchConfig {
+pub struct BaiduSearchConfig {
     pub endpoint: String,
+    pub api_key: String,
     pub max_results: usize,
     pub timeout: Duration,
 }
 
-impl Default for WebSearchConfig {
+impl Default for BaiduSearchConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://api.duckduckgo.com/".to_string(),
+            endpoint: "https://qianfan.baidubce.com/v2/ai_search/web_search".to_string(),
+            api_key: String::new(),
             max_results: 8,
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(20),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct DuckDuckGoSearch {
-    config: WebSearchConfig,
+pub struct BaiduWebSearch {
+    config: BaiduSearchConfig,
     client: reqwest::Client,
 }
 
-impl DuckDuckGoSearch {
-    pub fn new(config: WebSearchConfig) -> Self {
+impl BaiduWebSearch {
+    pub fn new(config: BaiduSearchConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .user_agent("lite-agent-desktop/0.1")
@@ -40,30 +44,104 @@ impl DuckDuckGoSearch {
 }
 
 #[derive(Debug, Deserialize)]
-struct DdgResponse {
-    #[serde(rename = "Heading")]
-    heading: String,
-    #[serde(rename = "AbstractText")]
-    abstract_text: String,
-    #[serde(rename = "AbstractURL")]
-    abstract_url: String,
-    #[serde(rename = "RelatedTopics", default)]
-    related_topics: Vec<RelatedTopic>,
-}
-#[derive(Debug, Deserialize)]
-struct RelatedTopic {
-    #[serde(rename = "Text", default)]
-    text: String,
-    #[serde(rename = "FirstURL", default)]
-    url: String,
+struct BaiduResponse {
+    #[serde(default)]
+    code: Option<Value>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    references: Vec<BaiduReference>,
 }
 
-impl AgentFunction for DuckDuckGoSearch {
+#[derive(Debug, Deserialize)]
+struct BaiduReference {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    snippet: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    website: String,
+    #[serde(default)]
+    web_anchor: String,
+    #[serde(rename = "type", default)]
+    resource_type: String,
+}
+
+fn api_error(response: &BaiduResponse) -> Option<String> {
+    let code = response.code.as_ref()?;
+    let successful = match code {
+        Value::Null => true,
+        Value::Number(number) => number.as_i64() == Some(0),
+        Value::String(value) => {
+            value.is_empty() || value == "0" || value.eq_ignore_ascii_case("success")
+        }
+        _ => false,
+    };
+    if successful {
+        None
+    } else {
+        Some(format!(
+            "千帆百度搜索返回错误 {code}: {}",
+            response.message.as_deref().unwrap_or("未知错误")
+        ))
+    }
+}
+
+fn normalized_results(response: BaiduResponse, max_results: usize) -> Vec<Value> {
+    response
+        .references
+        .into_iter()
+        .filter(|reference| reference.resource_type.is_empty() || reference.resource_type == "web")
+        .filter(|reference| !reference.url.trim().is_empty())
+        .take(max_results)
+        .map(|reference| {
+            let title = [
+                reference.title,
+                reference.web_anchor,
+                reference.website.clone(),
+            ]
+            .into_iter()
+            .find(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| reference.url.clone());
+            let snippet = if reference.snippet.trim().is_empty() {
+                reference.content
+            } else {
+                reference.snippet
+            };
+            json!({
+                "title": title,
+                "url": reference.url,
+                "snippet": snippet,
+                "date": reference.date,
+                "source": reference.website,
+            })
+        })
+        .collect()
+}
+
+impl AgentFunction for BaiduWebSearch {
     fn spec(&self) -> FunctionSpec {
         FunctionSpec {
-            name: "web_search".into(),
-            description: "使用 DuckDuckGo 搜索公开网页；需要最新信息时使用。".into(),
-            parameters: json!({"type":"object","required":["query"],"properties":{"query":{"type":"string"}},"additionalProperties":false}),
+            name: TOOL_NAME.into(),
+            description: "使用千帆百度搜索查询公开网页和实时信息，返回网页标题、链接、摘要和日期。"
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "简洁的搜索关键词或问题"
+                    }
+                },
+                "additionalProperties": false
+            }),
         }
     }
 
@@ -76,45 +154,108 @@ impl AgentFunction for DuckDuckGoSearch {
             let query = args
                 .get("query")
                 .and_then(Value::as_str)
-                .filter(|q| !q.trim().is_empty())
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
                 .ok_or_else(
                     || lite_agent_runtime::AgentError::InvalidFunctionArguments {
-                        name: "web_search".into(),
+                        name: TOOL_NAME.into(),
                         message: "query 必须是非空字符串".into(),
                     },
                 )?;
-            let response: DdgResponse = self
+            let api_key = self.config.api_key.trim();
+            if api_key.is_empty() {
+                return Err(lite_agent_runtime::AgentError::Function {
+                    name: TOOL_NAME.into(),
+                    message: "尚未配置千帆 API Key，请先打开桌面应用设置并填写千帆配置".into(),
+                });
+            }
+
+            let response = self
                 .client
-                .get(&self.config.endpoint)
-                .query(&[
-                    ("q", query),
-                    ("format", "json"),
-                    ("no_html", "1"),
-                    ("skip_disambig", "1"),
-                ])
+                .post(&self.config.endpoint)
+                .bearer_auth(api_key)
+                .json(&json!({
+                    "messages": [{"role": "user", "content": query}],
+                    "search_source": "baidu_search_v2",
+                    "resource_type_filter": [{"type": "web", "top_k": self.config.max_results}],
+                    "sort": {"priority": "auto"}
+                }))
                 .send()
                 .await
-                .map_err(|e| lite_agent_runtime::AgentError::Http(e.to_string()))?
-                .error_for_status()
-                .map_err(|e| lite_agent_runtime::AgentError::Http(e.to_string()))?
-                .json()
+                .map_err(|error| lite_agent_runtime::AgentError::Http(error.to_string()))?;
+            let status = response.status();
+            let body = response
+                .text()
                 .await
-                .map_err(|e| lite_agent_runtime::AgentError::Http(e.to_string()))?;
-            let mut results = Vec::new();
-            if !response.abstract_text.is_empty() {
-                results.push(json!({"title": response.heading, "url": response.abstract_url, "snippet": response.abstract_text}));
+                .map_err(|error| lite_agent_runtime::AgentError::Http(error.to_string()))?;
+            if !status.is_success() {
+                let detail = body.chars().take(500).collect::<String>();
+                return Err(lite_agent_runtime::AgentError::Http(format!(
+                    "千帆百度搜索请求失败（HTTP {status}）：{detail}"
+                )));
             }
-            results.extend(
-                response
-                    .related_topics
-                    .into_iter()
-                    .filter(|x| !x.text.is_empty())
-                    .take(self.config.max_results)
-                    .map(|x| json!({"title": x.text, "url": x.url})),
-            );
+            let response: BaiduResponse = serde_json::from_str(&body).map_err(|error| {
+                lite_agent_runtime::AgentError::Http(format!("千帆百度搜索响应解析失败：{error}"))
+            })?;
+            if let Some(message) = api_error(&response) {
+                return Err(lite_agent_runtime::AgentError::Function {
+                    name: TOOL_NAME.into(),
+                    message,
+                });
+            }
+            let results = normalized_results(response, self.config.max_results);
             Ok(FunctionExecution::Completed {
-                output: json!({"provider":"DuckDuckGo","query":query,"results":results,"note":"结果来自 DuckDuckGo Instant Answer API，可能不覆盖所有网页。"}),
+                output: json!({
+                    "provider": "百度千帆",
+                    "query": query,
+                    "results": results,
+                }),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{api_error, normalized_results, BaiduResponse, BaiduSearchConfig, BaiduWebSearch};
+    use lite_agent_runtime::AgentFunction;
+
+    #[test]
+    fn exposes_baidu_search_tool() {
+        let tool = BaiduWebSearch::new(BaiduSearchConfig::default());
+        let spec = tool.spec();
+        assert_eq!(spec.name, "web_search");
+        assert!(spec.description.contains("百度"));
+        assert_eq!(spec.parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn normalizes_web_references_and_ignores_other_media() {
+        let response: BaiduResponse = serde_json::from_value(serde_json::json!({
+            "references": [
+                {"title":"结果一","url":"https://example.com/1","snippet":"摘要一","date":"2026-07-25","website":"示例站点","type":"web"},
+                {"title":"图片","url":"https://example.com/image","type":"image"},
+                {"title":"结果二","url":"https://example.com/2","content":"摘要二","type":"web"}
+            ]
+        }))
+        .expect("valid response");
+
+        let results = normalized_results(response, 8);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["title"], "结果一");
+        assert_eq!(results[0]["snippet"], "摘要一");
+        assert_eq!(results[1]["snippet"], "摘要二");
+    }
+
+    #[test]
+    fn surfaces_api_errors_returned_with_successful_http_status() {
+        let response: BaiduResponse = serde_json::from_value(serde_json::json!({
+            "code": "invalid_api_key",
+            "message": "API key is invalid"
+        }))
+        .expect("valid response");
+        assert!(api_error(&response)
+            .expect("API error")
+            .contains("invalid_api_key"));
     }
 }

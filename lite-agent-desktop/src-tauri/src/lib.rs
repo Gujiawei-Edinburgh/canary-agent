@@ -2,13 +2,13 @@ use lite_agent_kernel::events::{new_id, Thread};
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
 use lite_agent_runtime::{
     builtin_registry, Agent, AgentConfig, FunctionContext, LocalSessionCoordinator, Result,
-    ThreadStore,
+    RuntimeEvent, ThreadStore, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
 use lite_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
 use lite_agent_tools::{
-    register_time_tools, register_web_search, AuthorizationDecision, ExecAuthorizer,
-    ExecCommandConfig, ExecCommandTool, WebSearchConfig,
+    register_time_tools, register_web_search, AuthorizationDecision, BaiduSearchConfig,
+    ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,10 +19,12 @@ use std::{
 use tauri::{Emitter, Manager, State};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DesktopConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    pub qianfan_api_key: String,
     pub workspace: String,
 }
 
@@ -37,13 +39,7 @@ struct Runtime {
 }
 
 fn error(message: impl ToString) -> tauri::Error {
-    tauri::Error::Setup(
-        (Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            message.to_string(),
-        )) as Box<dyn std::error::Error>)
-            .into(),
-    )
+    tauri::Error::Io(std::io::Error::other(message.to_string()))
 }
 
 fn config_path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
@@ -134,6 +130,17 @@ fn backend() -> Arc<dyn SandboxBackend> {
     Arc::new(lite_agent_tools::sandbox::MacOsSeatbeltBackend::new())
 }
 fn build_runtime(c: &DesktopConfig, dir: PathBuf) -> tauri::Result<Runtime> {
+    let workspace = if c.workspace.trim().is_empty() {
+        std::env::current_dir().map_err(error)?
+    } else {
+        PathBuf::from(&c.workspace)
+    };
+    if !workspace.exists() {
+        std::fs::create_dir_all(&workspace)
+            .map_err(|e| error(format!("创建 workspace {} 失败: {e}", workspace.display())))?;
+    }
+    std::fs::create_dir_all(dir.join("threads"))
+        .map_err(|e| error(format!("创建会话目录失败: {e}")))?;
     let store = Arc::new(JsonFileThreadStore::open(&dir).map_err(error)?);
     let model = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: c.base_url.clone(),
@@ -143,16 +150,22 @@ fn build_runtime(c: &DesktopConfig, dir: PathBuf) -> tauri::Result<Runtime> {
     }));
     let mut reg = builtin_registry();
     register_time_tools(&mut reg);
-    register_web_search(&mut reg, WebSearchConfig::default());
+    register_web_search(
+        &mut reg,
+        BaiduSearchConfig {
+            api_key: c.qianfan_api_key.clone(),
+            ..BaiduSearchConfig::default()
+        },
+    );
     reg.register(ExecCommandTool::new(
         ExecCommandConfig::new(
-            PathBuf::from(&c.workspace),
+            workspace.clone(),
             backend(),
-            SandboxPolicy::workspace_read_write_with_host_network(&c.workspace),
+            SandboxPolicy::workspace_read_write_with_host_network(&workspace),
             Arc::new(DenyAuthorizer),
         )
         .with_workspace_resolver(WorkspaceResolver {
-            fallback: PathBuf::from(&c.workspace),
+            fallback: workspace,
         }),
     ));
     let agent=Agent::new(AgentConfig{system_prompt:"你是 lite-agent，使用中文回答。需要执行命令时使用 exec_command，需要查询公开网页时使用 web_search，需要当前时间时使用 get_current_time。".into(),..AgentConfig::default()},store.clone(),model,reg,Arc::new(LocalSessionCoordinator::default()));
@@ -165,7 +178,12 @@ fn build_runtime(c: &DesktopConfig, dir: PathBuf) -> tauri::Result<Runtime> {
 
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> DesktopConfig {
-    state.config.lock().unwrap().clone()
+    let config = state.config.lock().unwrap().clone();
+    if state.runtime.lock().unwrap().is_none() {
+        DesktopConfig::default()
+    } else {
+        config
+    }
 }
 #[tauri::command]
 fn save_config(
@@ -175,6 +193,8 @@ fn save_config(
 ) -> tauri::Result<()> {
     persist_config(&app, &config)?;
     let dir = state_dir(&app)?;
+    let previous_runtime = state.runtime.lock().unwrap().take();
+    drop(previous_runtime);
     let rt = build_runtime(&config, dir)?;
     *state.config.lock().unwrap() = config;
     *state.runtime.lock().unwrap() = Some(rt);
@@ -193,7 +213,11 @@ async fn list_threads(state: State<'_, AppState>) -> tauri::Result<Vec<Thread>> 
     };
     let dir = rt.1.join("threads");
     let mut out = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir).await.map_err(error)?;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     while let Some(e) = entries.next_entry().await.map_err(error)? {
         if e.path().extension().and_then(|x| x.to_str()) == Some("json") {
             if let Ok(raw) = tokio::fs::read_to_string(e.path()).await {
@@ -243,22 +267,100 @@ async fn run_turn(
         .ok_or_else(|| error("请先完成设置"))?;
     agent
         .run_turn_stream(&thread_id, user_text, move |event| {
-            let message = format!("{event:?}");
-            let _ = app.emit("turn-event", json!({"kind":"runtime","message":message}));
+            let _ = app.emit("turn-event", desktop_turn_event(event));
         })
         .await
         .map(|_| ())
         .map_err(error)
 }
+
+#[tauri::command]
+fn abort_turn(state: State<'_, AppState>, thread_id: String) -> tauri::Result<()> {
+    let agent = state
+        .runtime
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|runtime| runtime.agent.clone())
+        .ok_or_else(|| error("请先完成设置"))?;
+    agent.abort(&thread_id).map_err(error)
+}
+
+fn desktop_turn_event(event: TurnStreamEvent) -> Value {
+    match event {
+        TurnStreamEvent::Model(model) => match model {
+            TurnModelEvent::RequestStarted { iteration } => {
+                json!({"type":"model_iteration_started","iteration":iteration})
+            }
+            TurnModelEvent::AssistantMessage { text } => {
+                json!({"type":"assistant_message","text":text})
+            }
+            TurnModelEvent::AssistantDelta { text } => {
+                json!({"type":"assistant_delta","text":text})
+            }
+        },
+        TurnStreamEvent::State(state) => desktop_state_event(state),
+        TurnStreamEvent::Runtime(RuntimeEvent {
+            source,
+            message,
+            metadata,
+        }) => json!({"type":"runtime","source":source,"message":message,"metadata":metadata}),
+    }
+}
+
+fn desktop_state_event(event: TurnStateEvent) -> Value {
+    match event {
+        TurnStateEvent::TurnStarted { thread_id, turn_id } => {
+            json!({"type":"turn_started","thread_id":thread_id,"turn_id":turn_id})
+        }
+        TurnStateEvent::FunctionCallsRequested { calls } => {
+            json!({"type":"tool_calls_requested","calls":calls})
+        }
+        TurnStateEvent::FunctionStarted { call_id, name } => {
+            json!({"type":"tool_started","call_id":call_id,"name":name})
+        }
+        TurnStateEvent::FunctionCompleted { call_id, name } => {
+            json!({"type":"tool_completed","call_id":call_id,"name":name})
+        }
+        TurnStateEvent::FunctionFailed {
+            call_id,
+            name,
+            error,
+        } => json!({"type":"tool_failed","call_id":call_id,"name":name,"error":error}),
+        TurnStateEvent::Suspended { suspension } => {
+            json!({"type":"turn_suspended","suspension":suspension})
+        }
+        TurnStateEvent::TurnFinished { outcome } => match outcome {
+            TurnOutcome::AssistantMessage { text } => {
+                json!({"type":"turn_finished","outcome":"assistant_message","text":text})
+            }
+            TurnOutcome::Suspended { suspension } => {
+                json!({"type":"turn_finished","outcome":"suspended","suspension":suspension})
+            }
+            TurnOutcome::Failed { error } => {
+                json!({"type":"turn_finished","outcome":"failed","error":error})
+            }
+            TurnOutcome::Aborted { reason } => {
+                json!({"type":"turn_finished","outcome":"aborted","reason":reason})
+            }
+        },
+        TurnStateEvent::TurnFailed { error } => json!({"type":"turn_failed","error":error}),
+        TurnStateEvent::TurnAborted { reason } => json!({"type":"turn_aborted","reason":reason}),
+        TurnStateEvent::TurnTokenUsage { usage } => {
+            json!({"type":"token_usage","usage":usage})
+        }
+    }
+}
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let c = load_config(app.handle())?;
-            let dir = state_dir(app.handle())?;
+            let c = load_config(app.handle()).unwrap_or_default();
             let runtime = if c.base_url.is_empty() || c.model.is_empty() {
                 None
             } else {
-                Some(build_runtime(&c, dir)?)
+                state_dir(app.handle())
+                    .ok()
+                    .and_then(|dir| build_runtime(&c, dir).ok())
             };
             app.manage(AppState {
                 config: Mutex::new(c),
@@ -271,7 +373,8 @@ pub fn run() {
             save_config,
             list_threads,
             create_thread,
-            run_turn
+            run_turn,
+            abort_turn
         ])
         .run(tauri::generate_context!())
         .expect("error while running lite-agent");
