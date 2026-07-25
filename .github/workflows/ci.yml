@@ -81,6 +81,9 @@ jobs:
       - name: Build desktop bundle
         working-directory: lite-agent-desktop
         run: npm run tauri build -- ${{ matrix.args }}
+      - name: Verify macOS app signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict --verbose=2 "target/${{ matrix.target }}/release/bundle/macos/lite-agent.app"
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
