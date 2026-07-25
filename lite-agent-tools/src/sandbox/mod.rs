@@ -20,6 +20,12 @@ mod seatbelt;
 
 pub use seatbelt::MacOsSeatbeltBackend;
 
+#[cfg(windows)]
+mod windows_fake;
+
+#[cfg(windows)]
+pub use windows_fake::WindowsFakeBackend;
+
 #[cfg(target_os = "linux")]
 mod linux;
 

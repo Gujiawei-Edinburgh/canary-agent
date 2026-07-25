@@ -7,5 +7,6 @@ members = [
     "lite-agent-store-json",
     "lite-agent-observability",
     "examples/repl",
+    "lite-agent-desktop/src-tauri",
 ]
 resolver = "2"

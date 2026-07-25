@@ -171,6 +171,8 @@ pub enum Shell {
     Bash,
     Zsh,
     Fish,
+    #[cfg(windows)]
+    PowerShell,
 }
 
 impl Shell {
@@ -179,6 +181,8 @@ impl Shell {
             Some(path) if path.ends_with("/bash") => Self::Bash,
             Some(path) if path.ends_with("/zsh") => Self::Zsh,
             Some(path) if path.ends_with("/fish") => Self::Fish,
+            #[cfg(windows)]
+            _ => Self::PowerShell,
             _ => Self::Sh,
         }
     }
@@ -189,6 +193,8 @@ impl Shell {
             Self::Bash => "/bin/bash",
             Self::Zsh => "/bin/zsh",
             Self::Fish => "/usr/bin/fish",
+            #[cfg(windows)]
+            Self::PowerShell => "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
         }
     }
 
@@ -198,6 +204,8 @@ impl Shell {
             Self::Bash => "bash",
             Self::Zsh => "zsh",
             Self::Fish => "fish",
+            #[cfg(windows)]
+            Self::PowerShell => "powershell",
         }
     }
 }
@@ -487,7 +495,16 @@ impl ExecCommandTool {
     ) -> SandboxRequest {
         SandboxRequest {
             program: request.shell.path().into(),
-            args: vec!["-lc".to_string(), request.command.clone()],
+            args: if cfg!(windows) {
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    request.command.clone(),
+                ]
+            } else {
+                vec!["-lc".to_string(), request.command.clone()]
+            },
             cwd: request.cwd.clone(),
             environment: self.config.environment.clone(),
             cancellation,

@@ -13,12 +13,14 @@ use std::pin::Pin;
 
 mod exec_command;
 pub mod sandbox;
+mod web_search;
 
 pub use exec_command::{
     ApprovalHandling, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
     ExecRequest, FixedWorkspaceResolver, ResolvedWorkspace, Shell, ThreadExecAuthorizer,
     WorkspaceResolveRequest, WorkspaceResolver,
 };
+pub use web_search::{DuckDuckGoSearch, WebSearchConfig};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GetCurrentTime;
@@ -57,6 +59,10 @@ impl AgentFunction for GetCurrentTime {
 
 pub fn register_time_tools(registry: &mut FunctionRegistry) {
     registry.register(GetCurrentTime);
+}
+
+pub fn register_web_search(registry: &mut FunctionRegistry, config: WebSearchConfig) {
+    registry.register(DuckDuckGoSearch::new(config));
 }
 
 #[cfg(test)]

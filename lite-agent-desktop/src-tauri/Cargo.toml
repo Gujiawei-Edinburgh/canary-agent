@@ -1,0 +1,28 @@
+[package]
+name = "lite-agent-desktop"
+version = "0.1.0"
+description = "lite-agent 中文桌面客户端"
+authors = ["lite-agent"]
+edition = "2021"
+
+[lib]
+name = "lite_agent_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+lite-agent-kernel = { path = "../../lite-agent-kernel" }
+lite-agent-runtime = { path = "../../lite-agent-runtime" }
+lite-agent-tools = { path = "../../lite-agent-tools" }
+lite-agent-openai = { path = "../../lite-agent-openai" }
+lite-agent-store-json = { path = "../../lite-agent-store-json" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
