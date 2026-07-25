@@ -10,6 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -78,5 +88,5 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            lite-agent-desktop/src-tauri/target/**/release/bundle/**/*.dmg
-            lite-agent-desktop/src-tauri/target/**/release/bundle/**/*.exe
+            target/**/release/bundle/**/*.dmg
+            target/**/release/bundle/**/*.exe

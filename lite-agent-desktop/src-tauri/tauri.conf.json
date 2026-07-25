@@ -5,5 +5,5 @@
   "identifier": "dev.lite-agent.desktop",
   "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": { "windows": [{ "title": "lite-agent", "width": 1180, "height": 760, "minWidth": 900, "minHeight": 600 }], "security": { "csp": null } },
-  "bundle": { "active": true, "targets": ["dmg", "nsis"], "icon": ["icons/icon.svg"], "macOS": { "minimumSystemVersion": "11.0" }, "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } } }
+  "bundle": { "active": true, "targets": ["dmg", "nsis"], "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"], "macOS": { "minimumSystemVersion": "11.0" }, "windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } } }
 }

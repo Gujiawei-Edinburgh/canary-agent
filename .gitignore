@@ -4,3 +4,11 @@
 /lite-agent-desktop/node_modules/
 /lite-agent-desktop/dist/
 /lite-agent-desktop/src-tauri/gen/
+/lite-agent-desktop/src-tauri/icons/android/
+/lite-agent-desktop/src-tauri/icons/ios/
+/lite-agent-desktop/src-tauri/icons/32x32.png
+/lite-agent-desktop/src-tauri/icons/64x64.png
+/lite-agent-desktop/src-tauri/icons/128x128.png
+/lite-agent-desktop/src-tauri/icons/128x128@2x.png
+/lite-agent-desktop/src-tauri/icons/Square*.png
+/lite-agent-desktop/src-tauri/icons/StoreLogo.png
