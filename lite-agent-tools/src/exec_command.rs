@@ -25,38 +25,14 @@ pub struct ExecRequest {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceResolveRequest {
-    /// The durable thread identifier. Resolvers may use it as an opaque key
-    /// when deriving a workspace path.
     pub thread_id: String,
-    /// Application-owned metadata persisted on the thread. The tools crate
-    /// does not interpret or mutate this value.
     pub metadata: Value,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedWorkspace {
-    /// Absolute host path used as the command working directory.
     pub cwd: PathBuf,
-    /// Effective sandbox policy for this invocation. A resolver can derive it
-    /// from the same metadata as the workspace path.
     pub policy: SandboxPolicy,
-}
-
-impl ResolvedWorkspace {
-    fn validate(&self) -> Result<()> {
-        if !self.cwd.is_absolute() {
-            return Err(AgentError::Function {
-                name: "workspace_resolver".to_string(),
-                message: "resolved workspace cwd must be an absolute host path".to_string(),
-            });
-        }
-        self.policy
-            .validate()
-            .map_err(|error| AgentError::Function {
-                name: "workspace_resolver".to_string(),
-                message: format!("invalid sandbox policy: {error}"),
-            })
-    }
 }
 
 pub trait WorkspaceResolver: Send + Sync {
@@ -366,9 +342,6 @@ impl ExecCommandTool {
             })
             .await
             .map_err(|error| tool_error(format!("workspace resolution failed: {error}")))?;
-        workspace
-            .validate()
-            .map_err(|error| tool_error(format!("invalid resolved workspace: {error}")))?;
         let request = ExecRequest {
             command: command.to_string(),
             cwd: workspace.cwd,

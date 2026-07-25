@@ -180,27 +180,6 @@ impl SandboxPolicy {
         }
     }
 
-    /// Build a workspace policy with a narrower visible subtree.
-    ///
-    /// The selected subtree is read/write (or read-only), other paths under
-    /// `base_path` are denied, and paths outside `base_path` inherit the
-    /// workspace default of read-only. The backend must support denied
-    /// filesystem rules to enforce this boundary.
-    pub fn workspace_scoped(
-        base_path: impl Into<PathBuf>,
-        visible_path: impl Into<PathBuf>,
-        access: FilesystemAccess,
-    ) -> SandboxResult<Self> {
-        Ok(Self {
-            filesystem: PolicySetting::strict(FilesystemPolicy::workspace_scoped(
-                base_path,
-                visible_path,
-                access,
-            )?),
-            ..Self::default()
-        })
-    }
-
     pub fn validate(&self) -> SandboxResult<()> {
         self.filesystem.requested.validate()
     }
@@ -307,39 +286,6 @@ impl FilesystemPolicy {
         }
     }
 
-    /// Restrict visibility to `visible_path` within `base_path`.
-    pub fn workspace_scoped(
-        base_path: impl Into<PathBuf>,
-        visible_path: impl Into<PathBuf>,
-        access: FilesystemAccess,
-    ) -> SandboxResult<Self> {
-        let base_path = normalize_absolute_path(&base_path.into())?;
-        let visible_path = normalize_absolute_path(&visible_path.into())?;
-        if !visible_path.starts_with(&base_path) {
-            return Err(SandboxError::InvalidRequest(format!(
-                "visible workspace path {} must be inside base path {}",
-                visible_path.display(),
-                base_path.display()
-            )));
-        }
-
-        let mut rules = Vec::with_capacity(2);
-        if visible_path != base_path {
-            rules.push(FilesystemRule {
-                path: base_path,
-                access: FilesystemAccess::Denied,
-            });
-        }
-        rules.push(FilesystemRule {
-            path: visible_path,
-            access,
-        });
-        Ok(Self::Workspace {
-            default_access: FilesystemAccess::ReadOnly,
-            rules,
-        })
-    }
-
     /// Resolve the effective access for an absolute path using longest-prefix
     /// matching on complete path components.
     pub fn access_for(&self, path: impl AsRef<std::path::Path>) -> SandboxResult<FilesystemAccess> {
@@ -429,7 +375,7 @@ fn normalize_absolute_path(path: &std::path::Path) -> SandboxResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemAccess, FilesystemPolicy, FilesystemRule, SandboxError, SandboxPolicy};
+    use super::{FilesystemAccess, FilesystemPolicy, FilesystemRule};
 
     #[test]
     fn filesystem_rules_use_longest_matching_path() {
@@ -502,45 +448,6 @@ mod tests {
         };
 
         assert!(policy.validate().is_err());
-    }
-
-    #[test]
-    fn scoped_workspace_denies_siblings_and_allows_selected_path() {
-        let policy = SandboxPolicy::workspace_scoped(
-            "/srv/workspaces/user-a",
-            "/srv/workspaces/user-a/thread-a",
-            FilesystemAccess::ReadWrite,
-        )
-        .expect("valid scoped workspace");
-        let filesystem = policy.filesystem.requested;
-
-        assert_eq!(
-            filesystem
-                .access_for("/srv/workspaces/user-a/thread-a/file.txt")
-                .unwrap(),
-            FilesystemAccess::ReadWrite
-        );
-        assert_eq!(
-            filesystem
-                .access_for("/srv/workspaces/user-a/thread-b/file.txt")
-                .unwrap(),
-            FilesystemAccess::Denied
-        );
-        assert_eq!(
-            filesystem.access_for("/etc/hosts").unwrap(),
-            FilesystemAccess::ReadOnly
-        );
-    }
-
-    #[test]
-    fn scoped_workspace_rejects_path_outside_base() {
-        let error = SandboxPolicy::workspace_scoped(
-            "/srv/workspaces/user-a",
-            "/srv/workspaces/user-b/thread-a",
-            FilesystemAccess::ReadWrite,
-        )
-        .expect_err("path outside base must be rejected");
-        assert!(matches!(error, SandboxError::InvalidRequest(_)));
     }
 }
 
