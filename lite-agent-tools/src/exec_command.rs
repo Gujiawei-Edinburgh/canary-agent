@@ -487,7 +487,7 @@ impl ExecCommandTool {
     ) -> SandboxRequest {
         SandboxRequest {
             program: request.shell.path().into(),
-            args: vec!["-lc".to_string(), request.command.clone()],
+            args: vec!["-c".to_string(), request.command.clone()],
             cwd: request.cwd.clone(),
             environment: self.config.environment.clone(),
             cancellation,

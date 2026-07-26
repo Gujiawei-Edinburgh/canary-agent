@@ -284,9 +284,15 @@ fn render_profile(policy: &EffectiveSandboxPolicy) -> SandboxResult<String> {
         } => {
             let base = escape_profile_path(&canonical_existing_path(base))?;
             let visible = escape_profile_path(&canonical_existing_path(visible))?;
-            profile.push_str(&format!(
-                "(deny file-read* (subpath \"{base}\"))\n(deny file-write* (subpath \"{base}\"))\n"
-            ));
+            // Workspace mode is readable everywhere but writable only in the
+            // selected subtree. A nested scope additionally hides siblings
+            // below its managed base.
+            profile.push_str(
+                "(allow file-read*)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
+            );
+            if base != visible {
+                profile.push_str(&format!("(deny file-read* (subpath \"{base}\"))\n"));
+            }
             profile.push_str(&format!("(allow file-read* (subpath \"{visible}\"))\n"));
             match access {
                 super::FilesystemAccess::ReadWrite => {
@@ -387,7 +393,10 @@ mod tests {
             identity: IdentityIsolation::Host,
         };
         let profile = render_profile(&policy).expect("profile");
-        assert!(profile.contains("(deny file-write* (subpath \"/tmp/workspace\"))"));
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
+        assert!(profile.contains("(allow file-read*)"));
+        assert!(!profile.contains("(deny file-read* (subpath \"/tmp/workspace\"))"));
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("(allow file-write* (subpath \"/tmp/workspace\"))"));
     }
@@ -419,6 +428,8 @@ mod tests {
             identity: IdentityIsolation::Host,
         };
         let profile = render_profile(&policy).expect("profile");
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(allow file-read*)"));
         assert!(profile.contains("(deny file-read* (subpath \"/tmp/workspaces\"))"));
         assert!(
             profile.contains("(allow file-read* (subpath \"/tmp/workspaces/user-a/thread-a\"))")
@@ -472,7 +483,7 @@ mod tests {
         let workspace_file = workspace.path().join("created.txt");
         let outside_file = outside.path().join("blocked.txt");
         let command = format!(
-            "printf workspace > '{}'; workspace_status=$?; printf outside > '{}'; outside_status=$?; test $workspace_status -eq 0 -a $outside_status -ne 0",
+            "printf probe > /dev/null; null_status=$?; printf workspace > '{}'; workspace_status=$?; printf outside > '{}'; outside_status=$?; test $null_status -eq 0 -a $workspace_status -eq 0 -a $outside_status -ne 0",
             workspace_file.display(),
             outside_file.display()
         );
