@@ -78,7 +78,12 @@ impl TraceCollector for JsonlTraceCollector {
             },
         };
 
-        if let Err(error) = writer.write_all(&raw).and_then(|_| writer.write_all(b"\n")) {
+        if let Err(error) = writer
+            .write_all(&raw)
+            .and_then(|_| writer.write_all(b"\n"))
+            .and_then(|_| writer.flush())
+            .and_then(|_| writer.get_ref().sync_data())
+        {
             tracing::error!(thread_id, error = %error, "failed to write trace event");
         }
     }

@@ -242,6 +242,16 @@ impl ContextBuilder for CompactingContextBuilder {
                 messages.push(summary_message.clone());
             }
             messages.extend(selected);
+            let estimated_context_tokens = self.estimator.estimate(&messages);
+            tracing::debug!(
+                thread_id = input.thread_id,
+                estimated_context_tokens,
+                max_context_tokens = self.max_context_tokens,
+                selected_message_count = messages.len(),
+                omitted_message_count = omitted.len(),
+                has_summary = summary_message.is_some(),
+                "model context built"
+            );
             let cache = summary_message.and_then(|message| match message {
                 ChatMessage::System { content } => Some(ThreadContextCache {
                     thread_id: input.thread_id.to_string(),

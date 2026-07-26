@@ -8,7 +8,7 @@ import "highlight.js/styles/github-dark.css";
 import "katex/dist/katex.min.css";
 import "./style.css";
 
-type Config = { base_url: string; model: string; api_key: string; qianfan_api_key: string; workspace: string };
+type Config = { base_url: string; model: string; api_key: string; qianfan_api_key: string; workspace: string; max_context_tokens: number; max_model_iterations: number };
 type Thread = { id: string; created_at: string; updated_at: string; turns: any[]; metadata: any };
 type ToolCall = { call_id: string; name: string; arguments: unknown };
 type LiveTool = ToolCall & { status: "queued" | "running" | "completed" | "failed"; error?: string };
@@ -22,6 +22,8 @@ const state = {
   workspaceDialog: false,
   pending: null as LiveTurn | null,
   openProcesses: new Set<string>(),
+  threadErrors: new Map<string, string>(),
+  diagnosticsDir: "",
 };
 
 let composing = false;
@@ -71,9 +73,12 @@ async function boot() {
   render();
   try {
     state.config = await invoke<Config>("get_config");
+    state.diagnosticsDir = await invoke<string>("get_diagnostics_dir");
+    const runtimeError = await invoke<string | null>("get_runtime_error");
     await listen<DesktopTurnEvent>("turn-event", event => handleTurnEvent(event.payload));
     await refresh();
-    if (!state.config.base_url || !state.config.model) showSettings(true);
+    if (runtimeError) showSettings(false, runtimeError);
+    else if (!state.config.base_url || !state.config.model) showSettings(true);
   } catch (error) {
     el("app").innerHTML = `<div class="settings"><h1>启动失败</h1><pre>${escapeHtml(error)}</pre></div>`;
   }
@@ -202,7 +207,8 @@ function updateLiveTurnDom() {
 function conversationHtml() {
   const persisted = persistedConversation(currentThread());
   const live = state.pending?.threadId === state.selected ? liveTurnHtml(state.pending) : "";
-  return `<div class="conversation-column">${persisted}${live}</div>`;
+  const transientError = state.threadErrors.get(state.selected);
+  return `<div class="conversation-column">${persisted}${live}${transientError ? `<div class="turn-error">${escapeHtml(transientError)}</div>` : ""}</div>`;
 }
 
 function persistedConversation(thread?: Thread) {
@@ -213,8 +219,11 @@ function persistedConversation(thread?: Thread) {
     const outputs = new Map(items.filter((item: any) => item.type === "tool_output").map((item: any) => [item.call_id, item]));
     const calls = modelItems.flatMap((item: any) => item.function_calls || []);
     const assistant = modelItems.map((item: any) => item.text).filter(Boolean).join("\n\n");
+    const failure = items.filter((item: any) => item.type === "turn_failed").at(-1)?.error;
+    const abortion = items.filter((item: any) => item.type === "turn_aborted").at(-1)?.reason;
     const processId = `turn:${turn.id || index}`;
-    return `${userItems.map((item: any) => userMessage(item.text)).join("")}${calls.length ? toolGroupHtml(calls, outputs, processId) : ""}${assistant ? assistantMessage(assistant) : ""}`;
+    const terminalError = failure || abortion;
+    return `${userItems.map((item: any) => userMessage(item.text)).join("")}${calls.length ? toolGroupHtml(calls, outputs, processId) : ""}${assistant ? assistantMessage(assistant) : ""}${terminalError ? `<div class="turn-error">${escapeHtml(terminalError)}</div>` : ""}`;
   }).join("");
 }
 
@@ -271,6 +280,7 @@ async function sendMessage(event: Event) {
   const input = el("prompt") as HTMLTextAreaElement;
   const userText = input.value.trim();
   if (!userText || state.pending) return;
+  state.threadErrors.delete(state.selected);
   state.pending = { threadId: state.selected, userText, assistantParts: [""], iteration: 0, tools: [] };
   state.openProcesses.add(`live:${state.selected}`);
   input.value = "";
@@ -280,8 +290,10 @@ async function sendMessage(event: Event) {
     state.pending = null;
     await refresh();
   } catch (error) {
-    if (state.pending) state.pending.error = `发送失败：${String(error)}`;
-    updateLiveTurnDom();
+    const threadId = state.pending?.threadId || state.selected;
+    state.threadErrors.set(threadId, `发送失败：${String(error)}`);
+    state.pending = null;
+    await refresh();
   }
 }
 
@@ -332,12 +344,12 @@ async function createThread() {
   catch (error) { errorBox.textContent = `创建失败：${String(error)}`; button.disabled = false; }
 }
 
-function showSettings(first: boolean) {
-  const config = state.config || { base_url: "", model: "", api_key: "", qianfan_api_key: "", workspace: "" };
-  el("app").innerHTML = `<div class="settings-page"><div class="settings"><h1>${first ? "欢迎使用 lite-agent" : "设置"}</h1><p>所有 API Key 仅保存在本机，不会写入应用安装包。</p><section class="settings-section"><h2>语言模型</h2><p>请填写兼容 OpenAI Chat Completions 的服务配置。</p><label>LLM URL<input id="url" value="${escapeHtml(config.base_url)}"></label><label>模型<input id="model" value="${escapeHtml(config.model)}"></label><label>API Key<input id="key" type="password" autocomplete="off" value="${escapeHtml(config.api_key)}"></label></section><section class="settings-section"><h2>千帆百度搜索</h2><p>用于搜索中文网页和实时信息。未配置时不影响聊天，但无法使用网页搜索。</p><label>千帆 API Key<input id="qianfan-key" type="password" autocomplete="off" value="${escapeHtml(config.qianfan_api_key || "")}" placeholder="请输入百度智能云千帆 API Key"></label></section><section class="settings-section"><h2>工作区</h2><label>默认工作区<input id="ws" value="${escapeHtml(config.workspace)}"></label></section><button id="save">保存并继续</button><p id="save-error" class="error"></p></div></div>`;
+function showSettings(first: boolean, runtimeError = "") {
+  const config = state.config || { base_url: "", model: "", api_key: "", qianfan_api_key: "", workspace: "", max_context_tokens: 262144, max_model_iterations: 1024 };
+  el("app").innerHTML = `<div class="settings-page"><div class="settings"><h1>${first ? "欢迎使用 lite-agent" : "设置"}</h1><p>所有 API Key 仅保存在本机，不会写入应用安装包。</p>${runtimeError ? `<div class="turn-error">运行时初始化失败：${escapeHtml(runtimeError)}</div>` : ""}<section class="settings-section"><h2>语言模型</h2><p>请填写兼容 OpenAI Chat Completions 的服务配置。</p><label>LLM URL<input id="url" value="${escapeHtml(config.base_url)}"></label><label>模型<input id="model" value="${escapeHtml(config.model)}"></label><label>API Key<input id="key" type="password" autocomplete="off" value="${escapeHtml(config.api_key)}"></label><label>上下文预算（tokens）<input id="max-context-tokens" type="number" min="8192" max="2000000" step="1024" value="${config.max_context_tokens}"></label><p>默认 262,144；不要超过模型服务实际支持的上下文窗口。</p><label>单轮最大 Model Iterations<input id="max-model-iterations" type="number" min="1" max="65535" value="${config.max_model_iterations}"></label><p>默认 1,024；达到上限时会终止本轮并记录明确错误。</p></section><section class="settings-section"><h2>千帆百度搜索</h2><p>用于搜索中文网页和实时信息。未配置时不影响聊天，但无法使用网页搜索。</p><label>千帆 API Key<input id="qianfan-key" type="password" autocomplete="off" value="${escapeHtml(config.qianfan_api_key || "")}" placeholder="请输入百度智能云千帆 API Key"></label></section><section class="settings-section"><h2>工作区</h2><label>默认工作区<input id="ws" value="${escapeHtml(config.workspace)}"></label></section><section class="settings-section"><h2>诊断日志</h2><p>应用日志和每个 thread 的 JSONL trace 会实时写入：</p><code>${escapeHtml(state.diagnosticsDir || "保存设置后生成")}</code></section><button id="save">保存并继续</button><p id="save-error" class="error"></p></div></div>`;
   el("save").onclick = async () => {
     const button = el("save") as HTMLButtonElement; const errorBox = el("save-error"); button.disabled = true; errorBox.textContent = "保存中…";
-    try { state.config = { base_url: (el("url") as HTMLInputElement).value.trim(), model: (el("model") as HTMLInputElement).value.trim(), api_key: (el("key") as HTMLInputElement).value, qianfan_api_key: (el("qianfan-key") as HTMLInputElement).value.trim(), workspace: (el("ws") as HTMLInputElement).value.trim() }; if (!state.config.base_url || !state.config.model) throw new Error("LLM URL 和模型不能为空"); await invoke("save_config", { config: state.config }); await refresh(); }
+    try { state.config = { base_url: (el("url") as HTMLInputElement).value.trim(), model: (el("model") as HTMLInputElement).value.trim(), api_key: (el("key") as HTMLInputElement).value, qianfan_api_key: (el("qianfan-key") as HTMLInputElement).value.trim(), workspace: (el("ws") as HTMLInputElement).value.trim(), max_context_tokens: Number.parseInt((el("max-context-tokens") as HTMLInputElement).value, 10), max_model_iterations: Number.parseInt((el("max-model-iterations") as HTMLInputElement).value, 10) }; if (!state.config.base_url || !state.config.model) throw new Error("LLM URL 和模型不能为空"); if (!Number.isInteger(state.config.max_context_tokens) || state.config.max_context_tokens < 8192 || state.config.max_context_tokens > 2000000) throw new Error("上下文预算必须在 8,192 到 2,000,000 之间"); if (!Number.isInteger(state.config.max_model_iterations) || state.config.max_model_iterations < 1 || state.config.max_model_iterations > 65535) throw new Error("Model Iterations 必须在 1 到 65,535 之间"); await invoke("save_config", { config: state.config }); await refresh(); }
     catch (error) { errorBox.textContent = `保存失败：${String(error)}`; button.disabled = false; }
   };
 }

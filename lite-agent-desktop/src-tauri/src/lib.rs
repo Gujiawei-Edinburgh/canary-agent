@@ -1,8 +1,10 @@
 use lite_agent_kernel::events::{new_id, Thread};
+use lite_agent_observability::{init_file_logging, JsonlTraceCollector, LoggingGuard};
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
 use lite_agent_runtime::{
-    builtin_registry, Agent, AgentConfig, FunctionContext, LocalSessionCoordinator, Result,
-    RuntimeEvent, ThreadStore, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    builtin_registry, Agent, AgentConfig, CompactingContextBuilder, FunctionContext,
+    LocalSessionCoordinator, Result, RuntimeEvent, ThreadStore, TraceCollector, TurnModelEvent,
+    TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
 use lite_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
@@ -18,7 +20,10 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+const DEFAULT_MAX_CONTEXT_TOKENS: usize = 256 * 1024;
+const DEFAULT_MAX_MODEL_ITERATIONS: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DesktopConfig {
     pub base_url: String,
@@ -26,15 +31,35 @@ pub struct DesktopConfig {
     pub api_key: String,
     pub qianfan_api_key: String,
     pub workspace: String,
+    pub max_context_tokens: usize,
+    pub max_model_iterations: usize,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            qianfan_api_key: String::new(),
+            workspace: String::new(),
+            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_model_iterations: DEFAULT_MAX_MODEL_ITERATIONS,
+        }
+    }
 }
 
 struct AppState {
     config: Mutex<DesktopConfig>,
     runtime: Mutex<Option<Runtime>>,
+    runtime_error: Mutex<Option<String>>,
+    _logging_guard: LoggingGuard,
+    diagnostics_dir: PathBuf,
 }
 struct Runtime {
     agent: Agent,
     store: Arc<JsonFileThreadStore>,
+    trace_collector: Arc<JsonlTraceCollector>,
     state_dir: PathBuf,
 }
 
@@ -130,6 +155,12 @@ fn backend() -> Arc<dyn SandboxBackend> {
     Arc::new(lite_agent_tools::sandbox::MacOsSeatbeltBackend::new())
 }
 fn build_runtime(c: &DesktopConfig, dir: PathBuf) -> tauri::Result<Runtime> {
+    if !(8_192..=2_000_000).contains(&c.max_context_tokens) {
+        return Err(error("上下文窗口必须在 8,192 到 2,000,000 tokens 之间"));
+    }
+    if !(1..=65_535).contains(&c.max_model_iterations) {
+        return Err(error("Model iteration 上限必须在 1 到 65,535 之间"));
+    }
     let workspace = if c.workspace.trim().is_empty() {
         std::env::current_dir().map_err(error)?
     } else {
@@ -142,6 +173,7 @@ fn build_runtime(c: &DesktopConfig, dir: PathBuf) -> tauri::Result<Runtime> {
     std::fs::create_dir_all(dir.join("threads"))
         .map_err(|e| error(format!("创建会话目录失败: {e}")))?;
     let store = Arc::new(JsonFileThreadStore::open(&dir).map_err(error)?);
+    let trace_collector = Arc::new(JsonlTraceCollector::new(&dir).map_err(error)?);
     let model = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: c.base_url.clone(),
         api_key: c.api_key.clone(),
@@ -168,22 +200,48 @@ fn build_runtime(c: &DesktopConfig, dir: PathBuf) -> tauri::Result<Runtime> {
             fallback: workspace,
         }),
     ));
-    let agent=Agent::new(AgentConfig{system_prompt:"你是 lite-agent，使用中文回答。需要执行命令时使用 exec_command，需要查询公开网页时使用 web_search，需要当前时间时使用 get_current_time。".into(),..AgentConfig::default()},store.clone(),model,reg,Arc::new(LocalSessionCoordinator::default()));
+    let agent = Agent::new(
+        AgentConfig {
+            max_model_iterations: c.max_model_iterations,
+            system_prompt: "你是 lite-agent，使用中文回答。需要执行命令时使用 exec_command，需要查询公开网页时使用 web_search，需要当前时间时使用 get_current_time。".into(),
+        },
+        store.clone(),
+        model,
+        reg,
+        Arc::new(LocalSessionCoordinator::default()),
+    )
+    .with_context_builder(CompactingContextBuilder {
+        max_context_tokens: c.max_context_tokens,
+        ..CompactingContextBuilder::default()
+    })
+    .with_shared_trace_collector(trace_collector.clone());
+    tracing::info!(
+        max_context_tokens = c.max_context_tokens,
+        max_model_iterations = c.max_model_iterations,
+        state_dir = %dir.display(),
+        "desktop runtime initialized"
+    );
     Ok(Runtime {
         agent,
         store,
+        trace_collector,
         state_dir: dir,
     })
 }
 
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> DesktopConfig {
-    let config = state.config.lock().unwrap().clone();
-    if state.runtime.lock().unwrap().is_none() {
-        DesktopConfig::default()
-    } else {
-        config
-    }
+    state.config.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_diagnostics_dir(state: State<'_, AppState>) -> String {
+    state.diagnostics_dir.display().to_string()
+}
+
+#[tauri::command]
+fn get_runtime_error(state: State<'_, AppState>) -> Option<String> {
+    state.runtime_error.lock().unwrap().clone()
 }
 #[tauri::command]
 fn save_config(
@@ -191,13 +249,22 @@ fn save_config(
     state: State<'_, AppState>,
     config: DesktopConfig,
 ) -> tauri::Result<()> {
-    persist_config(&app, &config)?;
     let dir = state_dir(&app)?;
     let previous_runtime = state.runtime.lock().unwrap().take();
     drop(previous_runtime);
-    let rt = build_runtime(&config, dir)?;
+    let rt = match build_runtime(&config, dir) {
+        Ok(runtime) => runtime,
+        Err(runtime_error) => {
+            let message = runtime_error.to_string();
+            tracing::error!(error = %message, "failed to apply desktop configuration");
+            *state.runtime_error.lock().unwrap() = Some(message);
+            return Err(runtime_error);
+        }
+    };
+    persist_config(&app, &config)?;
     *state.config.lock().unwrap() = config;
     *state.runtime.lock().unwrap() = Some(rt);
+    *state.runtime_error.lock().unwrap() = None;
     Ok(())
 }
 #[tauri::command]
@@ -258,20 +325,30 @@ async fn run_turn(
     thread_id: String,
     user_text: String,
 ) -> tauri::Result<()> {
-    let agent = state
+    let (agent, trace_collector) = state
         .runtime
         .lock()
         .unwrap()
         .as_ref()
-        .map(|x| x.agent.clone())
+        .map(|x| (x.agent.clone(), x.trace_collector.clone()))
         .ok_or_else(|| error("请先完成设置"))?;
-    agent
+    tracing::info!(thread_id, "desktop turn command started");
+    let result = agent
         .run_turn_stream(&thread_id, user_text, move |event| {
             let _ = app.emit("turn-event", desktop_turn_event(event));
         })
-        .await
-        .map(|_| ())
-        .map_err(error)
+        .await;
+    trace_collector.flush().await;
+    match result {
+        Ok(outcome) => {
+            tracing::info!(thread_id, ?outcome, "desktop turn command finished");
+            Ok(())
+        }
+        Err(turn_error) => {
+            tracing::error!(thread_id, error = %turn_error, "desktop turn command failed");
+            Err(error(turn_error))
+        }
+    }
 }
 
 #[tauri::command]
@@ -354,22 +431,34 @@ fn desktop_state_event(event: TurnStateEvent) -> Value {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            let diagnostics_dir = state_dir(app.handle())?;
+            let logging_guard = init_file_logging(&diagnostics_dir).map_err(error)?;
             let c = load_config(app.handle()).unwrap_or_default();
-            let runtime = if c.base_url.is_empty() || c.model.is_empty() {
-                None
+            let (runtime, runtime_error) = if c.base_url.is_empty() || c.model.is_empty() {
+                (None, None)
             } else {
-                state_dir(app.handle())
-                    .ok()
-                    .and_then(|dir| build_runtime(&c, dir).ok())
+                match build_runtime(&c, diagnostics_dir.clone()) {
+                    Ok(runtime) => (Some(runtime), None),
+                    Err(runtime_error) => {
+                        let message = runtime_error.to_string();
+                        tracing::error!(error = %runtime_error, "desktop runtime initialization failed");
+                        (None, Some(message))
+                    }
+                }
             };
             app.manage(AppState {
                 config: Mutex::new(c),
                 runtime: Mutex::new(runtime),
+                runtime_error: Mutex::new(runtime_error),
+                _logging_guard: logging_guard,
+                diagnostics_dir,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
+            get_diagnostics_dir,
+            get_runtime_error,
             save_config,
             list_threads,
             create_thread,
@@ -378,4 +467,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running lite-agent");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DesktopConfig, DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_MODEL_ITERATIONS};
+
+    #[test]
+    fn legacy_desktop_config_receives_long_task_defaults() {
+        let config: DesktopConfig = serde_json::from_str(
+            r#"{
+                "base_url": "https://example.com/v1",
+                "model": "example-model",
+                "api_key": "secret",
+                "workspace": "C:\\\\workspace"
+            }"#,
+        )
+        .expect("legacy config");
+
+        assert_eq!(config.max_context_tokens, DEFAULT_MAX_CONTEXT_TOKENS);
+        assert_eq!(config.max_model_iterations, DEFAULT_MAX_MODEL_ITERATIONS);
+        assert!(config.qianfan_api_key.is_empty());
+    }
 }

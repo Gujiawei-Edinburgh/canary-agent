@@ -18,11 +18,12 @@ lite-agent-runtime = { path = "../../lite-agent-runtime" }
 lite-agent-tools = { path = "../../lite-agent-tools" }
 lite-agent-openai = { path = "../../lite-agent-openai" }
 lite-agent-store-json = { path = "../../lite-agent-store-json" }
+lite-agent-observability = { path = "../../lite-agent-observability" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+tracing = "0.1"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
-
