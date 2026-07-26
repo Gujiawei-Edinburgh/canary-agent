@@ -81,9 +81,31 @@ jobs:
       - name: Build desktop bundle
         working-directory: lite-agent-desktop
         run: npm run tauri build -- ${{ matrix.args }}
-      - name: Verify macOS app signature
+      - name: Verify macOS DMG and app signature
         if: runner.os == 'macOS'
-        run: codesign --verify --deep --strict --verbose=2 "target/${{ matrix.target }}/release/bundle/macos/lite-agent.app"
+        shell: bash
+        run: |
+          dmg_path="$(find "target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          if [[ -z "$dmg_path" ]]; then
+            echo "No DMG found for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+
+          hdiutil verify "$dmg_path"
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet || true
+            rmdir "$mount_dir" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_dir"
+          app_path="$(find "$mount_dir" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "No app bundle found inside $dmg_path" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
