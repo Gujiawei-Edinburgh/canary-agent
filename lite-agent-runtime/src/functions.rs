@@ -1,7 +1,7 @@
 use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
 use crate::model::FunctionSpec;
-use lite_agent_kernel::events::{new_id, GoalState, GoalStatus, Suspension, SuspensionKind};
+use lite_agent_kernel::events::{GoalState, GoalStatus, Suspension};
 use lite_agent_kernel::projection::ThreadProjection;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -233,39 +233,8 @@ impl FunctionRegistry {
 
 pub fn builtin_registry() -> FunctionRegistry {
     let mut registry = FunctionRegistry::new();
-    registry.register_runtime_command(GetGoal);
     registry.register_runtime_command(UpdateGoal);
-    registry.register_runtime_command(AskUser);
     registry
-}
-
-struct GetGoal;
-
-impl RuntimeCommand for GetGoal {
-    fn spec(&self) -> FunctionSpec {
-        FunctionSpec {
-            name: "get_goal".to_string(),
-            description: "Return the current thread goal, if one has been set.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn call<'a>(
-        &'a self,
-        _args: Value,
-        context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>> {
-        Box::pin(async move {
-            Ok(RuntimeCommandExecution::Completed {
-                output: json!({ "goal": context.projection.goal }),
-                effects: Vec::new(),
-            })
-        })
-    }
 }
 
 struct UpdateGoal;
@@ -323,62 +292,9 @@ impl RuntimeCommand for UpdateGoal {
     }
 }
 
-struct AskUser;
-
-#[derive(Debug, Deserialize)]
-struct AskUserArgs {
-    prompt: String,
-}
-
-impl RuntimeCommand for AskUser {
-    fn spec(&self) -> FunctionSpec {
-        FunctionSpec {
-            name: "ask_user".to_string(),
-            description: "Ask the user a follow-up question and stop the current turn.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "required": ["prompt"],
-                "properties": {
-                    "prompt": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn call<'a>(
-        &'a self,
-        args: Value,
-        _context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>> {
-        Box::pin(async move {
-            let parsed: AskUserArgs = serde_json::from_value(args).map_err(|error| {
-                AgentError::InvalidFunctionArguments {
-                    name: "ask_user".to_string(),
-                    message: error.to_string(),
-                }
-            })?;
-            let request_id = new_id("req");
-            Ok(RuntimeCommandExecution::SuspendedAfterExecution {
-                suspension: Suspension {
-                    id: request_id.clone(),
-                    kind: SuspensionKind::UserInput,
-                    payload: json!({ "prompt": parsed.prompt.clone() }),
-                },
-                output: json!({
-                    "request_id": request_id,
-                    "prompt": parsed.prompt,
-                    "status": "suspended"
-                }),
-                effects: Vec::new(),
-            })
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use lite_agent_kernel::events::{GoalStatus, SuspensionKind, Thread};
+    use lite_agent_kernel::events::{GoalStatus, Thread};
     use lite_agent_kernel::projection::ThreadProjection;
 
     use super::{builtin_registry, FunctionCallExecution, FunctionContext};
@@ -410,31 +326,5 @@ mod tests {
             effects.as_slice(),
             [super::RuntimeEffect::SetGoal(goal)] if goal.status == GoalStatus::Active
         ));
-    }
-
-    #[tokio::test]
-    async fn ask_user_returns_suspended_state() {
-        let registry = builtin_registry();
-        let execution = registry
-            .call(
-                "ask_user",
-                json!({ "prompt": "Which thread?" }),
-                FunctionContext {
-                    thread_id: "t".to_string(),
-                    metadata: serde_json::Value::Null,
-                    turn_id: "turn".to_string(),
-                    call_id: "call".to_string(),
-                    projection: ThreadProjection::from_thread(&Thread::new("t")),
-                    abort_signal: crate::agent_loop::turn_abort_pair().1,
-                },
-            )
-            .await
-            .expect("call");
-
-        let FunctionCallExecution::SuspendedAfterExecution { suspension, .. } = execution else {
-            panic!("expected waiting");
-        };
-        assert_eq!(suspension.kind, SuspensionKind::UserInput);
-        assert_eq!(suspension.payload["prompt"], "Which thread?");
     }
 }

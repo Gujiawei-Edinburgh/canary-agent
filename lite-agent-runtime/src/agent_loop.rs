@@ -1448,7 +1448,7 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use crate::functions::builtin_registry;
+    use crate::functions::{builtin_registry, FunctionRegistry, SimpleFunction};
     use crate::model::{
         ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
         ModelStreamHandler,
@@ -1456,9 +1456,12 @@ mod tests {
     use crate::store::{ThreadContextCache, ThreadStore};
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
-        FunctionCallHookResult, Result, RuntimeEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+        FunctionCallHookResult, FunctionExecution, FunctionSpec, Result, RuntimeEvent, TurnOutcome,
+        TurnStateEvent, TurnStreamEvent,
     };
-    use lite_agent_kernel::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
+    use lite_agent_kernel::events::{
+        Suspension, SuspensionKind, TokenUsage, ToolResult, TurnItemKind, TurnStatus,
+    };
     use lite_agent_kernel::projection::ThreadProjection;
     use serde_json::json;
     use std::collections::VecDeque;
@@ -1591,9 +1594,51 @@ mod tests {
             AgentConfig::default(),
             store,
             Arc::new(MockModel::new(responses)),
-            builtin_registry(),
+            test_registry(),
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         )
+    }
+
+    fn test_registry() -> FunctionRegistry {
+        let mut registry = builtin_registry();
+        registry.register(SimpleFunction::new(
+            FunctionSpec {
+                name: "test_function".to_string(),
+                description: "Test-only function.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            },
+            |_args, _context| async {
+                Ok(FunctionExecution::Completed {
+                    output: json!({ "ok": true }),
+                })
+            },
+        ));
+        registry.register(SimpleFunction::new(
+            FunctionSpec {
+                name: "test_suspend".to_string(),
+                description: "Test-only suspension function.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            },
+            |_args, _context| async {
+                Ok(FunctionExecution::SuspendedAfterExecution {
+                    suspension: Suspension {
+                        id: "test-suspension".to_string(),
+                        kind: SuspensionKind::LongRunningJob,
+                        payload: json!({}),
+                    },
+                    output: json!({ "status": "suspended" }),
+                })
+            },
+        ));
+        registry
     }
 
     struct RecordingHook {
@@ -1729,7 +1774,7 @@ mod tests {
                     text: Some("I will check the goal first.".to_string()),
                     function_calls: vec![ModelFunctionCall {
                         call_id: "c1".to_string(),
-                        name: "get_goal".to_string(),
+                        name: "test_function".to_string(),
                         arguments: json!({}),
                     }],
                 },
@@ -1763,7 +1808,7 @@ mod tests {
             AgentConfig::default(),
             store.clone(),
             Arc::new(PendingModel),
-            builtin_registry(),
+            test_registry(),
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         ));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1816,7 +1861,7 @@ mod tests {
                 ModelResponse::FunctionCalls {
                     calls: vec![ModelFunctionCall {
                         call_id: "c1".to_string(),
-                        name: "get_goal".to_string(),
+                        name: "test_function".to_string(),
                         arguments: json!({}),
                     }],
                 },
@@ -1883,7 +1928,7 @@ mod tests {
             AgentConfig::default(),
             store.clone(),
             Arc::new(UsageModel),
-            builtin_registry(),
+            test_registry(),
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         );
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1957,7 +2002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_stops_turn() {
+    async fn suspended_after_execution_stops_turn() {
         let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
@@ -1965,12 +2010,12 @@ mod tests {
                 calls: vec![
                     ModelFunctionCall {
                         call_id: "c1".to_string(),
-                        name: "ask_user".to_string(),
+                        name: "test_suspend".to_string(),
                         arguments: json!({ "prompt": "Which one?" }),
                     },
                     ModelFunctionCall {
                         call_id: "c2".to_string(),
-                        name: "get_goal".to_string(),
+                        name: "test_function".to_string(),
                         arguments: json!({}),
                     },
                 ],
@@ -2038,7 +2083,7 @@ mod tests {
                 ModelResponse::FunctionCalls {
                     calls: vec![ModelFunctionCall {
                         call_id: "c1".to_string(),
-                        name: "get_goal".to_string(),
+                        name: "test_function".to_string(),
                         arguments: json!({}),
                     }],
                 },
@@ -2056,10 +2101,10 @@ mod tests {
         assert_eq!(
             *hook_events.lock().expect("events"),
             vec![
-                "before:a:get_goal",
-                "before:b:get_goal",
-                "after:b:get_goal:completed",
-                "after:a:get_goal:completed",
+                "before:a:test_function",
+                "before:b:test_function",
+                "after:b:test_function:completed",
+                "after:a:test_function:completed",
             ]
         );
     }
@@ -2074,7 +2119,7 @@ mod tests {
                 ModelResponse::FunctionCalls {
                     calls: vec![ModelFunctionCall {
                         call_id: "c1".to_string(),
-                        name: "get_goal".to_string(),
+                        name: "test_function".to_string(),
                         arguments: json!({}),
                     }],
                 },
@@ -2091,9 +2136,9 @@ mod tests {
         assert_eq!(
             *hook_events.lock().expect("events"),
             vec![
-                "before:audit:get_goal",
-                "before:policy:get_goal",
-                "after:audit:get_goal:failed",
+                "before:audit:test_function",
+                "before:policy:test_function",
+                "after:audit:test_function:failed",
             ]
         );
 
@@ -2111,7 +2156,7 @@ mod tests {
                 name,
                 result: ToolResult::Error { error },
             } if call_id == "c1"
-                && name == "get_goal"
+                && name == "test_function"
                 && error.contains("policy blocked call")
         )));
     }
@@ -2126,7 +2171,7 @@ mod tests {
                 ModelResponse::FunctionCalls {
                     calls: vec![ModelFunctionCall {
                         call_id: "c1".to_string(),
-                        name: "get_goal".to_string(),
+                        name: "test_function".to_string(),
                         arguments: json!({}),
                     }],
                 },
@@ -2154,14 +2199,17 @@ mod tests {
         );
         assert_eq!(
             *hook_events.lock().expect("events"),
-            vec!["before:audit:get_goal", "after:audit:get_goal:completed"]
+            vec![
+                "before:audit:test_function",
+                "after:audit:test_function:completed"
+            ]
         );
         assert!(events.lock().expect("events").iter().any(|event| matches!(
             event,
             TurnStreamEvent::Runtime(RuntimeEvent { source, message, metadata })
                 if source == "function_call_hook"
                     && message == "post-hook failed"
-                    && metadata["name"] == "get_goal"
+                    && metadata["name"] == "test_function"
         )));
 
         let thread = store.load("t").await.expect("thread");
@@ -2186,11 +2234,11 @@ mod tests {
             Arc::new(MockModel::new(vec![ModelResponse::FunctionCalls {
                 calls: vec![ModelFunctionCall {
                     call_id: "c1".to_string(),
-                    name: "get_goal".to_string(),
+                    name: "test_function".to_string(),
                     arguments: json!({}),
                 }],
             }])),
-            builtin_registry(),
+            test_registry(),
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         );
 
