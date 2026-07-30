@@ -1,8 +1,8 @@
 use super::{
     classify_policy_violation, EffectiveSandboxPolicy, FilesystemPolicy, IdentityIsolation,
-    NetworkAccess, PolicySetting, ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput,
-    SandboxPolicy, SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult,
-    SandboxStatus, SandboxWarning, UnsupportedPolicyBehavior,
+    KernelOpsPolicy, NetworkAccess, PolicySetting, ProcessVisibility, SandboxBackend, SandboxError,
+    SandboxOutput, SandboxPolicy, SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest,
+    SandboxResult, SandboxStatus, SandboxWarning, UnsupportedPolicyBehavior,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -59,11 +59,22 @@ impl SandboxBackend for MacOsSeatbeltBackend {
             network: policy.network.requested,
             process: policy.process.requested,
             identity: policy.identity.requested,
+            kernel_ops: policy.kernel_ops.requested.clone(),
         };
         let mut warnings = Vec::new();
 
         resolve_process(&mut effective, &policy.process, &mut warnings)?;
         resolve_identity(&mut effective, &policy.identity, &mut warnings)?;
+        if !matches!(policy.kernel_ops.requested, KernelOpsPolicy::Unrestricted) {
+            unsupported(
+                SandboxPolicyDimension::KernelOps,
+                &policy.kernel_ops,
+                "Seatbelt does not expose a portable raw kernel-operation filter",
+                &mut effective,
+                &mut warnings,
+                |effective| effective.kernel_ops = KernelOpsPolicy::Unrestricted,
+            )?;
+        }
 
         if matches!(effective.filesystem, FilesystemPolicy::Isolated) {
             unsupported(
@@ -391,6 +402,7 @@ mod tests {
             network: NetworkAccess::Denied,
             process: ProcessPolicy::default(),
             identity: IdentityIsolation::Host,
+            kernel_ops: KernelOpsPolicy::Unrestricted,
         };
         let profile = render_profile(&policy).expect("profile");
         assert!(profile.contains("(deny file-write*)"));
@@ -408,6 +420,7 @@ mod tests {
             network: NetworkAccess::Host,
             process: ProcessPolicy::default(),
             identity: IdentityIsolation::Host,
+            kernel_ops: KernelOpsPolicy::Unrestricted,
         };
         let profile = render_profile(&policy).expect("profile");
         assert!(profile.contains("(allow file-write* (subpath \"/tmp/workspace\"))"));
@@ -426,6 +439,7 @@ mod tests {
             network: NetworkAccess::Denied,
             process: ProcessPolicy::default(),
             identity: IdentityIsolation::Host,
+            kernel_ops: KernelOpsPolicy::Unrestricted,
         };
         let profile = render_profile(&policy).expect("profile");
         assert!(profile.contains("(deny file-write*)"));
@@ -455,12 +469,31 @@ mod tests {
         let backend = MacOsSeatbeltBackend::new();
         let policy = SandboxPolicy::workspace_read_write("/tmp/workspace");
         let resolution = backend.resolve_policy(&policy).expect("fallback policy");
-        assert_eq!(resolution.warnings.len(), 2);
+        assert_eq!(resolution.warnings.len(), 3);
         assert_eq!(
             resolution.effective.process.visibility,
             ProcessVisibility::Host
         );
         assert_eq!(resolution.effective.identity, IdentityIsolation::Host);
+        assert_eq!(
+            resolution.effective.kernel_ops,
+            KernelOpsPolicy::Unrestricted
+        );
+        assert!(resolution
+            .warnings
+            .iter()
+            .any(|warning| warning.dimension == SandboxPolicyDimension::KernelOps));
+    }
+
+    #[test]
+    fn rejects_kernel_operation_filter_when_strict() {
+        let backend = MacOsSeatbeltBackend::new();
+        let mut policy = SandboxPolicy::workspace_read_write("/tmp/workspace");
+        policy.kernel_ops = PolicySetting::strict(KernelOpsPolicy::baseline());
+        let error = backend
+            .resolve_policy(&policy)
+            .expect_err("Seatbelt cannot enforce raw kernel-operation filtering");
+        assert!(error.to_string().contains("kernel-operation filter"));
     }
 
     #[cfg(target_os = "macos")]

@@ -184,17 +184,9 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FunctionRegistry {
     functions: BTreeMap<String, RegisteredFunction>,
-}
-
-impl Default for FunctionRegistry {
-    fn default() -> Self {
-        Self {
-            functions: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Clone)]

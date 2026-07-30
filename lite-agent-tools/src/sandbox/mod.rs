@@ -4,7 +4,7 @@
 //! isolation guarantees requested by `exec_command` and the execution boundary
 //! used by native, container, or user-provided backends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -146,6 +146,7 @@ pub struct SandboxPolicy {
     pub network: PolicySetting<NetworkAccess>,
     pub process: PolicySetting<ProcessPolicy>,
     pub identity: PolicySetting<IdentityIsolation>,
+    pub kernel_ops: PolicySetting<KernelOpsPolicy>,
 }
 
 impl SandboxPolicy {
@@ -205,6 +206,7 @@ impl Default for SandboxPolicy {
             network: PolicySetting::strict(NetworkAccess::Isolated),
             process: PolicySetting::fallback(ProcessPolicy::default()),
             identity: PolicySetting::fallback(IdentityIsolation::Unprivileged),
+            kernel_ops: PolicySetting::fallback(KernelOpsPolicy::baseline()),
         }
     }
 }
@@ -253,6 +255,7 @@ pub struct EffectiveSandboxPolicy {
     pub network: NetworkAccess,
     pub process: ProcessPolicy,
     pub identity: IdentityIsolation,
+    pub kernel_ops: KernelOpsPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,12 +264,93 @@ pub enum SandboxPolicyDimension {
     Network,
     Process,
     Identity,
+    KernelOps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxWarning {
     pub dimension: SandboxPolicyDimension,
     pub message: String,
+}
+
+/// High-level operations that can affect the host kernel or other processes.
+///
+/// This is deliberately independent of syscall names and numbers. Backends
+/// translate these operations into their native policy language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KernelOp {
+    MountFilesystem,
+    ChangeNamespace,
+    TraceProcess,
+    AccessProcessMemory,
+    UseKernelInstrumentation,
+    LoadKernelCode,
+    AccessRawDevice,
+    ManageSystemPower,
+}
+
+impl KernelOp {
+    #[cfg(target_os = "linux")]
+    fn all() -> &'static [Self] {
+        &[
+            Self::MountFilesystem,
+            Self::ChangeNamespace,
+            Self::TraceProcess,
+            Self::AccessProcessMemory,
+            Self::UseKernelInstrumentation,
+            Self::LoadKernelCode,
+            Self::AccessRawDevice,
+            Self::ManageSystemPower,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelOpViolationAction {
+    ReturnPermissionDenied,
+    KillProcess,
+}
+
+/// Kernel-operation restrictions requested from a sandbox backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelOpsPolicy {
+    /// Do not install a kernel-operation filter.
+    Unrestricted,
+    /// Deny the listed operation groups and allow all other operations.
+    DenyList {
+        denied: BTreeSet<KernelOp>,
+        violation: KernelOpViolationAction,
+    },
+    /// Allow only the listed operation groups. This is intentionally opt-in:
+    /// arbitrary shells and language runtimes need a broad syscall surface.
+    AllowList {
+        allowed: BTreeSet<KernelOp>,
+        violation: KernelOpViolationAction,
+    },
+}
+
+impl KernelOpsPolicy {
+    /// A practical baseline for untrusted command execution. It blocks
+    /// operations that can create further isolation escapes, inspect or alter
+    /// other processes, load kernel functionality, access raw device handles,
+    /// or change system power state.
+    pub fn baseline() -> Self {
+        Self::DenyList {
+            denied: [
+                KernelOp::MountFilesystem,
+                KernelOp::ChangeNamespace,
+                KernelOp::TraceProcess,
+                KernelOp::AccessProcessMemory,
+                KernelOp::UseKernelInstrumentation,
+                KernelOp::LoadKernelCode,
+                KernelOp::AccessRawDevice,
+                KernelOp::ManageSystemPower,
+            ]
+            .into_iter()
+            .collect(),
+            violation: KernelOpViolationAction::ReturnPermissionDenied,
+        }
+    }
 }
 
 /// Filesystem visibility and write access requested by the command.
@@ -402,7 +486,8 @@ fn normalize_absolute_path(path: &std::path::Path) -> SandboxResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemAccess, FilesystemPolicy};
+    use super::{FilesystemAccess, FilesystemPolicy, KernelOp, KernelOpsPolicy};
+    use std::collections::BTreeSet;
 
     #[test]
     fn scoped_workspace_resolves_visibility_by_path() {
@@ -428,6 +513,33 @@ mod tests {
         assert_eq!(
             policy.access_for("/etc/hosts").unwrap(),
             FilesystemAccess::ReadOnly
+        );
+    }
+
+    #[test]
+    fn baseline_blocks_high_risk_kernel_operations() {
+        let KernelOpsPolicy::DenyList { denied, .. } = KernelOpsPolicy::baseline() else {
+            panic!("baseline must be a deny list");
+        };
+        assert_eq!(denied.len(), 8);
+        assert!(denied.contains(&KernelOp::ChangeNamespace));
+        assert!(denied.contains(&KernelOp::TraceProcess));
+        assert!(denied.contains(&KernelOp::LoadKernelCode));
+    }
+
+    #[test]
+    fn explicit_kernel_operation_lists_are_preserved() {
+        let allowed = BTreeSet::from([KernelOp::TraceProcess]);
+        let policy = KernelOpsPolicy::AllowList {
+            allowed: allowed.clone(),
+            violation: super::KernelOpViolationAction::KillProcess,
+        };
+        assert_eq!(
+            policy,
+            KernelOpsPolicy::AllowList {
+                allowed,
+                violation: super::KernelOpViolationAction::KillProcess,
+            }
         );
     }
 }

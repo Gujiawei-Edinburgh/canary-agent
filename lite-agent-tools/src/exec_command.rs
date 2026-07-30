@@ -647,6 +647,7 @@ mod tests {
                     network: policy.network.requested,
                     process: policy.process.requested,
                     identity: policy.identity.requested,
+                    kernel_ops: policy.kernel_ops.requested.clone(),
                 },
                 warnings: Vec::new(),
             })

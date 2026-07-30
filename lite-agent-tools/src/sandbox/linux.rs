@@ -6,9 +6,10 @@
 
 use super::{
     classify_policy_violation, EffectiveSandboxPolicy, FilesystemAccess, FilesystemPolicy,
-    IdentityIsolation, NetworkAccess, PolicySetting, ProcessVisibility, SandboxBackend,
-    SandboxError, SandboxOutput, SandboxPolicy, SandboxPolicyDimension, SandboxPolicyResolution,
-    SandboxRequest, SandboxResult, SandboxStatus, SandboxWarning, UnsupportedPolicyBehavior,
+    IdentityIsolation, KernelOp, KernelOpViolationAction, KernelOpsPolicy, NetworkAccess,
+    PolicySetting, ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput, SandboxPolicy,
+    SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult, SandboxStatus,
+    SandboxWarning, UnsupportedPolicyBehavior,
 };
 use std::ffi::{CStr, CString};
 use std::io::Read;
@@ -43,6 +44,7 @@ impl SandboxBackend for LinuxNativeBackend {
             network: policy.network.requested,
             process: policy.process.requested,
             identity: policy.identity.requested,
+            kernel_ops: policy.kernel_ops.requested.clone(),
         };
         let mut warnings = Vec::new();
 
@@ -492,7 +494,164 @@ fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
             .map_err(|error| io_context("create network namespace", error))?;
     }
 
+    install_kernel_ops_filter(&policy.kernel_ops)?;
+
     Ok(())
+}
+
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_MODE_FILTER: libc::c_int = 2;
+const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+const PR_SET_SECCOMP: libc::c_int = 22;
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+
+fn install_kernel_ops_filter(policy: &KernelOpsPolicy) -> std::io::Result<()> {
+    if audit_arch() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "seccomp kernel-operation filtering is unsupported on this architecture",
+        ));
+    }
+    let (syscalls, action) = match policy {
+        KernelOpsPolicy::Unrestricted => return Ok(()),
+        KernelOpsPolicy::DenyList { denied, violation } => (syscalls_for_ops(denied), *violation),
+        KernelOpsPolicy::AllowList { allowed, violation } => {
+            let all = all_supported_kernel_syscalls();
+            let allowed = syscalls_for_ops(allowed);
+            let denied = all.into_iter().filter(|nr| !allowed.contains(nr)).collect();
+            (denied, *violation)
+        }
+    };
+    if syscalls.is_empty() {
+        return Ok(());
+    }
+
+    let violation = match action {
+        KernelOpViolationAction::ReturnPermissionDenied => SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        KernelOpViolationAction::KillProcess => SECCOMP_RET_KILL_PROCESS,
+    };
+    let mut filter = Vec::with_capacity(syscalls.len() * 2 + 3);
+    filter.push(libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        jt: 0,
+        jf: 0,
+        k: 4,
+    });
+    filter.push(libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt: 1,
+        jf: 0,
+        k: audit_arch(),
+    });
+    filter.push(libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_KILL_PROCESS,
+    });
+    filter.push(libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    });
+    for syscall in syscalls {
+        filter.push(libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: syscall,
+        });
+        filter.push(libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: violation,
+        });
+    }
+    filter.push(libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    });
+
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr() as *mut libc::sock_filter,
+    };
+    if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn audit_arch() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        AUDIT_ARCH_X86_64
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        AUDIT_ARCH_AARCH64
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
+fn syscalls_for_ops(ops: &std::collections::BTreeSet<KernelOp>) -> Vec<u32> {
+    ops.iter().flat_map(|op| syscalls_for_op(*op)).collect()
+}
+
+fn syscalls_for_op(op: KernelOp) -> Vec<u32> {
+    match op {
+        KernelOp::MountFilesystem => vec![
+            libc::SYS_mount as u32,
+            libc::SYS_umount2 as u32,
+            libc::SYS_pivot_root as u32,
+            libc::SYS_chroot as u32,
+        ],
+        KernelOp::ChangeNamespace => vec![libc::SYS_setns as u32, libc::SYS_unshare as u32],
+        KernelOp::TraceProcess => vec![libc::SYS_ptrace as u32, libc::SYS_kcmp as u32],
+        KernelOp::AccessProcessMemory => vec![
+            libc::SYS_process_vm_readv as u32,
+            libc::SYS_process_vm_writev as u32,
+        ],
+        KernelOp::UseKernelInstrumentation => vec![
+            libc::SYS_bpf as u32,
+            libc::SYS_perf_event_open as u32,
+            libc::SYS_userfaultfd as u32,
+        ],
+        KernelOp::LoadKernelCode => vec![
+            libc::SYS_init_module as u32,
+            libc::SYS_finit_module as u32,
+            libc::SYS_delete_module as u32,
+            libc::SYS_kexec_load as u32,
+        ],
+        KernelOp::AccessRawDevice => vec![
+            libc::SYS_open_by_handle_at as u32,
+            libc::SYS_name_to_handle_at as u32,
+        ],
+        KernelOp::ManageSystemPower => vec![
+            libc::SYS_reboot as u32,
+            libc::SYS_swapon as u32,
+            libc::SYS_swapoff as u32,
+        ],
+    }
+}
+
+fn all_supported_kernel_syscalls() -> Vec<u32> {
+    KernelOp::all()
+        .iter()
+        .flat_map(|op| syscalls_for_op(*op))
+        .collect()
 }
 
 fn run_isolated_child(
@@ -910,6 +1069,57 @@ mod tests {
             resolution.effective.process.visibility,
             ProcessVisibility::Isolated
         );
+    }
+
+    #[test]
+    fn baseline_seccomp_denies_namespace_syscall() {
+        use std::io::Read;
+        use std::os::unix::io::{FromRawFd, RawFd};
+
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        if child == 0 {
+            unsafe { libc::close(fds[0]) };
+            let result = install_kernel_ops_filter(&KernelOpsPolicy::baseline()).and_then(|()| {
+                let result = unsafe { libc::setns(-1, 0) };
+                let errno = if result == -1 {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                } else {
+                    0
+                };
+                let bytes = errno.to_ne_bytes();
+                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                if written == bytes.len() as isize {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+            if result.is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            unsafe {
+                libc::close(fds[1]);
+                libc::_exit(0)
+            };
+        }
+
+        unsafe { libc::close(fds[1]) };
+        let mut bytes = [0_u8; 4];
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        reader.read_exact(&mut bytes).expect("child errno");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(i32::from_ne_bytes(bytes), libc::EPERM);
     }
 
     #[tokio::test]
