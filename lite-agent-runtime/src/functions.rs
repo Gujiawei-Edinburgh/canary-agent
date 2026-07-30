@@ -27,6 +27,28 @@ pub struct FunctionLimits {
     pub max_output_bytes: usize,
 }
 
+pub trait FunctionOutputResolver: Send + Sync {
+    fn resolve(&self, function_name: &str, output: Value, max_output_bytes: usize)
+        -> Result<Value>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiscardResolver;
+
+impl FunctionOutputResolver for DiscardResolver {
+    fn resolve(
+        &self,
+        function_name: &str,
+        _output: Value,
+        max_output_bytes: usize,
+    ) -> Result<Value> {
+        Err(AgentError::FunctionOutputTooLarge {
+            name: function_name.to_string(),
+            max_bytes: max_output_bytes,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum FunctionExecution {
     Completed {
@@ -91,6 +113,7 @@ pub enum FunctionCallExecution {
 pub trait AgentFunction: Send + Sync {
     fn spec(&self) -> FunctionSpec;
     fn limits(&self) -> FunctionLimits;
+    fn output_resolver(&self) -> &dyn FunctionOutputResolver;
     fn call<'a>(
         &'a self,
         args: Value,
@@ -101,6 +124,7 @@ pub trait AgentFunction: Send + Sync {
 pub trait RuntimeCommand: Send + Sync {
     fn spec(&self) -> FunctionSpec;
     fn limits(&self) -> FunctionLimits;
+    fn output_resolver(&self) -> &dyn FunctionOutputResolver;
     fn call<'a>(
         &'a self,
         args: Value,
@@ -111,6 +135,7 @@ pub trait RuntimeCommand: Send + Sync {
 pub struct SimpleFunction<F> {
     spec: FunctionSpec,
     limits: FunctionLimits,
+    output_resolver: Arc<dyn FunctionOutputResolver>,
     handler: F,
 }
 
@@ -119,8 +144,17 @@ impl<F> SimpleFunction<F> {
         Self {
             spec,
             limits,
+            output_resolver: Arc::new(DiscardResolver),
             handler,
         }
+    }
+
+    pub fn with_output_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: FunctionOutputResolver + 'static,
+    {
+        self.output_resolver = Arc::new(resolver);
+        self
     }
 }
 
@@ -137,6 +171,10 @@ where
         self.limits
     }
 
+    fn output_resolver(&self) -> &dyn FunctionOutputResolver {
+        self.output_resolver.as_ref()
+    }
+
     fn call<'a>(
         &'a self,
         args: Value,
@@ -146,9 +184,17 @@ where
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FunctionRegistry {
     functions: BTreeMap<String, RegisteredFunction>,
+}
+
+impl Default for FunctionRegistry {
+    fn default() -> Self {
+        Self {
+            functions: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -213,7 +259,12 @@ impl FunctionRegistry {
                             name: name.to_string(),
                             timeout_ms: limits.time_budget.as_millis(),
                         })??;
-                let execution = enforce_output_limit(name, execution, limits.max_output_bytes)?;
+                let execution = enforce_output_limit(
+                    name,
+                    execution,
+                    limits.max_output_bytes,
+                    function.output_resolver(),
+                )?;
                 match execution {
                     FunctionExecution::Completed { output } => {
                         Ok(FunctionCallExecution::Completed {
@@ -246,7 +297,12 @@ impl FunctionRegistry {
                         timeout_ms: limits.time_budget.as_millis(),
                     })?? {
                     RuntimeCommandExecution::Completed { output, effects } => {
-                        ensure_output_limit(name, &output, limits.max_output_bytes)?;
+                        let output = resolve_output(
+                            name,
+                            output,
+                            limits.max_output_bytes,
+                            command.output_resolver(),
+                        )?;
                         Ok(FunctionCallExecution::Completed { output, effects })
                     }
                     RuntimeCommandExecution::SuspendedAfterExecution {
@@ -254,7 +310,12 @@ impl FunctionRegistry {
                         output,
                         effects,
                     } => {
-                        ensure_output_limit(name, &output, limits.max_output_bytes)?;
+                        let output = resolve_output(
+                            name,
+                            output,
+                            limits.max_output_bytes,
+                            command.output_resolver(),
+                        )?;
                         Ok(FunctionCallExecution::SuspendedAfterExecution {
                             suspension,
                             output,
@@ -288,29 +349,45 @@ fn validate_limits(name: &str, limits: FunctionLimits) -> Result<()> {
     Ok(())
 }
 
-fn ensure_output_limit(name: &str, output: &Value, max_output_bytes: usize) -> Result<()> {
-    if serde_json::to_vec(output)?.len() > max_output_bytes {
+fn resolve_output(
+    name: &str,
+    output: Value,
+    max_output_bytes: usize,
+    resolver: &dyn FunctionOutputResolver,
+) -> Result<Value> {
+    if serde_json::to_vec(&output)?.len() <= max_output_bytes {
+        return Ok(output);
+    }
+    let resolved = resolver.resolve(name, output, max_output_bytes)?;
+    if serde_json::to_vec(&resolved)?.len() > max_output_bytes {
         return Err(AgentError::FunctionOutputTooLarge {
             name: name.to_string(),
             max_bytes: max_output_bytes,
         });
     }
-    Ok(())
+    Ok(resolved)
 }
 
 fn enforce_output_limit(
     name: &str,
     execution: FunctionExecution,
     max_output_bytes: usize,
+    resolver: &dyn FunctionOutputResolver,
 ) -> Result<FunctionExecution> {
-    match &execution {
-        FunctionExecution::Completed { output }
-        | FunctionExecution::SuspendedAfterExecution { output, .. } => {
-            ensure_output_limit(name, output, max_output_bytes)?;
+    match execution {
+        FunctionExecution::Completed { output } => Ok(FunctionExecution::Completed {
+            output: resolve_output(name, output, max_output_bytes, resolver)?,
+        }),
+        FunctionExecution::SuspendedAfterExecution { suspension, output } => {
+            Ok(FunctionExecution::SuspendedAfterExecution {
+                suspension,
+                output: resolve_output(name, output, max_output_bytes, resolver)?,
+            })
         }
-        FunctionExecution::SuspendedBeforeExecution { .. } => {}
+        FunctionExecution::SuspendedBeforeExecution { suspension } => {
+            Ok(FunctionExecution::SuspendedBeforeExecution { suspension })
+        }
     }
-    Ok(execution)
 }
 
 pub fn builtin_registry() -> FunctionRegistry {
@@ -356,6 +433,10 @@ impl RuntimeCommand for UpdateGoal {
         }
     }
 
+    fn output_resolver(&self) -> &dyn FunctionOutputResolver {
+        &DiscardResolver
+    }
+
     fn call<'a>(
         &'a self,
         args: Value,
@@ -388,11 +469,24 @@ mod tests {
 
     use super::{
         builtin_registry, FunctionCallExecution, FunctionContext, FunctionExecution,
-        FunctionLimits, FunctionRegistry, FunctionSpec, SimpleFunction,
+        FunctionLimits, FunctionOutputResolver, FunctionRegistry, FunctionSpec, SimpleFunction,
     };
     use crate::AgentError;
     use serde_json::json;
     use std::time::Duration;
+
+    struct ReplaceLargeOutput;
+
+    impl FunctionOutputResolver for ReplaceLargeOutput {
+        fn resolve(
+            &self,
+            _function_name: &str,
+            _output: serde_json::Value,
+            _max_output_bytes: usize,
+        ) -> crate::Result<serde_json::Value> {
+            Ok(json!("ok"))
+        }
+    }
 
     #[tokio::test]
     async fn update_goal_returns_runtime_effect() {
@@ -506,5 +600,51 @@ mod tests {
             AgentError::FunctionOutputTooLarge { name, max_bytes }
                 if name == "large_output" && max_bytes == 10
         ));
+    }
+
+    #[tokio::test]
+    async fn custom_output_resolver_can_replace_large_output() {
+        let mut registry = FunctionRegistry::new();
+        registry.register(
+            SimpleFunction::new(
+                FunctionSpec {
+                    name: "large_output".to_string(),
+                    description: "Test function.".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+                FunctionLimits {
+                    time_budget: Duration::from_secs(1),
+                    max_output_bytes: 10,
+                },
+                |_args, _context| async {
+                    Ok(FunctionExecution::Completed {
+                        output: json!("this output is too large"),
+                    })
+                },
+            )
+            .with_output_resolver(ReplaceLargeOutput),
+        );
+
+        let (_, abort_signal) = crate::turn_abort_pair();
+        let execution = registry
+            .call(
+                "large_output",
+                json!({}),
+                FunctionContext {
+                    thread_id: "thread".to_string(),
+                    metadata: serde_json::Value::Null,
+                    turn_id: "turn".to_string(),
+                    call_id: "call".to_string(),
+                    projection: ThreadProjection::default(),
+                    abort_signal,
+                },
+            )
+            .await
+            .expect("resolver should handle large output");
+
+        let FunctionCallExecution::Completed { output, .. } = execution else {
+            panic!("expected completed function call");
+        };
+        assert_eq!(output, json!("ok"));
     }
 }

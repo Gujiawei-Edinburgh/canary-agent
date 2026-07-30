@@ -18,9 +18,9 @@ pub use context::{
 };
 pub use error::{AgentError, Result};
 pub use functions::{
-    builtin_registry, AgentFunction, FunctionCallExecution, FunctionContext, FunctionExecution,
-    FunctionLimits, FunctionRegistry, RuntimeCommand, RuntimeCommandExecution, RuntimeEffect,
-    SimpleFunction, SuspensionResolution,
+    builtin_registry, AgentFunction, DiscardResolver, FunctionCallExecution, FunctionContext,
+    FunctionExecution, FunctionLimits, FunctionOutputResolver, FunctionRegistry, RuntimeCommand,
+    RuntimeCommandExecution, RuntimeEffect, SimpleFunction, SuspensionResolution,
 };
 pub use model::{
     FunctionSpec, ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,

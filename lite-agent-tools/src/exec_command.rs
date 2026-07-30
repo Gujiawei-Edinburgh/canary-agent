@@ -4,8 +4,8 @@ use crate::sandbox::{
 };
 use lite_agent_kernel::events::{new_id, Suspension, SuspensionKind};
 use lite_agent_runtime::{
-    AgentError, AgentFunction, FunctionContext, FunctionExecution, FunctionLimits, FunctionSpec,
-    Result, TurnAbortSignal,
+    AgentError, AgentFunction, DiscardResolver, FunctionContext, FunctionExecution, FunctionLimits,
+    FunctionOutputResolver, FunctionSpec, Result, TurnAbortSignal,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -306,6 +306,10 @@ impl AgentFunction for ExecCommandTool {
             time_budget: self.config.default_timeout,
             max_output_bytes: self.config.max_output_bytes,
         }
+    }
+
+    fn output_resolver(&self) -> &dyn FunctionOutputResolver {
+        &DiscardResolver
     }
 
     fn call<'a>(

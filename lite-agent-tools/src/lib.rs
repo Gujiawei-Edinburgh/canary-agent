@@ -5,8 +5,8 @@
 
 use chrono::{Local, Utc};
 use lite_agent_runtime::{
-    AgentFunction, FunctionContext, FunctionExecution, FunctionLimits, FunctionRegistry,
-    FunctionSpec, Result,
+    AgentFunction, DiscardResolver, FunctionContext, FunctionExecution, FunctionLimits,
+    FunctionOutputResolver, FunctionRegistry, FunctionSpec, Result,
 };
 use serde_json::{json, Value};
 use std::future::Future;
@@ -43,6 +43,10 @@ impl AgentFunction for GetCurrentTime {
             time_budget: Duration::from_secs(5),
             max_output_bytes: 20 * 1024 * 1024,
         }
+    }
+
+    fn output_resolver(&self) -> &dyn FunctionOutputResolver {
+        &DiscardResolver
     }
 
     fn call<'a>(
