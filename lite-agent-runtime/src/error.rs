@@ -63,6 +63,18 @@ pub enum AgentError {
     #[error("function not found: {0}")]
     FunctionNotFound(String),
 
+    #[error("function {name} exceeded its time budget of {timeout_ms} ms")]
+    FunctionTimeout { name: String, timeout_ms: u128 },
+
+    #[error("function {name} declared an invalid zero time budget")]
+    InvalidFunctionTimeout { name: String },
+
+    #[error("function {name} output exceeded its limit of {max_bytes} bytes")]
+    FunctionOutputTooLarge { name: String, max_bytes: usize },
+
+    #[error("function {name} declared an invalid zero output limit")]
+    InvalidFunctionOutputLimit { name: String },
+
     #[error("function error in {name}: {message}")]
     Function { name: String, message: String },
 

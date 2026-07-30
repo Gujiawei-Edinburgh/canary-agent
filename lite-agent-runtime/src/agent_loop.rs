@@ -1456,8 +1456,8 @@ mod tests {
     use crate::store::{ThreadContextCache, ThreadStore};
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
-        FunctionCallHookResult, FunctionExecution, FunctionSpec, Result, RuntimeEvent, TurnOutcome,
-        TurnStateEvent, TurnStreamEvent,
+        FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionSpec, Result,
+        RuntimeEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use lite_agent_kernel::events::{
         Suspension, SuspensionKind, TokenUsage, ToolResult, TurnItemKind, TurnStatus,
@@ -1468,6 +1468,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct TestStore {
@@ -1611,6 +1612,10 @@ mod tests {
                     "additionalProperties": false
                 }),
             },
+            FunctionLimits {
+                time_budget: Duration::from_secs(1),
+                max_output_bytes: 20 * 1024 * 1024,
+            },
             |_args, _context| async {
                 Ok(FunctionExecution::Completed {
                     output: json!({ "ok": true }),
@@ -1626,6 +1631,10 @@ mod tests {
                     "properties": {},
                     "additionalProperties": false
                 }),
+            },
+            FunctionLimits {
+                time_budget: Duration::from_secs(1),
+                max_output_bytes: 20 * 1024 * 1024,
             },
             |_args, _context| async {
                 Ok(FunctionExecution::SuspendedAfterExecution {

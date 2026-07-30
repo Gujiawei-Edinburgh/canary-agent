@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct FunctionContext {
@@ -18,6 +19,12 @@ pub struct FunctionContext {
     pub call_id: String,
     pub projection: ThreadProjection,
     pub abort_signal: TurnAbortSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionLimits {
+    pub time_budget: Duration,
+    pub max_output_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +90,7 @@ pub enum FunctionCallExecution {
 
 pub trait AgentFunction: Send + Sync {
     fn spec(&self) -> FunctionSpec;
+    fn limits(&self) -> FunctionLimits;
     fn call<'a>(
         &'a self,
         args: Value,
@@ -92,6 +100,7 @@ pub trait AgentFunction: Send + Sync {
 
 pub trait RuntimeCommand: Send + Sync {
     fn spec(&self) -> FunctionSpec;
+    fn limits(&self) -> FunctionLimits;
     fn call<'a>(
         &'a self,
         args: Value,
@@ -101,12 +110,17 @@ pub trait RuntimeCommand: Send + Sync {
 
 pub struct SimpleFunction<F> {
     spec: FunctionSpec,
+    limits: FunctionLimits,
     handler: F,
 }
 
 impl<F> SimpleFunction<F> {
-    pub fn new(spec: FunctionSpec, handler: F) -> Self {
-        Self { spec, handler }
+    pub fn new(spec: FunctionSpec, limits: FunctionLimits, handler: F) -> Self {
+        Self {
+            spec,
+            limits,
+            handler,
+        }
     }
 }
 
@@ -117,6 +131,10 @@ where
 {
     fn spec(&self) -> FunctionSpec {
         self.spec.clone()
+    }
+
+    fn limits(&self) -> FunctionLimits {
+        self.limits
     }
 
     fn call<'a>(
@@ -185,39 +203,64 @@ impl FunctionRegistry {
             .get(name)
             .ok_or_else(|| AgentError::FunctionNotFound(name.to_string()))?;
         match function {
-            RegisteredFunction::Tool(function) => match function.call(args, context).await? {
-                FunctionExecution::Completed { output } => Ok(FunctionCallExecution::Completed {
-                    output,
-                    effects: Vec::new(),
-                }),
-                FunctionExecution::SuspendedAfterExecution { suspension, output } => {
-                    Ok(FunctionCallExecution::SuspendedAfterExecution {
-                        suspension,
-                        output,
-                        effects: Vec::new(),
-                    })
+            RegisteredFunction::Tool(function) => {
+                let limits = function.limits();
+                validate_limits(name, limits)?;
+                let execution =
+                    tokio::time::timeout(limits.time_budget, function.call(args, context))
+                        .await
+                        .map_err(|_| AgentError::FunctionTimeout {
+                            name: name.to_string(),
+                            timeout_ms: limits.time_budget.as_millis(),
+                        })??;
+                let execution = enforce_output_limit(name, execution, limits.max_output_bytes)?;
+                match execution {
+                    FunctionExecution::Completed { output } => {
+                        Ok(FunctionCallExecution::Completed {
+                            output,
+                            effects: Vec::new(),
+                        })
+                    }
+                    FunctionExecution::SuspendedAfterExecution { suspension, output } => {
+                        Ok(FunctionCallExecution::SuspendedAfterExecution {
+                            suspension,
+                            output,
+                            effects: Vec::new(),
+                        })
+                    }
+                    FunctionExecution::SuspendedBeforeExecution { suspension } => {
+                        Ok(FunctionCallExecution::SuspendedBeforeExecution {
+                            suspension,
+                            effects: Vec::new(),
+                        })
+                    }
                 }
-                FunctionExecution::SuspendedBeforeExecution { suspension } => {
-                    Ok(FunctionCallExecution::SuspendedBeforeExecution {
-                        suspension,
-                        effects: Vec::new(),
-                    })
-                }
-            },
+            }
             RegisteredFunction::RuntimeCommand(command) => {
-                match command.call(args, context).await? {
+                let limits = command.limits();
+                validate_limits(name, limits)?;
+                match tokio::time::timeout(limits.time_budget, command.call(args, context))
+                    .await
+                    .map_err(|_| AgentError::FunctionTimeout {
+                        name: name.to_string(),
+                        timeout_ms: limits.time_budget.as_millis(),
+                    })?? {
                     RuntimeCommandExecution::Completed { output, effects } => {
+                        ensure_output_limit(name, &output, limits.max_output_bytes)?;
                         Ok(FunctionCallExecution::Completed { output, effects })
                     }
                     RuntimeCommandExecution::SuspendedAfterExecution {
                         suspension,
                         output,
                         effects,
-                    } => Ok(FunctionCallExecution::SuspendedAfterExecution {
-                        suspension,
-                        output,
-                        effects,
-                    }),
+                    } => {
+                        ensure_output_limit(name, &output, limits.max_output_bytes)?;
+                        Ok(FunctionCallExecution::SuspendedAfterExecution {
+                            suspension,
+                            output,
+                            effects,
+                        })
+                    }
                     RuntimeCommandExecution::SuspendedBeforeExecution {
                         suspension,
                         effects,
@@ -229,6 +272,45 @@ impl FunctionRegistry {
             }
         }
     }
+}
+
+fn validate_limits(name: &str, limits: FunctionLimits) -> Result<()> {
+    if limits.time_budget.is_zero() {
+        return Err(AgentError::InvalidFunctionTimeout {
+            name: name.to_string(),
+        });
+    }
+    if limits.max_output_bytes == 0 {
+        return Err(AgentError::InvalidFunctionOutputLimit {
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_output_limit(name: &str, output: &Value, max_output_bytes: usize) -> Result<()> {
+    if serde_json::to_vec(output)?.len() > max_output_bytes {
+        return Err(AgentError::FunctionOutputTooLarge {
+            name: name.to_string(),
+            max_bytes: max_output_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn enforce_output_limit(
+    name: &str,
+    execution: FunctionExecution,
+    max_output_bytes: usize,
+) -> Result<FunctionExecution> {
+    match &execution {
+        FunctionExecution::Completed { output }
+        | FunctionExecution::SuspendedAfterExecution { output, .. } => {
+            ensure_output_limit(name, output, max_output_bytes)?;
+        }
+        FunctionExecution::SuspendedBeforeExecution { .. } => {}
+    }
+    Ok(execution)
 }
 
 pub fn builtin_registry() -> FunctionRegistry {
@@ -267,6 +349,13 @@ impl RuntimeCommand for UpdateGoal {
         }
     }
 
+    fn limits(&self) -> FunctionLimits {
+        FunctionLimits {
+            time_budget: Duration::from_secs(1),
+            max_output_bytes: 20 * 1024 * 1024,
+        }
+    }
+
     fn call<'a>(
         &'a self,
         args: Value,
@@ -297,8 +386,13 @@ mod tests {
     use lite_agent_kernel::events::{GoalStatus, Thread};
     use lite_agent_kernel::projection::ThreadProjection;
 
-    use super::{builtin_registry, FunctionCallExecution, FunctionContext};
+    use super::{
+        builtin_registry, FunctionCallExecution, FunctionContext, FunctionExecution,
+        FunctionLimits, FunctionRegistry, FunctionSpec, SimpleFunction,
+    };
+    use crate::AgentError;
     use serde_json::json;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn update_goal_returns_runtime_effect() {
@@ -325,6 +419,92 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [super::RuntimeEffect::SetGoal(goal)] if goal.status == GoalStatus::Active
+        ));
+    }
+
+    #[tokio::test]
+    async fn function_calls_are_stopped_at_the_declared_time_budget() {
+        let mut registry = FunctionRegistry::new();
+        registry.register(SimpleFunction::new(
+            FunctionSpec {
+                name: "never_finishes".to_string(),
+                description: "Test function.".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            FunctionLimits {
+                time_budget: Duration::from_millis(10),
+                max_output_bytes: 20 * 1024 * 1024,
+            },
+            |_args, _context| async {
+                std::future::pending::<crate::Result<FunctionExecution>>().await
+            },
+        ));
+
+        let (_, abort_signal) = crate::turn_abort_pair();
+        let error = registry
+            .call(
+                "never_finishes",
+                json!({}),
+                FunctionContext {
+                    thread_id: "thread".to_string(),
+                    metadata: serde_json::Value::Null,
+                    turn_id: "turn".to_string(),
+                    call_id: "call".to_string(),
+                    projection: ThreadProjection::default(),
+                    abort_signal,
+                },
+            )
+            .await
+            .expect_err("call should time out");
+
+        assert!(matches!(
+            error,
+            AgentError::FunctionTimeout { name, timeout_ms }
+                if name == "never_finishes" && timeout_ms == 10
+        ));
+    }
+
+    #[tokio::test]
+    async fn function_output_is_checked_against_the_declared_limit() {
+        let mut registry = FunctionRegistry::new();
+        registry.register(SimpleFunction::new(
+            FunctionSpec {
+                name: "large_output".to_string(),
+                description: "Test function.".to_string(),
+                parameters: json!({"type": "object"}),
+            },
+            FunctionLimits {
+                time_budget: Duration::from_secs(1),
+                max_output_bytes: 10,
+            },
+            |_args, _context| async {
+                Ok(FunctionExecution::Completed {
+                    output: json!("this output is too large"),
+                })
+            },
+        ));
+
+        let (_, abort_signal) = crate::turn_abort_pair();
+        let error = registry
+            .call(
+                "large_output",
+                json!({}),
+                FunctionContext {
+                    thread_id: "thread".to_string(),
+                    metadata: serde_json::Value::Null,
+                    turn_id: "turn".to_string(),
+                    call_id: "call".to_string(),
+                    projection: ThreadProjection::default(),
+                    abort_signal,
+                },
+            )
+            .await
+            .expect_err("output should exceed its limit");
+
+        assert!(matches!(
+            error,
+            AgentError::FunctionOutputTooLarge { name, max_bytes }
+                if name == "large_output" && max_bytes == 10
         ));
     }
 }

@@ -5,11 +5,13 @@
 
 use chrono::{Local, Utc};
 use lite_agent_runtime::{
-    AgentFunction, FunctionContext, FunctionExecution, FunctionRegistry, FunctionSpec, Result,
+    AgentFunction, FunctionContext, FunctionExecution, FunctionLimits, FunctionRegistry,
+    FunctionSpec, Result,
 };
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 mod exec_command;
 pub mod sandbox;
@@ -33,6 +35,13 @@ impl AgentFunction for GetCurrentTime {
                 "properties": {},
                 "additionalProperties": false
             }),
+        }
+    }
+
+    fn limits(&self) -> FunctionLimits {
+        FunctionLimits {
+            time_budget: Duration::from_secs(5),
+            max_output_bytes: 20 * 1024 * 1024,
         }
     }
 

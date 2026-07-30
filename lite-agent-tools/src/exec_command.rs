@@ -4,8 +4,8 @@ use crate::sandbox::{
 };
 use lite_agent_kernel::events::{new_id, Suspension, SuspensionKind};
 use lite_agent_runtime::{
-    AgentError, AgentFunction, FunctionContext, FunctionExecution, FunctionSpec, Result,
-    TurnAbortSignal,
+    AgentError, AgentFunction, FunctionContext, FunctionExecution, FunctionLimits, FunctionSpec,
+    Result, TurnAbortSignal,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -294,10 +294,17 @@ impl AgentFunction for ExecCommandTool {
                 "required": ["cmd"],
                 "properties": {
                     "cmd": { "type": "string", "description": "Shell command to run." },
-                    "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional timeout in milliseconds." }
+                    "timeout_ms": { "type": "integer", "minimum": 1, "description": "Optional timeout in milliseconds; values above the tool time budget are capped." }
                 },
                 "additionalProperties": false
             }),
+        }
+    }
+
+    fn limits(&self) -> FunctionLimits {
+        FunctionLimits {
+            time_budget: self.config.default_timeout,
+            max_output_bytes: self.config.max_output_bytes,
         }
     }
 
