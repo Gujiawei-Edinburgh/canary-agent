@@ -1345,14 +1345,22 @@ impl Agent {
     where
         F: Future<Output = Result<T>> + Send,
     {
+        if abort_signal.is_cancelled() {
+            let reason = "turn aborted by caller".to_string();
+            tracing::info!(thread_id, turn_id, step, "turn aborted before step");
+            self.abort_turn(thread, turn_id, reason)?;
+            return Ok(None);
+        }
+
         tokio::select! {
-            result = future => Ok(Some(result)),
+            biased;
             () = abort_signal.wait_cancelled() => {
                 let reason = "turn aborted by caller".to_string();
                 tracing::info!(thread_id, turn_id, step, "turn aborted");
                 self.abort_turn(thread, turn_id, reason)?;
                 Ok(None)
             }
+            result = future => Ok(Some(result)),
         }
     }
 
@@ -2399,6 +2407,47 @@ mod tests {
                     result: ToolResult::Error { error },
                     ..
                 } if call_id == "c2" && error.contains("max function calls")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_before_an_immediate_function_starts() {
+        let store = Arc::new(TestStore::default());
+        let agent = agent_with(
+            store.clone(),
+            vec![ModelResponse::FunctionCalls {
+                calls: vec![ModelFunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "test_function".to_string(),
+                    arguments: json!({}),
+                }],
+            }],
+        );
+        let aborting_agent = agent.clone();
+
+        let outcome = agent
+            .run_turn_stream("t", "run it", move |event| {
+                if matches!(
+                    event,
+                    TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested { .. })
+                ) {
+                    aborting_agent.abort("t").expect("active turn");
+                }
+            })
+            .await
+            .expect("turn");
+
+        assert!(matches!(outcome, TurnOutcome::Aborted { .. }));
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.turns[0].status, TurnStatus::Aborted);
+        assert!(!thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::ToolOutput {
+                    result: ToolResult::Success { .. },
+                    ..
+                }
             )
         }));
     }
