@@ -25,14 +25,29 @@ use tokio::sync::watch;
 
 #[derive(Clone)]
 pub struct AgentConfig {
-    pub max_model_iterations: usize,
+    pub turn_execution_limits: TurnExecutionLimits,
     pub system_prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnExecutionLimits {
+    pub max_model_iterations: usize,
+    pub max_function_calls: usize,
+}
+
+impl Default for TurnExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_model_iterations: 128,
+            max_function_calls: 1024,
+        }
+    }
 }
 
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
-            .field("max_model_iterations", &self.max_model_iterations)
+            .field("turn_execution_limits", &self.turn_execution_limits)
             .field("system_prompt", &self.system_prompt)
             .finish()
     }
@@ -41,7 +56,7 @@ impl std::fmt::Debug for AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_model_iterations: 128,
+            turn_execution_limits: TurnExecutionLimits::default(),
             system_prompt: concat!(
                 "You are an agent runtime assistant. Use functions only when they are useful. ",
                 "Thread goal is explicit durable state. Turn items are factual append-only records. ",
@@ -706,9 +721,11 @@ impl Agent {
             turn_id: turn_id.clone(),
         }));
         let mut turn_token_usage = TokenUsage::default();
+        let mut function_call_count = 0;
+        let limits = self.config.turn_execution_limits;
 
         let outcome = 'turn_loop: {
-            for iteration in 0..self.config.max_model_iterations {
+            for iteration in 0..limits.max_model_iterations {
                 let session = Session::from_thread(&thread, turn_id.clone());
                 let cached_context = self.store.load_context_cache(thread_id).await?;
                 let request = self
@@ -840,7 +857,14 @@ impl Agent {
                             trace_model_response,
                         );
 
-                        for (call_index, call) in calls.iter().enumerate() {
+                        let remaining_function_calls = limits
+                            .max_function_calls
+                            .saturating_sub(function_call_count);
+                        let admitted_call_count = calls.len().min(remaining_function_calls);
+                        function_call_count += admitted_call_count;
+
+                        for (call_index, call) in calls.iter().take(admitted_call_count).enumerate()
+                        {
                             let call_id = call.call_id.clone();
                             let name = call.name.clone();
                             on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
@@ -1183,6 +1207,62 @@ impl Agent {
                                 }
                             }
                         }
+
+                        if admitted_call_count < calls.len() {
+                            let error =
+                                AgentError::MaxFunctionCalls(limits.max_function_calls).to_string();
+                            let skipped_error =
+                                format!("function call not executed because {error}");
+                            let skipped_calls = calls
+                                .iter()
+                                .skip(admitted_call_count)
+                                .map(|skipped_call| {
+                                    (skipped_call.call_id.clone(), skipped_call.name.clone())
+                                })
+                                .collect::<Vec<_>>();
+                            Self::push_turn_items(
+                                &mut thread,
+                                &turn_id,
+                                skipped_calls
+                                    .iter()
+                                    .map(|(call_id, name)| {
+                                        TurnItem::new(
+                                            TurnItemSource::Tool,
+                                            TurnItemKind::ToolOutput {
+                                                call_id: call_id.clone(),
+                                                name: name.clone(),
+                                                result: ToolResult::Error {
+                                                    error: skipped_error.clone(),
+                                                },
+                                            },
+                                        )
+                                    })
+                                    .collect(),
+                            )?;
+                            self.fail_turn(&mut thread, &turn_id, error.clone())?;
+                            thread = self.commit_thread(thread, lease.fence()).await?;
+                            for (call_id, name) in skipped_calls {
+                                self.record_trace(
+                                    &mut trace_sequence,
+                                    thread_id,
+                                    &turn_id,
+                                    TraceEventKind::ToolOutput {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        result: ToolResult::Error {
+                                            error: skipped_error.clone(),
+                                        },
+                                    },
+                                );
+                                on_event(TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
+                                    call_id,
+                                    name,
+                                    error: skipped_error.clone(),
+                                }));
+                            }
+                            tracing::warn!(error, "turn exceeded max function calls");
+                            break 'turn_loop TurnOutcome::Failed { error };
+                        }
                     }
                     ModelResponse::AssistantMessage { .. }
                     | ModelResponse::FunctionCalls { .. } => {
@@ -1191,7 +1271,7 @@ impl Agent {
                 }
             }
 
-            let error = AgentError::MaxIterations(self.config.max_model_iterations).to_string();
+            let error = AgentError::MaxIterations(limits.max_model_iterations).to_string();
             tracing::warn!(error, "turn exceeded max iterations");
             self.fail_turn(&mut thread, &turn_id, error.clone())?;
             break 'turn_loop TurnOutcome::Failed { error };
@@ -1457,7 +1537,7 @@ mod tests {
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionSpec, Result,
-        RuntimeEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+        RuntimeEvent, TurnExecutionLimits, TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use lite_agent_kernel::events::{
         Suspension, SuspensionKind, TokenUsage, ToolResult, TurnItemKind, TurnStatus,
@@ -2236,7 +2316,10 @@ mod tests {
         let store = Arc::new(TestStore::default());
         let agent = Agent::new(
             AgentConfig {
-                max_model_iterations: 1,
+                turn_execution_limits: TurnExecutionLimits {
+                    max_model_iterations: 1,
+                    ..TurnExecutionLimits::default()
+                },
                 ..AgentConfig::default()
             },
             store.clone(),
@@ -2259,5 +2342,64 @@ mod tests {
             .items
             .iter()
             .any(|item| matches!(item.kind, TurnItemKind::TurnFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn function_call_limit_records_skipped_calls_and_fails_turn() {
+        let store = Arc::new(TestStore::default());
+        let agent = Agent::new(
+            AgentConfig {
+                turn_execution_limits: TurnExecutionLimits {
+                    max_model_iterations: 4,
+                    max_function_calls: 1,
+                },
+                ..AgentConfig::default()
+            },
+            store.clone(),
+            Arc::new(MockModel::new(vec![ModelResponse::FunctionCalls {
+                calls: vec![
+                    ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "test_function".to_string(),
+                        arguments: json!({}),
+                    },
+                    ModelFunctionCall {
+                        call_id: "c2".to_string(),
+                        name: "test_function".to_string(),
+                        arguments: json!({}),
+                    },
+                ],
+            }])),
+            test_registry(),
+            Arc::new(crate::session::LocalSessionCoordinator::default()),
+        );
+
+        let outcome = agent.run_turn("t", "call twice").await.expect("turn");
+        assert!(
+            matches!(outcome, TurnOutcome::Failed { ref error } if error.contains("max function calls"))
+        );
+
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.turns[0].status, TurnStatus::Failed);
+        assert!(thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::ToolOutput {
+                    call_id,
+                    result: ToolResult::Success { .. },
+                    ..
+                } if call_id == "c1"
+            )
+        }));
+        assert!(thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::ToolOutput {
+                    call_id,
+                    result: ToolResult::Error { error },
+                    ..
+                } if call_id == "c2" && error.contains("max function calls")
+            )
+        }));
     }
 }
