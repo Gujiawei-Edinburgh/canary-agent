@@ -1090,6 +1090,14 @@ impl Agent {
                                         TurnStatus::Suspended,
                                     )?;
                                     thread = self.commit_thread(thread, lease.fence()).await?;
+                                    self.record_trace(
+                                        &mut trace_sequence,
+                                        thread_id,
+                                        &turn_id,
+                                        TraceEventKind::SuspensionCreated {
+                                            suspension: suspension.clone(),
+                                        },
+                                    );
                                     for (skipped_call_id, skipped_name, error) in &skipped_calls {
                                         self.record_trace(
                                             &mut trace_sequence,
@@ -1180,6 +1188,14 @@ impl Agent {
                                         TurnStatus::Suspended,
                                     )?;
                                     thread = self.commit_thread(thread, lease.fence()).await?;
+                                    self.record_trace(
+                                        &mut trace_sequence,
+                                        thread_id,
+                                        &turn_id,
+                                        TraceEventKind::SuspensionCreated {
+                                            suspension: suspension.clone(),
+                                        },
+                                    );
                                     self.record_trace(
                                         &mut trace_sequence,
                                         thread_id,
@@ -1424,11 +1440,20 @@ impl Agent {
 
         for (call_index, (call, started_attempt)) in pending_calls.iter().enumerate() {
             let attempt = started_attempt.unwrap_or(0).saturating_add(1);
+            let recovery_policy = self.function_registry.recovery_policy(&call.name)?;
+            self.record_trace(
+                trace_sequence,
+                &thread_id,
+                turn_id,
+                TraceEventKind::RecoveryStarted {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    attempt,
+                    policy: recovery_policy,
+                },
+            );
             if started_attempt.is_some()
-                && matches!(
-                    self.function_registry.recovery_policy(&call.name)?,
-                    FunctionRecoveryPolicy::NonIdempotent
-                )
+                && matches!(recovery_policy, FunctionRecoveryPolicy::NonIdempotent)
             {
                 let suspension = Suspension {
                     id: new_id("suspension"),
@@ -1454,6 +1479,14 @@ impl Agent {
                 )?;
                 Self::set_turn_status(thread, turn_id, TurnStatus::Suspended)?;
                 *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                self.record_trace(
+                    trace_sequence,
+                    &thread_id,
+                    turn_id,
+                    TraceEventKind::SuspensionCreated {
+                        suspension: suspension.clone(),
+                    },
+                );
                 on_event(TurnStreamEvent::State(TurnStateEvent::Suspended {
                     suspension: suspension.clone(),
                 }));
@@ -1578,6 +1611,14 @@ impl Agent {
                     Self::push_turn_items(thread, turn_id, items)?;
                     Self::set_turn_status(thread, turn_id, TurnStatus::Suspended)?;
                     *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                    self.record_trace(
+                        trace_sequence,
+                        &thread_id,
+                        turn_id,
+                        TraceEventKind::SuspensionCreated {
+                            suspension: suspension.clone(),
+                        },
+                    );
                     on_event(TurnStreamEvent::State(TurnStateEvent::Suspended {
                         suspension: suspension.clone(),
                     }));
@@ -1868,6 +1909,7 @@ mod tests {
         ModelStreamHandler,
     };
     use crate::store::{ThreadContextCache, ThreadStore};
+    use crate::trace::{TraceCollector, TraceEvent, TraceEventKind};
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionRecoveryPolicy,
@@ -1885,6 +1927,17 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingTraceCollector {
+        events: Mutex<Vec<TraceEvent>>,
+    }
+
+    impl TraceCollector for RecordingTraceCollector {
+        fn record(&self, event: TraceEvent) {
+            self.events.lock().expect("trace events").push(event);
+        }
+    }
 
     #[derive(Default)]
     struct TestStore {
@@ -2887,11 +2940,80 @@ mod tests {
         thread.turns.push(turn);
         store.insert_thread(thread);
 
-        let agent = agent_with(store.clone(), vec![]);
+        let collector = Arc::new(RecordingTraceCollector::default());
+        let agent =
+            agent_with(store.clone(), vec![]).with_shared_trace_collector(collector.clone());
         let outcome = agent.recover_turn("t", |_| {}).await.expect("recovery");
         assert!(matches!(outcome, TurnOutcome::Suspended { ref suspension }
             if suspension.kind == SuspensionKind::FunctionRecovery));
         let thread = store.load("t").await.expect("thread");
         assert_eq!(thread.turns[0].status, TurnStatus::Suspended);
+        let events = collector.events.lock().expect("trace events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                TraceEventKind::RecoveryStarted {
+                    ref call_id,
+                    attempt: 2,
+                    ..
+                } if call_id == "c1"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event.kind, TraceEventKind::SuspensionCreated { ref suspension }
+                if suspension.kind == SuspensionKind::FunctionRecovery)
+        }));
+    }
+
+    #[tokio::test]
+    async fn recovery_executes_call_without_a_started_marker() {
+        let store = Arc::new(TestStore::default());
+        let mut thread = Thread::new("t");
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Model,
+            TurnItemKind::ModelResponse {
+                text: None,
+                function_calls: vec![ModelFunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "test_function".to_string(),
+                    arguments: json!({}),
+                }],
+            },
+        ));
+        thread.turns.push(turn);
+        store.insert_thread(thread);
+
+        let agent = agent_with(
+            store.clone(),
+            vec![ModelResponse::AssistantMessage {
+                text: "continued".to_string(),
+            }],
+        );
+        let outcome = agent.recover_turn("t", |_| {}).await.expect("recovery");
+        assert_eq!(
+            outcome,
+            TurnOutcome::AssistantMessage {
+                text: "continued".to_string()
+            }
+        );
+        let thread = store.load("t").await.expect("thread");
+        assert!(thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::FunctionCallStarted { call_id, attempt, .. }
+                    if call_id == "c1" && *attempt == 1
+            )
+        }));
+        assert!(thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::ToolOutput {
+                    call_id,
+                    result: ToolResult::Success { .. },
+                    ..
+                } if call_id == "c1"
+            )
+        }));
     }
 }

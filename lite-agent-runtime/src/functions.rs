@@ -3,7 +3,7 @@ use crate::error::{AgentError, Result};
 use crate::model::FunctionSpec;
 use lite_agent_kernel::events::{GoalState, GoalStatus, Suspension};
 use lite_agent_kernel::projection::ThreadProjection;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -27,7 +27,8 @@ pub struct FunctionLimits {
     pub max_output_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FunctionRecoveryPolicy {
     Idempotent,
     NonIdempotent,

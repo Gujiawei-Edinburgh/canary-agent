@@ -1,4 +1,5 @@
-use lite_agent_kernel::{ModelFunctionCall, ToolResult};
+use crate::functions::FunctionRecoveryPolicy;
+use lite_agent_kernel::{ModelFunctionCall, Suspension, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -29,10 +30,19 @@ pub enum TraceEventKind {
         name: String,
         arguments: Value,
     },
+    RecoveryStarted {
+        call_id: String,
+        name: String,
+        attempt: u32,
+        policy: FunctionRecoveryPolicy,
+    },
     ToolOutput {
         call_id: String,
         name: String,
         result: ToolResult,
+    },
+    SuspensionCreated {
+        suspension: Suspension,
     },
     TurnFinished {
         status: TraceTurnStatus,
