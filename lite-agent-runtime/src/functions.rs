@@ -27,6 +27,12 @@ pub struct FunctionLimits {
     pub max_output_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionRecoveryPolicy {
+    Idempotent,
+    NonIdempotent,
+}
+
 pub trait FunctionOutputResolver: Send + Sync {
     fn resolve(&self, function_name: &str, output: Value, max_output_bytes: usize)
         -> Result<Value>;
@@ -113,6 +119,7 @@ pub enum FunctionCallExecution {
 pub trait AgentFunction: Send + Sync {
     fn spec(&self) -> FunctionSpec;
     fn limits(&self) -> FunctionLimits;
+    fn recovery_policy(&self) -> FunctionRecoveryPolicy;
     fn output_resolver(&self) -> &dyn FunctionOutputResolver;
     fn call<'a>(
         &'a self,
@@ -124,6 +131,7 @@ pub trait AgentFunction: Send + Sync {
 pub trait RuntimeCommand: Send + Sync {
     fn spec(&self) -> FunctionSpec;
     fn limits(&self) -> FunctionLimits;
+    fn recovery_policy(&self) -> FunctionRecoveryPolicy;
     fn output_resolver(&self) -> &dyn FunctionOutputResolver;
     fn call<'a>(
         &'a self,
@@ -135,15 +143,22 @@ pub trait RuntimeCommand: Send + Sync {
 pub struct SimpleFunction<F> {
     spec: FunctionSpec,
     limits: FunctionLimits,
+    recovery_policy: FunctionRecoveryPolicy,
     output_resolver: Arc<dyn FunctionOutputResolver>,
     handler: F,
 }
 
 impl<F> SimpleFunction<F> {
-    pub fn new(spec: FunctionSpec, limits: FunctionLimits, handler: F) -> Self {
+    pub fn new(
+        spec: FunctionSpec,
+        limits: FunctionLimits,
+        recovery_policy: FunctionRecoveryPolicy,
+        handler: F,
+    ) -> Self {
         Self {
             spec,
             limits,
+            recovery_policy,
             output_resolver: Arc::new(DiscardResolver),
             handler,
         }
@@ -169,6 +184,10 @@ where
 
     fn limits(&self) -> FunctionLimits {
         self.limits
+    }
+
+    fn recovery_policy(&self) -> FunctionRecoveryPolicy {
+        self.recovery_policy
     }
 
     fn output_resolver(&self) -> &dyn FunctionOutputResolver {
@@ -228,6 +247,17 @@ impl FunctionRegistry {
                 RegisteredFunction::RuntimeCommand(command) => command.spec(),
             })
             .collect()
+    }
+
+    pub fn recovery_policy(&self, name: &str) -> Result<FunctionRecoveryPolicy> {
+        let function = self
+            .functions
+            .get(name)
+            .ok_or_else(|| AgentError::FunctionNotFound(name.to_string()))?;
+        Ok(match function {
+            RegisteredFunction::Tool(function) => function.recovery_policy(),
+            RegisteredFunction::RuntimeCommand(command) => command.recovery_policy(),
+        })
     }
 
     pub async fn call(
@@ -425,6 +455,10 @@ impl RuntimeCommand for UpdateGoal {
         }
     }
 
+    fn recovery_policy(&self) -> FunctionRecoveryPolicy {
+        FunctionRecoveryPolicy::Idempotent
+    }
+
     fn output_resolver(&self) -> &dyn FunctionOutputResolver {
         &DiscardResolver
     }
@@ -461,7 +495,8 @@ mod tests {
 
     use super::{
         builtin_registry, FunctionCallExecution, FunctionContext, FunctionExecution,
-        FunctionLimits, FunctionOutputResolver, FunctionRegistry, FunctionSpec, SimpleFunction,
+        FunctionLimits, FunctionOutputResolver, FunctionRecoveryPolicy, FunctionRegistry,
+        FunctionSpec, SimpleFunction,
     };
     use crate::AgentError;
     use serde_json::json;
@@ -521,6 +556,7 @@ mod tests {
                 time_budget: Duration::from_millis(10),
                 max_output_bytes: 20 * 1024 * 1024,
             },
+            FunctionRecoveryPolicy::NonIdempotent,
             |_args, _context| async {
                 std::future::pending::<crate::Result<FunctionExecution>>().await
             },
@@ -563,6 +599,7 @@ mod tests {
                 time_budget: Duration::from_secs(1),
                 max_output_bytes: 10,
             },
+            FunctionRecoveryPolicy::Idempotent,
             |_args, _context| async {
                 Ok(FunctionExecution::Completed {
                     output: json!("this output is too large"),
@@ -608,6 +645,7 @@ mod tests {
                     time_budget: Duration::from_secs(1),
                     max_output_bytes: 10,
                 },
+                FunctionRecoveryPolicy::Idempotent,
                 |_args, _context| async {
                     Ok(FunctionExecution::Completed {
                         output: json!("this output is too large"),

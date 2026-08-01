@@ -1,7 +1,8 @@
 use crate::context::{CompactingContextBuilder, ContextBuildInput, ContextBuilder};
 use crate::error::{AgentError, Result};
 use crate::functions::{
-    FunctionCallExecution, FunctionContext, FunctionRegistry, RuntimeEffect, SuspensionResolution,
+    FunctionCallExecution, FunctionContext, FunctionRecoveryPolicy, FunctionRegistry,
+    RuntimeEffect, SuspensionResolution,
 };
 use crate::model::{ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::session::{SessionCoordinator, SessionLease};
@@ -10,8 +11,8 @@ use crate::trace::{
     NoopTraceCollector, TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus,
 };
 use lite_agent_kernel::events::{
-    Suspension, Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind,
-    TurnItemSource, TurnStatus,
+    new_id, Suspension, SuspensionKind, Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem,
+    TurnItemKind, TurnItemSource, TurnStatus,
 };
 use lite_agent_kernel::projection::ThreadProjection;
 use lite_agent_kernel::RevisionToken;
@@ -397,6 +398,29 @@ impl Agent {
         .await
     }
 
+    /// Recover a turn left running by a previous process after a crash.
+    ///
+    /// Calls that were never started are executed normally. Calls with a
+    /// durable start marker but no terminal output are retried only when the
+    /// registered function is idempotent; otherwise the turn is suspended for
+    /// external reconciliation.
+    pub async fn recover_turn<'a, F>(&self, thread_id: &str, on_event: F) -> Result<TurnOutcome>
+    where
+        F: FnMut(TurnStreamEvent) + Send + 'a,
+    {
+        let active_turn = self.register_active_turn(thread_id)?;
+        let lease = self.session_coordinator.acquire(thread_id).await?;
+        self.run_turn_stream_abortable_internal(
+            thread_id,
+            None,
+            active_turn.signal.clone(),
+            on_event,
+            0,
+            &lease,
+        )
+        .await
+    }
+
     /// Resume the existing turn associated with a suspension.
     ///
     /// The caller must update any external authorization state before calling
@@ -514,6 +538,25 @@ impl Agent {
                     }));
                     true
                 } else if matches!(resolution, SuspensionResolution::Approve) {
+                    Self::push_turn_items(
+                        &mut thread,
+                        &pending.turn_id,
+                        vec![TurnItem::new(
+                            TurnItemSource::Runtime,
+                            TurnItemKind::FunctionCallStarted {
+                                call_id: call.call_id.clone(),
+                                name: call.name.clone(),
+                                attempt: pending
+                                    .suspension
+                                    .payload
+                                    .get("attempt")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(1) as u32
+                                    + 1,
+                            },
+                        )],
+                    )?;
+                    thread = self.commit_thread(thread, lease.fence()).await?;
                     on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
                         call_id: call.call_id.clone(),
                         name: call.name.clone(),
@@ -672,6 +715,7 @@ impl Agent {
             Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
             Err(error) => return Err(error),
         };
+        let recovering = user_text.is_none();
         let (turn_id, trace_user_text) = if let Some(user_text) = user_text {
             if let Some(pending) = ThreadProjection::from_thread(&thread).pending_suspension {
                 return Err(AgentError::SuspendedTurn {
@@ -725,6 +769,21 @@ impl Agent {
         let limits = self.config.turn_execution_limits;
 
         let outcome = 'turn_loop: {
+            if recovering {
+                if let Some(outcome) = self
+                    .recover_pending_function_calls(
+                        &mut thread,
+                        &turn_id,
+                        &mut abort_signal,
+                        lease,
+                        &mut on_event,
+                        &mut trace_sequence,
+                    )
+                    .await?
+                {
+                    break 'turn_loop outcome;
+                }
+            }
             for iteration in 0..limits.max_model_iterations {
                 let session = Session::from_thread(&thread, turn_id.clone());
                 let cached_context = self.store.load_context_cache(thread_id).await?;
@@ -894,6 +953,21 @@ impl Agent {
                                 .await;
                             let execution = match pre_hook_result {
                                 Ok(()) => {
+                                    Self::push_turn_items(
+                                        &mut thread,
+                                        &turn_id,
+                                        vec![TurnItem::new(
+                                            TurnItemSource::Runtime,
+                                            TurnItemKind::FunctionCallStarted {
+                                                call_id: call_id.clone(),
+                                                name: name.clone(),
+                                                attempt: 1,
+                                            },
+                                        )],
+                                    )?;
+                                    thread = self.commit_thread(thread, lease.fence()).await?;
+                                    hook_context.projection =
+                                        ThreadProjection::from_thread(&thread);
                                     let context = FunctionContext {
                                         thread_id: thread.id.clone(),
                                         metadata: thread.metadata.clone(),
@@ -1333,6 +1407,258 @@ impl Agent {
         });
     }
 
+    async fn recover_pending_function_calls(
+        &self,
+        thread: &mut Thread,
+        turn_id: &str,
+        abort_signal: &mut TurnAbortSignal,
+        lease: &SessionLease,
+        on_event: &mut TurnEventHandler<'_>,
+        trace_sequence: &mut u64,
+    ) -> Result<Option<TurnOutcome>> {
+        let thread_id = thread.id.clone();
+        let pending_calls = Self::pending_function_calls(thread, turn_id);
+        if pending_calls.is_empty() {
+            return Ok(None);
+        }
+
+        for (call_index, (call, started_attempt)) in pending_calls.iter().enumerate() {
+            let attempt = started_attempt.unwrap_or(0).saturating_add(1);
+            if started_attempt.is_some()
+                && matches!(
+                    self.function_registry.recovery_policy(&call.name)?,
+                    FunctionRecoveryPolicy::NonIdempotent
+                )
+            {
+                let suspension = Suspension {
+                    id: new_id("suspension"),
+                    kind: SuspensionKind::FunctionRecovery,
+                    payload: serde_json::json!({
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "attempt": attempt,
+                        "deferred": true,
+                        "recovery": true,
+                        "reason": "function started but no terminal output was recorded"
+                    }),
+                };
+                Self::push_turn_items(
+                    thread,
+                    turn_id,
+                    vec![TurnItem::new(
+                        TurnItemSource::Runtime,
+                        TurnItemKind::SuspensionCreated {
+                            suspension: suspension.clone(),
+                        },
+                    )],
+                )?;
+                Self::set_turn_status(thread, turn_id, TurnStatus::Suspended)?;
+                *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                on_event(TurnStreamEvent::State(TurnStateEvent::Suspended {
+                    suspension: suspension.clone(),
+                }));
+                return Ok(Some(TurnOutcome::Suspended { suspension }));
+            }
+
+            Self::push_turn_items(
+                thread,
+                turn_id,
+                vec![TurnItem::new(
+                    TurnItemSource::Runtime,
+                    TurnItemKind::FunctionCallStarted {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        attempt,
+                    },
+                )],
+            )?;
+            *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+
+            on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+            }));
+            self.record_trace(
+                trace_sequence,
+                &thread_id,
+                turn_id,
+                TraceEventKind::FunctionCall {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            );
+
+            let context = FunctionContext {
+                thread_id: thread.id.clone(),
+                metadata: thread.metadata.clone(),
+                turn_id: turn_id.to_string(),
+                call_id: call.call_id.clone(),
+                projection: ThreadProjection::from_thread(thread),
+                abort_signal: abort_signal.clone(),
+            };
+            let execution = self
+                .await_step_or_abort(
+                    self.function_registry
+                        .call(&call.name, call.arguments.clone(), context),
+                    abort_signal,
+                    thread,
+                    &thread_id,
+                    turn_id,
+                    "recovered function call",
+                )
+                .await?;
+            let Some(execution) = execution else {
+                Self::append_aborted_function_outputs(
+                    thread,
+                    turn_id,
+                    &pending_calls
+                        .iter()
+                        .skip(call_index)
+                        .map(|(call, _)| call.clone())
+                        .collect::<Vec<_>>(),
+                    0,
+                )?;
+                *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                return Ok(Some(TurnOutcome::Aborted {
+                    reason: "turn aborted by caller".to_string(),
+                }));
+            };
+
+            match execution {
+                Ok(FunctionCallExecution::Completed { output, effects }) => {
+                    let mut items = Self::apply_runtime_effects(thread, effects);
+                    items.push(TurnItem::new(
+                        TurnItemSource::Tool,
+                        TurnItemKind::ToolOutput {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            result: ToolResult::Success {
+                                output: output.clone(),
+                            },
+                        },
+                    ));
+                    Self::push_turn_items(thread, turn_id, items)?;
+                    *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                    self.record_trace(
+                        trace_sequence,
+                        &thread_id,
+                        turn_id,
+                        TraceEventKind::ToolOutput {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            result: ToolResult::Success { output },
+                        },
+                    );
+                    on_event(TurnStreamEvent::State(TurnStateEvent::FunctionCompleted {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                    }));
+                }
+                Ok(FunctionCallExecution::SuspendedBeforeExecution { suspension, .. })
+                | Ok(FunctionCallExecution::SuspendedAfterExecution { suspension, .. }) => {
+                    let mut items = vec![TurnItem::new(
+                        TurnItemSource::Runtime,
+                        TurnItemKind::SuspensionCreated {
+                            suspension: suspension.clone(),
+                        },
+                    )];
+                    for (skipped_call, _) in pending_calls.iter().skip(call_index + 1) {
+                        items.push(TurnItem::new(
+                            TurnItemSource::Tool,
+                            TurnItemKind::ToolOutput {
+                                call_id: skipped_call.call_id.clone(),
+                                name: skipped_call.name.clone(),
+                                result: ToolResult::Error {
+                                    error: "function not executed because a previous function suspended the turn".to_string(),
+                                },
+                            },
+                        ));
+                    }
+                    Self::push_turn_items(thread, turn_id, items)?;
+                    Self::set_turn_status(thread, turn_id, TurnStatus::Suspended)?;
+                    *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                    on_event(TurnStreamEvent::State(TurnStateEvent::Suspended {
+                        suspension: suspension.clone(),
+                    }));
+                    return Ok(Some(TurnOutcome::Suspended { suspension }));
+                }
+                Err(error) => {
+                    let error_text = error.to_string();
+                    Self::push_turn_items(
+                        thread,
+                        turn_id,
+                        vec![TurnItem::new(
+                            TurnItemSource::Tool,
+                            TurnItemKind::ToolOutput {
+                                call_id: call.call_id.clone(),
+                                name: call.name.clone(),
+                                result: ToolResult::Error {
+                                    error: error_text.clone(),
+                                },
+                            },
+                        )],
+                    )?;
+                    *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
+                    on_event(TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        error: error_text,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn pending_function_calls(
+        thread: &Thread,
+        turn_id: &str,
+    ) -> Vec<(ModelFunctionCall, Option<u32>)> {
+        let Some(turn) = thread.turns.iter().find(|turn| turn.id == turn_id) else {
+            return Vec::new();
+        };
+        let Some((response_index, calls)) =
+            turn.items
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, item)| match &item.kind {
+                    TurnItemKind::ModelResponse { function_calls, .. }
+                        if !function_calls.is_empty() =>
+                    {
+                        Some((index, function_calls.clone()))
+                    }
+                    _ => None,
+                })
+        else {
+            return Vec::new();
+        };
+        let mut started = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        for item in turn.items.iter().skip(response_index + 1) {
+            match &item.kind {
+                TurnItemKind::FunctionCallStarted {
+                    call_id, attempt, ..
+                } => {
+                    started.insert(call_id.clone(), *attempt);
+                }
+                TurnItemKind::ToolOutput { call_id, .. } => {
+                    completed.insert(call_id.clone());
+                }
+                _ => {}
+            }
+        }
+        calls
+            .into_iter()
+            .filter(|call| !completed.contains(&call.call_id))
+            .map(|call| {
+                let attempt = started.get(&call.call_id).copied();
+                (call, attempt)
+            })
+            .collect()
+    }
+
     async fn await_step_or_abort<T, F>(
         &self,
         future: F,
@@ -1544,11 +1870,13 @@ mod tests {
     use crate::store::{ThreadContextCache, ThreadStore};
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
-        FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionSpec, Result,
-        RuntimeEvent, TurnExecutionLimits, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+        FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionRecoveryPolicy,
+        FunctionSpec, Result, RuntimeEvent, TurnExecutionLimits, TurnOutcome, TurnStateEvent,
+        TurnStreamEvent,
     };
     use lite_agent_kernel::events::{
-        Suspension, SuspensionKind, TokenUsage, ToolResult, TurnItemKind, TurnStatus,
+        Suspension, SuspensionKind, Thread, TokenUsage, ToolResult, Turn, TurnItem, TurnItemKind,
+        TurnItemSource, TurnStatus,
     };
     use lite_agent_kernel::projection::ThreadProjection;
     use serde_json::json;
@@ -1635,6 +1963,15 @@ mod tests {
         }
     }
 
+    impl TestStore {
+        fn insert_thread(&self, thread: Thread) {
+            self.threads
+                .lock()
+                .expect("threads")
+                .insert(thread.id.clone(), thread);
+        }
+    }
+
     struct MockModel {
         responses: Mutex<VecDeque<ModelResponse>>,
         requests: Mutex<Vec<ModelRequest>>,
@@ -1704,6 +2041,7 @@ mod tests {
                 time_budget: Duration::from_secs(1),
                 max_output_bytes: 20 * 1024 * 1024,
             },
+            FunctionRecoveryPolicy::Idempotent,
             |_args, _context| async {
                 Ok(FunctionExecution::Completed {
                     output: json!({ "ok": true }),
@@ -1724,6 +2062,7 @@ mod tests {
                 time_budget: Duration::from_secs(1),
                 max_output_bytes: 20 * 1024 * 1024,
             },
+            FunctionRecoveryPolicy::NonIdempotent,
             |_args, _context| async {
                 Ok(FunctionExecution::SuspendedAfterExecution {
                     suspension: Suspension {
@@ -2450,5 +2789,109 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn recovery_retries_idempotent_started_call_before_next_model_step() {
+        let store = Arc::new(TestStore::default());
+        let mut thread = Thread::new("t");
+        let mut turn = Turn::new();
+        let turn_id = turn.id.clone();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::User,
+            TurnItemKind::UserInput {
+                text: "continue".to_string(),
+                response_to: None,
+            },
+        ));
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Model,
+            TurnItemKind::ModelResponse {
+                text: None,
+                function_calls: vec![ModelFunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "test_function".to_string(),
+                    arguments: json!({}),
+                }],
+            },
+        ));
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Runtime,
+            TurnItemKind::FunctionCallStarted {
+                call_id: "c1".to_string(),
+                name: "test_function".to_string(),
+                attempt: 1,
+            },
+        ));
+        assert_eq!(turn.id, turn_id);
+        thread.turns.push(turn);
+        store.insert_thread(thread);
+
+        let agent = agent_with(
+            store.clone(),
+            vec![ModelResponse::AssistantMessage {
+                text: "recovered".to_string(),
+            }],
+        );
+        let outcome = agent.recover_turn("t", |_| {}).await.expect("recovery");
+        assert_eq!(
+            outcome,
+            TurnOutcome::AssistantMessage {
+                text: "recovered".to_string()
+            }
+        );
+        let thread = store.load("t").await.expect("thread");
+        assert!(thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::ToolOutput {
+                    call_id,
+                    result: ToolResult::Success { .. },
+                    ..
+                } if call_id == "c1"
+            )
+        }));
+        assert!(thread.turns[0].items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TurnItemKind::FunctionCallStarted { call_id, attempt, .. }
+                    if call_id == "c1" && *attempt == 2
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn recovery_suspends_non_idempotent_started_call() {
+        let store = Arc::new(TestStore::default());
+        let mut thread = Thread::new("t");
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Model,
+            TurnItemKind::ModelResponse {
+                text: None,
+                function_calls: vec![ModelFunctionCall {
+                    call_id: "c1".to_string(),
+                    name: "test_suspend".to_string(),
+                    arguments: json!({}),
+                }],
+            },
+        ));
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Runtime,
+            TurnItemKind::FunctionCallStarted {
+                call_id: "c1".to_string(),
+                name: "test_suspend".to_string(),
+                attempt: 1,
+            },
+        ));
+        thread.turns.push(turn);
+        store.insert_thread(thread);
+
+        let agent = agent_with(store.clone(), vec![]);
+        let outcome = agent.recover_turn("t", |_| {}).await.expect("recovery");
+        assert!(matches!(outcome, TurnOutcome::Suspended { ref suspension }
+            if suspension.kind == SuspensionKind::FunctionRecovery));
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.turns[0].status, TurnStatus::Suspended);
     }
 }

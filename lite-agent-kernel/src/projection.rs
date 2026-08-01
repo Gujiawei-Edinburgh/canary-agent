@@ -147,6 +147,7 @@ impl ThreadProjection {
                     TurnItemKind::GoalUpdated { current, .. } => {
                         projection.goal = Some(current.clone());
                     }
+                    TurnItemKind::FunctionCallStarted { .. } => {}
                     TurnItemKind::TurnFailed { .. } | TurnItemKind::TurnAborted { .. } => {}
                 }
             }

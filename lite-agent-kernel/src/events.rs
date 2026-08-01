@@ -185,6 +185,11 @@ pub enum TurnItemKind {
         name: String,
         result: ToolResult,
     },
+    FunctionCallStarted {
+        call_id: String,
+        name: String,
+        attempt: u32,
+    },
     SuspensionCreated {
         suspension: Suspension,
     },
@@ -204,6 +209,7 @@ pub enum TurnItemKind {
 #[serde(rename_all = "snake_case")]
 pub enum SuspensionKind {
     UserInput,
+    FunctionRecovery,
     HumanApproval,
     CredentialRequired,
     Webhook,
