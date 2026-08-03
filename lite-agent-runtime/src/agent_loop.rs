@@ -1961,6 +1961,19 @@ mod tests {
             })
         }
 
+        fn delete<'a>(
+            &'a self,
+            thread_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let removed = self.threads.lock().expect("threads").remove(thread_id);
+                self.caches.lock().expect("caches").remove(thread_id);
+                removed
+                    .map(|_| ())
+                    .ok_or_else(|| AgentError::ThreadNotFound(thread_id.to_string()))
+            })
+        }
+
         fn compare_and_commit<'a>(
             &'a self,
             mut thread: lite_agent_kernel::events::Thread,

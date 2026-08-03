@@ -163,6 +163,36 @@ impl ThreadStore for JsonFileThreadStore {
         })
     }
 
+    fn delete<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            Self::validate_thread_id(thread_id)?;
+            let _write_guard = self.write_lock.lock().await;
+            // TODO: This development store cannot make deletion of the thread
+            // and derived cache strictly atomic across separate files. A journal
+            // or a single per-thread directory would be required for that.
+            // The cache is derived data. Remove it first so an interrupted delete
+            // can leave a live thread without a cache, but never a deleted thread
+            // with stale cache data.
+            match fs::remove_file(self.context_cache_path(thread_id)).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            match fs::remove_file(self.thread_path(thread_id)).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AgentError::ThreadNotFound(thread_id.to_string()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        })
+    }
+
     fn compare_and_commit<'a>(
         &'a self,
         thread: Thread,
@@ -276,6 +306,49 @@ mod tests {
         assert!(matches!(
             error,
             AgentError::InvalidThreadId(value) if value == "../outside"
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletes_thread_and_context_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
+        store
+            .compare_and_commit(Thread::new("t1"), &LeaseFence::from_bytes([]))
+            .await
+            .expect("create thread");
+        store
+            .save_context_cache(ThreadContextCache {
+                thread_id: "t1".to_string(),
+                source_revision: RevisionToken::from_u64(1),
+                policy_version: "test".to_string(),
+                covered_message_count: 0,
+                summary: "cached".to_string(),
+            })
+            .await
+            .expect("save cache");
+
+        store.delete("t1").await.expect("delete");
+
+        assert!(matches!(
+            store.load("t1").await,
+            Err(AgentError::ThreadNotFound(id)) if id == "t1"
+        ));
+        assert_eq!(
+            store.load_context_cache("t1").await.expect("load cache"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_missing_thread_returns_not_found() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
+
+        let error = store.delete("missing").await.expect_err("missing thread");
+        assert!(matches!(
+            error,
+            AgentError::ThreadNotFound(id) if id == "missing"
         ));
     }
 

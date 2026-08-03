@@ -18,6 +18,11 @@ pub trait ThreadStore: Send + Sync {
         thread_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Thread>> + Send + 'a>>;
 
+    fn delete<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>>;
+
     /// Commits `thread` only when its embedded revision still matches storage.
     /// The lease fence must also be validated by stores that persist lease ownership.
     fn compare_and_commit<'a>(
