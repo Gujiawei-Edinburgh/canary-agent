@@ -1,8 +1,11 @@
 mod jsonl_collector;
 mod logging;
+mod metrics;
 
 pub use jsonl_collector::JsonlTraceCollector;
+pub use lite_agent_runtime::NoopMetricsRecorder as NoopRecorder;
 pub use logging::{init_file_logging, LoggingError, LoggingGuard};
+pub use metrics::PromRecorder;
 
 #[cfg(test)]
 mod tests {
@@ -10,6 +13,29 @@ mod tests {
     use lite_agent_runtime::{TraceCollector, TraceEvent, TraceEventKind};
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn prom_recorder_exposes_runtime_metrics() {
+        use lite_agent_runtime::{MetricStatus, MetricsRecorder, RuntimeMetric};
+
+        let recorder = super::PromRecorder::new().expect("prometheus recorder");
+        recorder.record(RuntimeMetric::TurnFinished {
+            thread_id: "thread-1".to_string(),
+            status: MetricStatus::Completed,
+            duration: std::time::Duration::from_millis(10),
+            function_calls: 2,
+        });
+        recorder.record(RuntimeMetric::TokenUsage {
+            input_tokens: 3,
+            cached_input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 5,
+        });
+
+        let output = recorder.encode().expect("metrics encoding");
+        assert!(output.contains("lite_agent_turns_total"));
+        assert!(output.contains("lite_agent_tokens_total"));
+    }
 
     #[tokio::test]
     async fn writes_one_file_per_thread_and_flushes_records() {

@@ -4,6 +4,7 @@ use crate::functions::{
     FunctionCallExecution, FunctionContext, FunctionRecoveryPolicy, FunctionRegistry,
     RuntimeEffect, SuspensionResolution,
 };
+use crate::metrics::{MetricStatus, MetricsRecorder, NoopMetricsRecorder, RuntimeMetric};
 use crate::model::{ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::session::{SessionCoordinator, SessionLease};
 use crate::store::{ThreadContextCache, ThreadStore};
@@ -22,6 +23,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -275,6 +277,7 @@ pub struct Agent {
     function_call_hooks: Vec<Arc<dyn FunctionCallHook>>,
     context_builder: Arc<dyn ContextBuilder>,
     trace_collector: Arc<dyn TraceCollector>,
+    metrics_recorder: Arc<dyn MetricsRecorder>,
     session_coordinator: Arc<dyn SessionCoordinator>,
     active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
     next_active_turn_id: Arc<AtomicU64>,
@@ -296,6 +299,7 @@ impl Agent {
             function_call_hooks: Vec::new(),
             context_builder: Arc::new(CompactingContextBuilder::default()),
             trace_collector: Arc::new(NoopTraceCollector),
+            metrics_recorder: Arc::new(NoopMetricsRecorder),
             session_coordinator,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             next_active_turn_id: Arc::new(AtomicU64::new(1)),
@@ -365,6 +369,18 @@ impl Agent {
     pub fn with_shared_trace_collector(mut self, trace_collector: Arc<dyn TraceCollector>) -> Self {
         self.trace_collector = trace_collector;
         self
+    }
+
+    pub fn with_metrics_recorder<M>(mut self, metrics_recorder: M) -> Self
+    where
+        M: MetricsRecorder + 'static,
+    {
+        self.metrics_recorder = Arc::new(metrics_recorder);
+        self
+    }
+    
+    fn record_metric(&self, metric: RuntimeMetric) {
+        self.metrics_recorder.record(metric);
     }
 
     /// Starts a turn and applies `metadata` when the thread does not exist yet.
@@ -699,6 +715,7 @@ impl Agent {
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
         tracing::debug!(thread_id, "turn started with session lease");
+        let turn_started = Instant::now();
 
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
@@ -762,6 +779,7 @@ impl Agent {
         }));
         let mut turn_token_usage = TokenUsage::default();
         let mut function_call_count = 0;
+        let mut first_token_recorded = false;
         let limits = self.config.turn_execution_limits;
 
         let outcome = 'turn_loop: {
@@ -796,6 +814,12 @@ impl Agent {
                 }));
                 let mut model_event_handler = |event| match event {
                     ModelStreamEvent::AssistantDelta { text } => {
+                        if !first_token_recorded {
+                            first_token_recorded = true;
+                            self.record_metric(RuntimeMetric::TimeToFirstToken {
+                                duration: turn_started.elapsed(),
+                            });
+                        }
                         on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
                             text,
                         }));
@@ -807,6 +831,7 @@ impl Agent {
                 let model_call = self
                     .model_client
                     .stream_complete(request, &mut model_event_handler);
+                let model_started = Instant::now();
                 let response = self
                     .await_step_or_abort(
                         model_call,
@@ -817,6 +842,14 @@ impl Agent {
                         "model request",
                     )
                     .await?;
+                self.record_metric(RuntimeMetric::ModelRequestFinished {
+                    status: match &response {
+                        None => MetricStatus::Aborted,
+                        Some(Ok(_)) => MetricStatus::Completed,
+                        Some(Err(_)) => MetricStatus::Failed,
+                    },
+                    duration: model_started.elapsed(),
+                });
                 let Some(response) = response else {
                     break 'turn_loop TurnOutcome::Aborted {
                         reason: "turn aborted by caller".to_string(),
@@ -947,6 +980,7 @@ impl Agent {
                             let (entered_hooks, pre_hook_result) = self
                                 .run_before_function_call_hooks(&hook_context, &mut on_event)
                                 .await;
+                            let function_started = Instant::now();
                             let execution = match pre_hook_result {
                                 Ok(()) => {
                                     Self::push_turn_items(
@@ -991,6 +1025,11 @@ impl Agent {
                             };
 
                             let Some(execution) = execution else {
+                                self.record_metric(RuntimeMetric::FunctionCallFinished {
+                                    name: name.clone(),
+                                    status: MetricStatus::Aborted,
+                                    duration: function_started.elapsed(),
+                                });
                                 Self::append_aborted_function_outputs(
                                     &mut thread,
                                     &turn_id,
@@ -1001,6 +1040,22 @@ impl Agent {
                                     reason: "turn aborted by caller".to_string(),
                                 };
                             };
+                            self.record_metric(RuntimeMetric::FunctionCallFinished {
+                                name: name.clone(),
+                                status: match &execution {
+                                    Ok(FunctionCallExecution::Completed { .. }) => {
+                                        MetricStatus::Completed
+                                    }
+                                    Ok(FunctionCallExecution::SuspendedBeforeExecution {
+                                        ..
+                                    })
+                                    | Ok(FunctionCallExecution::SuspendedAfterExecution {
+                                        ..
+                                    }) => MetricStatus::Suspended,
+                                    Err(_) => MetricStatus::Failed,
+                                },
+                                duration: function_started.elapsed(),
+                            });
                             match execution {
                                 Ok(FunctionCallExecution::Completed { output, effects }) => {
                                     let update_items =
@@ -1364,6 +1419,12 @@ impl Agent {
         };
 
         Self::apply_turn_token_usage(&mut thread, turn_token_usage);
+        self.record_metric(RuntimeMetric::TokenUsage {
+            input_tokens: turn_token_usage.input_tokens,
+            cached_input_tokens: turn_token_usage.cached_input_tokens,
+            output_tokens: turn_token_usage.output_tokens,
+            total_tokens: turn_token_usage.total_tokens,
+        });
         self.commit_thread(thread, lease.fence()).await?;
         let trace_status = match &outcome {
             TurnOutcome::AssistantMessage { .. } => TraceTurnStatus::Completed,
@@ -1371,6 +1432,17 @@ impl Agent {
             TurnOutcome::Failed { .. } => TraceTurnStatus::Failed,
             TurnOutcome::Aborted { .. } => TraceTurnStatus::Aborted,
         };
+        self.record_metric(RuntimeMetric::TurnFinished {
+            thread_id: thread_id.to_string(),
+            status: match &outcome {
+                TurnOutcome::AssistantMessage { .. } => MetricStatus::Completed,
+                TurnOutcome::Suspended { .. } => MetricStatus::Suspended,
+                TurnOutcome::Failed { .. } => MetricStatus::Failed,
+                TurnOutcome::Aborted { .. } => MetricStatus::Aborted,
+            },
+            duration: turn_started.elapsed(),
+            function_calls: function_call_count,
+        });
         self.record_trace(
             &mut trace_sequence,
             thread_id,
@@ -1526,6 +1598,7 @@ impl Agent {
                 projection: ThreadProjection::from_thread(thread),
                 abort_signal: abort_signal.clone(),
             };
+            let function_started = Instant::now();
             let execution = self
                 .await_step_or_abort(
                     self.function_registry
@@ -1537,6 +1610,15 @@ impl Agent {
                     "recovered function call",
                 )
                 .await?;
+            self.record_metric(RuntimeMetric::FunctionCallFinished {
+                name: call.name.clone(),
+                status: match &execution {
+                    None => MetricStatus::Aborted,
+                    Some(Ok(_)) => MetricStatus::Completed,
+                    Some(Err(_)) => MetricStatus::Failed,
+                },
+                duration: function_started.elapsed(),
+            });
             let Some(execution) = execution else {
                 Self::append_aborted_function_outputs(
                     thread,
