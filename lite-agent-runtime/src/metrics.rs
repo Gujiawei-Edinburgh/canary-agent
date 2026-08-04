@@ -19,6 +19,44 @@ impl MetricStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionCallOutcome {
+    Completed,
+    Suspended,
+    Failed,
+    Aborted,
+}
+
+impl FunctionCallOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Suspended => "suspended",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionCallSkipReason {
+    MaxCallsPerTurn,
+    PreviousFunctionSuspended,
+    NonIdempotentRecovery,
+    TurnAborted,
+}
+
+impl FunctionCallSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxCallsPerTurn => "max_calls_per_turn",
+            Self::PreviousFunctionSuspended => "previous_function_suspended",
+            Self::NonIdempotentRecovery => "non_idempotent_recovery",
+            Self::TurnAborted => "turn_aborted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeMetric {
     TurnFinished {
@@ -33,8 +71,12 @@ pub enum RuntimeMetric {
     },
     FunctionCallFinished {
         name: String,
-        status: MetricStatus,
+        outcome: FunctionCallOutcome,
         duration: Duration,
+    },
+    FunctionCallSkipped {
+        name: String,
+        reason: FunctionCallSkipReason,
     },
     TimeToFirstToken {
         duration: Duration,

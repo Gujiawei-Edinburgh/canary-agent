@@ -4,7 +4,10 @@ use crate::functions::{
     FunctionCallExecution, FunctionContext, FunctionRecoveryPolicy, FunctionRegistry,
     RuntimeEffect, SuspensionResolution,
 };
-use crate::metrics::{MetricStatus, MetricsRecorder, NoopMetricsRecorder, RuntimeMetric};
+use crate::metrics::{
+    FunctionCallOutcome, FunctionCallSkipReason, MetricStatus, MetricsRecorder,
+    NoopMetricsRecorder, RuntimeMetric,
+};
 use crate::model::{ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::session::{SessionCoordinator, SessionLease};
 use crate::store::{ThreadContextCache, ThreadStore};
@@ -378,7 +381,7 @@ impl Agent {
         self.metrics_recorder = Arc::new(metrics_recorder);
         self
     }
-    
+
     fn record_metric(&self, metric: RuntimeMetric) {
         self.metrics_recorder.record(metric);
     }
@@ -1027,9 +1030,15 @@ impl Agent {
                             let Some(execution) = execution else {
                                 self.record_metric(RuntimeMetric::FunctionCallFinished {
                                     name: name.clone(),
-                                    status: MetricStatus::Aborted,
+                                    outcome: FunctionCallOutcome::Aborted,
                                     duration: function_started.elapsed(),
                                 });
+                                for skipped_call in calls.iter().skip(call_index + 1) {
+                                    self.record_metric(RuntimeMetric::FunctionCallSkipped {
+                                        name: skipped_call.name.clone(),
+                                        reason: FunctionCallSkipReason::TurnAborted,
+                                    });
+                                }
                                 Self::append_aborted_function_outputs(
                                     &mut thread,
                                     &turn_id,
@@ -1042,17 +1051,17 @@ impl Agent {
                             };
                             self.record_metric(RuntimeMetric::FunctionCallFinished {
                                 name: name.clone(),
-                                status: match &execution {
+                                outcome: match &execution {
                                     Ok(FunctionCallExecution::Completed { .. }) => {
-                                        MetricStatus::Completed
+                                        FunctionCallOutcome::Completed
                                     }
                                     Ok(FunctionCallExecution::SuspendedBeforeExecution {
                                         ..
                                     })
                                     | Ok(FunctionCallExecution::SuspendedAfterExecution {
                                         ..
-                                    }) => MetricStatus::Suspended,
-                                    Err(_) => MetricStatus::Failed,
+                                    }) => FunctionCallOutcome::Suspended,
+                                    Err(_) => FunctionCallOutcome::Failed,
                                 },
                                 duration: function_started.elapsed(),
                             });
@@ -1134,6 +1143,13 @@ impl Agent {
                                             )
                                         })
                                         .collect::<Vec<_>>();
+                                    for (_, name, _) in &skipped_calls {
+                                        self.record_metric(RuntimeMetric::FunctionCallSkipped {
+                                            name: name.clone(),
+                                            reason:
+                                                FunctionCallSkipReason::PreviousFunctionSuspended,
+                                        });
+                                    }
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     Self::set_turn_status(
                                         &mut thread,
@@ -1232,6 +1248,13 @@ impl Agent {
                                             )
                                         })
                                         .collect::<Vec<_>>();
+                                    for (_, name, _) in &skipped_calls {
+                                        self.record_metric(RuntimeMetric::FunctionCallSkipped {
+                                            name: name.clone(),
+                                            reason:
+                                                FunctionCallSkipReason::PreviousFunctionSuspended,
+                                        });
+                                    }
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     Self::set_turn_status(
                                         &mut thread,
@@ -1361,6 +1384,12 @@ impl Agent {
                                     (skipped_call.call_id.clone(), skipped_call.name.clone())
                                 })
                                 .collect::<Vec<_>>();
+                            for (_, name) in &skipped_calls {
+                                self.record_metric(RuntimeMetric::FunctionCallSkipped {
+                                    name: name.clone(),
+                                    reason: FunctionCallSkipReason::MaxCallsPerTurn,
+                                });
+                            }
                             Self::push_turn_items(
                                 &mut thread,
                                 &turn_id,
@@ -1612,14 +1641,26 @@ impl Agent {
                 .await?;
             self.record_metric(RuntimeMetric::FunctionCallFinished {
                 name: call.name.clone(),
-                status: match &execution {
-                    None => MetricStatus::Aborted,
-                    Some(Ok(_)) => MetricStatus::Completed,
-                    Some(Err(_)) => MetricStatus::Failed,
+                outcome: match &execution {
+                    None => FunctionCallOutcome::Aborted,
+                    Some(Ok(FunctionCallExecution::Completed { .. })) => {
+                        FunctionCallOutcome::Completed
+                    }
+                    Some(Ok(FunctionCallExecution::SuspendedBeforeExecution { .. }))
+                    | Some(Ok(FunctionCallExecution::SuspendedAfterExecution { .. })) => {
+                        FunctionCallOutcome::Suspended
+                    }
+                    Some(Err(_)) => FunctionCallOutcome::Failed,
                 },
                 duration: function_started.elapsed(),
             });
             let Some(execution) = execution else {
+                for (skipped_call, _) in pending_calls.iter().skip(call_index + 1) {
+                    self.record_metric(RuntimeMetric::FunctionCallSkipped {
+                        name: skipped_call.name.clone(),
+                        reason: FunctionCallSkipReason::TurnAborted,
+                    });
+                }
                 Self::append_aborted_function_outputs(
                     thread,
                     turn_id,

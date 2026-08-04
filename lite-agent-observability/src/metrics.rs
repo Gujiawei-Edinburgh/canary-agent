@@ -1,5 +1,6 @@
 use lite_agent_runtime::{MetricsRecorder, RuntimeMetric};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Registry, TextEncoder};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -12,58 +13,79 @@ pub struct PromRecorder {
     ttft: HistogramVec,
     model_requests: HistogramVec,
     function_calls: HistogramVec,
+    function_calls_skipped: IntCounterVec,
     token_usage: IntCounterVec,
 }
 
 impl PromRecorder {
     pub fn new() -> prometheus::Result<Self> {
-        Self::with_registry(Arc::new(Registry::new()))
+        Self::with_registry_and_labels(Arc::new(Registry::new()), None)
     }
 
-    pub fn with_registry(registry: Arc<Registry>) -> prometheus::Result<Self> {
+    pub fn with_registry_and_labels(
+        registry: Arc<Registry>,
+        labels: Option<HashMap<String, String>>,
+    ) -> prometheus::Result<Self> {
+        let labels = labels.unwrap_or_default();
         let turns = IntCounterVec::new(
-            prometheus::Opts::new("lite_agent_turns_total", "Agent turn outcomes"),
+            prometheus::Opts::new("lite_agent_turns_total", "Agent turn outcomes")
+                .const_labels(labels.clone()),
             &["status"],
         )?;
         let turns_per_thread = IntCounterVec::new(
-            prometheus::Opts::new("lite_agent_turns_per_thread_total", "Agent turns by thread"),
+            prometheus::Opts::new("lite_agent_turns_per_thread_total", "Agent turns by thread")
+                .const_labels(labels.clone()),
             &["thread", "status"],
         )?;
         let turn_latency = HistogramVec::new(
-            prometheus::HistogramOpts::new("lite_agent_turn_latency_seconds", "Agent turn latency"),
+            prometheus::HistogramOpts::new("lite_agent_turn_latency_seconds", "Agent turn latency")
+                .const_labels(labels.clone()),
             &["status"],
         )?;
         let function_calls_per_turn = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "lite_agent_function_calls_per_turn",
                 "Function calls per turn",
-            ),
+            )
+            .const_labels(labels.clone()),
             &[],
         )?;
         let ttft = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "lite_agent_time_to_first_token_seconds",
                 "Time to first streamed token",
-            ),
+            )
+            .const_labels(labels.clone()),
             &[],
         )?;
         let model_requests = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "lite_agent_model_request_duration_seconds",
                 "Model request duration",
-            ),
+            )
+            .const_labels(labels.clone()),
             &["status"],
         )?;
         let function_calls = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "lite_agent_function_call_duration_seconds",
                 "Function call duration",
-            ),
+            )
+            .const_labels(labels.clone()),
             &["function", "status"],
         )?;
         let token_usage = IntCounterVec::new(
-            prometheus::Opts::new("lite_agent_tokens_total", "Model token usage"),
+            prometheus::Opts::new("lite_agent_tokens_total", "Model token usage")
+                .const_labels(labels.clone()),
             &["kind"],
+        )?;
+        let function_calls_skipped = IntCounterVec::new(
+            prometheus::Opts::new(
+                "lite_agent_function_calls_skipped_total",
+                "Skipped function calls",
+            )
+            .const_labels(labels),
+            &["function", "reason"],
         )?;
         registry.register(Box::new(turns.clone()))?;
         registry.register(Box::new(turns_per_thread.clone()))?;
@@ -72,6 +94,7 @@ impl PromRecorder {
         registry.register(Box::new(ttft.clone()))?;
         registry.register(Box::new(model_requests.clone()))?;
         registry.register(Box::new(function_calls.clone()))?;
+        registry.register(Box::new(function_calls_skipped.clone()))?;
         registry.register(Box::new(token_usage.clone()))?;
         Ok(Self {
             registry,
@@ -82,6 +105,7 @@ impl PromRecorder {
             ttft,
             model_requests,
             function_calls,
+            function_calls_skipped,
             token_usage,
         })
     }
@@ -130,12 +154,17 @@ impl MetricsRecorder for PromRecorder {
             }
             RuntimeMetric::FunctionCallFinished {
                 name,
-                status,
+                outcome,
                 duration,
             } => {
                 self.function_calls
-                    .with_label_values(&[&name, status.as_str()])
+                    .with_label_values(&[&name, outcome.as_str()])
                     .observe(duration.as_secs_f64());
+            }
+            RuntimeMetric::FunctionCallSkipped { name, reason } => {
+                self.function_calls_skipped
+                    .with_label_values(&[&name, reason.as_str()])
+                    .inc();
             }
             RuntimeMetric::TimeToFirstToken { duration } => {
                 self.ttft

@@ -24,7 +24,10 @@ pub use functions::{
     FunctionRegistry, RuntimeCommand, RuntimeCommandExecution, RuntimeEffect, SimpleFunction,
     SuspensionResolution,
 };
-pub use metrics::{MetricStatus, MetricsRecorder, NoopMetricsRecorder, RuntimeMetric};
+pub use metrics::{
+    FunctionCallOutcome, FunctionCallSkipReason, MetricStatus, MetricsRecorder,
+    NoopMetricsRecorder, RuntimeMetric,
+};
 pub use model::{
     FunctionSpec, ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
 };

@@ -12,13 +12,21 @@ mod tests {
     use super::JsonlTraceCollector;
     use lite_agent_runtime::{TraceCollector, TraceEvent, TraceEventKind};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
+    use std::sync::Arc;
 
     #[test]
     fn prom_recorder_exposes_runtime_metrics() {
         use lite_agent_runtime::{MetricStatus, MetricsRecorder, RuntimeMetric};
 
-        let recorder = super::PromRecorder::new().expect("prometheus recorder");
+        let mut labels = HashMap::new();
+        labels.insert("service".to_string(), "checkout".to_string());
+        let recorder = super::PromRecorder::with_registry_and_labels(
+            Arc::new(prometheus::Registry::new()),
+            Some(labels),
+        )
+        .expect("prometheus recorder");
         recorder.record(RuntimeMetric::TurnFinished {
             thread_id: "thread-1".to_string(),
             status: MetricStatus::Completed,
@@ -35,6 +43,7 @@ mod tests {
         let output = recorder.encode().expect("metrics encoding");
         assert!(output.contains("lite_agent_turns_total"));
         assert!(output.contains("lite_agent_tokens_total"));
+        assert!(output.contains("service=\"checkout\""));
     }
 
     #[tokio::test]
