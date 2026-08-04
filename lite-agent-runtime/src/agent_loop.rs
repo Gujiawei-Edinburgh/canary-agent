@@ -367,19 +367,13 @@ impl Agent {
         self
     }
 
-    pub async fn run_turn(
+    /// Starts a turn and applies `metadata` when the thread does not exist yet.
+    /// Existing thread metadata is preserved.
+    pub async fn run_turn<'a, F>(
         &self,
         thread_id: &str,
         user_text: impl Into<String>,
-    ) -> Result<TurnOutcome> {
-        self.run_turn_stream(thread_id, user_text, |_event| {})
-            .await
-    }
-
-    pub async fn run_turn_stream<'a, F>(
-        &self,
-        thread_id: &str,
-        user_text: impl Into<String>,
+        metadata: Value,
         on_event: F,
     ) -> Result<TurnOutcome>
     where
@@ -387,9 +381,10 @@ impl Agent {
     {
         let active_turn = self.register_active_turn(thread_id)?;
         let lease = self.session_coordinator.acquire(thread_id).await?;
-        self.run_turn_stream_abortable_internal(
+        self.run_turn_internal(
             thread_id,
             Some(user_text.into()),
+            Some(metadata),
             active_turn.signal.clone(),
             on_event,
             0,
@@ -410,8 +405,9 @@ impl Agent {
     {
         let active_turn = self.register_active_turn(thread_id)?;
         let lease = self.session_coordinator.acquire(thread_id).await?;
-        self.run_turn_stream_abortable_internal(
+        self.run_turn_internal(
             thread_id,
+            None,
             None,
             active_turn.signal.clone(),
             on_event,
@@ -681,14 +677,7 @@ impl Agent {
         }
         if should_continue {
             return self
-                .run_turn_stream_abortable_internal(
-                    thread_id,
-                    None,
-                    abort_signal,
-                    on_event,
-                    1,
-                    &lease,
-                )
+                .run_turn_internal(thread_id, None, None, abort_signal, on_event, 1, &lease)
                 .await;
         }
         Ok(TurnOutcome::Failed {
@@ -696,10 +685,11 @@ impl Agent {
         })
     }
 
-    async fn run_turn_stream_abortable_internal<'a, F>(
+    async fn run_turn_internal<'a, F>(
         &self,
         thread_id: &str,
         user_text: Option<String>,
+        initial_metadata: Option<Value>,
         mut abort_signal: TurnAbortSignal,
         mut on_event: F,
         mut trace_sequence: u64,
@@ -712,7 +702,13 @@ impl Agent {
 
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
-            Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
+            Err(AgentError::ThreadNotFound(_)) => {
+                let mut thread = Thread::new(thread_id);
+                if let Some(metadata) = initial_metadata {
+                    thread.metadata = metadata;
+                }
+                thread
+            }
             Err(error) => return Err(error),
         };
         let recovering = user_text.is_none();
@@ -2234,7 +2230,10 @@ mod tests {
             }],
         );
 
-        let outcome = agent.run_turn("t", "hi").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "hi", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert_eq!(
             outcome,
             TurnOutcome::AssistantMessage {
@@ -2248,6 +2247,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injects_metadata_when_creating_a_thread() {
+        let store = Arc::new(TestStore::default());
+        let agent = agent_with(
+            store.clone(),
+            vec![ModelResponse::AssistantMessage {
+                text: "hello".to_string(),
+            }],
+        );
+
+        agent
+            .run_turn("t", "hi", json!({"workspace": "/tmp/project"}), |_| {})
+            .await
+            .expect("turn");
+
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.metadata, json!({"workspace": "/tmp/project"}));
+    }
+
+    #[tokio::test]
     async fn empty_model_response_fails_turn() {
         let store = Arc::new(TestStore::default());
         let agent = agent_with(
@@ -2258,7 +2276,10 @@ mod tests {
             }],
         );
 
-        let outcome = agent.run_turn("t", "hello").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "hello", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(
             matches!(outcome, TurnOutcome::Failed { error } if error.contains("neither assistant text nor function calls"))
         );
@@ -2287,7 +2308,10 @@ mod tests {
             ],
         );
 
-        agent.run_turn("t", "check").await.expect("turn");
+        agent
+            .run_turn("t", "check", json!({}), |_| {})
+            .await
+            .expect("turn");
         let thread = store.load("t").await.expect("thread");
         let messages = thread.turns[0]
             .items
@@ -2322,7 +2346,7 @@ mod tests {
 
         let turn = tokio::spawn(async move {
             turn_agent
-                .run_turn_stream("t", "slow", move |event| {
+                .run_turn("t", "slow", json!({}), move |event| {
                     if matches!(
                         event,
                         TurnStreamEvent::State(TurnStateEvent::TurnStarted { .. })
@@ -2376,7 +2400,7 @@ mod tests {
         let captured = events.clone();
 
         let outcome = agent
-            .run_turn_stream("t", "goal?", move |event| {
+            .run_turn("t", "goal?", json!({}), move |event| {
                 captured.lock().expect("lock").push(event);
             })
             .await
@@ -2437,7 +2461,7 @@ mod tests {
         let captured = events.clone();
 
         let outcome = agent
-            .run_turn_stream("t", "usage?", move |event| {
+            .run_turn("t", "usage?", json!({}), move |event| {
                 captured.lock().expect("lock").push(event);
             })
             .await
@@ -2484,7 +2508,10 @@ mod tests {
             ],
         );
 
-        let outcome = agent.run_turn("t", "set a goal").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "set a goal", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert_eq!(
             outcome,
             TurnOutcome::AssistantMessage {
@@ -2524,7 +2551,10 @@ mod tests {
             }],
         );
 
-        let outcome = agent.run_turn("t", "compare").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "compare", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(matches!(outcome, TurnOutcome::Suspended { .. }));
         let thread = store.load("t").await.expect("thread");
         assert_eq!(thread.turns[0].status, TurnStatus::Suspended);
@@ -2540,7 +2570,10 @@ mod tests {
                 .count(),
             2
         );
-        let error = agent.run_turn("t", "another prompt").await.unwrap_err();
+        let error = agent
+            .run_turn("t", "another prompt", json!({}), |_| {})
+            .await
+            .unwrap_err();
         assert!(matches!(error, AgentError::SuspendedTurn { .. }));
     }
 
@@ -2563,7 +2596,10 @@ mod tests {
             ],
         );
 
-        let outcome = agent.run_turn("t", "call missing").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "call missing", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
         let thread = store.load("t").await.expect("thread");
         assert!(thread.turns[0].items.iter().any(|item| matches!(
@@ -2597,7 +2633,10 @@ mod tests {
         .with_function_call_hook(RecordingHook::new("a", hook_events.clone()))
         .with_function_call_hook(RecordingHook::new("b", hook_events.clone()));
 
-        let outcome = agent.run_turn("t", "goal?").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "goal?", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
 
         assert_eq!(
@@ -2633,7 +2672,10 @@ mod tests {
         .with_function_call_hook(RecordingHook::new("audit", hook_events.clone()))
         .with_function_call_hook(RecordingHook::new("policy", hook_events.clone()).fail_before());
 
-        let outcome = agent.run_turn("t", "goal?").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "goal?", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
         assert_eq!(
             *hook_events.lock().expect("events"),
@@ -2687,7 +2729,7 @@ mod tests {
         let captured = events.clone();
 
         let outcome = agent
-            .run_turn_stream("t", "goal?", move |event| {
+            .run_turn("t", "goal?", json!({}), move |event| {
                 captured.lock().expect("events").push(event);
             })
             .await
@@ -2747,7 +2789,10 @@ mod tests {
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         );
 
-        let outcome = agent.run_turn("t", "goal?").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "goal?", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
         let thread = store.load("t").await.expect("thread");
         assert_eq!(thread.turns[0].status, TurnStatus::Failed);
@@ -2787,7 +2832,10 @@ mod tests {
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         );
 
-        let outcome = agent.run_turn("t", "call twice").await.expect("turn");
+        let outcome = agent
+            .run_turn("t", "call twice", json!({}), |_| {})
+            .await
+            .expect("turn");
         assert!(
             matches!(outcome, TurnOutcome::Failed { ref error } if error.contains("max function calls"))
         );
@@ -2832,7 +2880,7 @@ mod tests {
         let aborting_agent = agent.clone();
 
         let outcome = agent
-            .run_turn_stream("t", "run it", move |event| {
+            .run_turn("t", "run it", json!({}), move |event| {
                 if matches!(
                     event,
                     TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested { .. })

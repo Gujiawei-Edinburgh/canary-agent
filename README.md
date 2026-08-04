@@ -114,7 +114,9 @@ async fn main() -> lite_agent_runtime::Result<()> {
     )
     .with_trace_collector(trace);
 
-    let outcome = agent.run_turn(&thread_id, "Hello").await?;
+    let outcome = agent
+        .run_turn(&thread_id, "Hello", serde_json::json!({}), |_| {})
+        .await?;
     println!("{outcome:?}");
     Ok(())
 }

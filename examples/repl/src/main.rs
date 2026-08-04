@@ -277,11 +277,16 @@ async fn run_repl(agent: Agent, store: Arc<JsonFileThreadStore>, thread_id: Stri
 
         let render_state = Arc::new(Mutex::new(StreamRenderState::default()));
         let render_state_for_events = render_state.clone();
-        let turn = agent.run_turn_stream(&thread_id, input.to_string(), move |event| {
-            if let Ok(mut state) = render_state_for_events.lock() {
-                print_stream_event(event, &mut state);
-            }
-        });
+        let turn = agent.run_turn(
+            &thread_id,
+            input.to_string(),
+            serde_json::json!({}),
+            move |event| {
+                if let Ok(mut state) = render_state_for_events.lock() {
+                    print_stream_event(event, &mut state);
+                }
+            },
+        );
         tokio::pin!(turn);
         let outcome = tokio::select! {
             result = &mut turn => result?,
