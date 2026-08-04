@@ -14,13 +14,16 @@ use std::pin::Pin;
 use std::time::Duration;
 
 mod exec_command;
+mod exec_command_metrics;
 pub mod sandbox;
 
 pub use exec_command::{
-    ApprovalHandling, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
-    ExecRequest, FixedWorkspaceResolver, ResolvedWorkspace, Shell, ThreadExecAuthorizer,
-    WorkspaceResolveRequest, WorkspaceResolver,
+    ApprovalHandling, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandMetric,
+    ExecCommandMetricsRecorder, ExecCommandOutcome, ExecCommandTool, ExecRequest,
+    FixedWorkspaceResolver, NoopExecCommandMetricsRecorder, ResolvedWorkspace, Shell,
+    ThreadExecAuthorizer, WorkspaceResolveRequest, WorkspaceResolver,
 };
+pub use exec_command_metrics::PromExecCommandRecorder;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GetCurrentTime;

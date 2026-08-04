@@ -14,6 +14,53 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecCommandOutcome {
+    Executed,
+    TimedOut,
+    Cancelled,
+    PolicyViolation,
+    ApprovalRequired,
+    Failed,
+}
+
+impl ExecCommandOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::PolicyViolation => "policy_violation",
+            Self::ApprovalRequired => "approval_required",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecCommandMetric {
+    Finished {
+        outcome: ExecCommandOutcome,
+        duration: Duration,
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    },
+}
+
+pub trait ExecCommandMetricsRecorder: Send + Sync {
+    fn record(&self, metric: ExecCommandMetric);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopExecCommandMetricsRecorder;
+
+impl ExecCommandMetricsRecorder for NoopExecCommandMetricsRecorder {
+    fn record(&self, _metric: ExecCommandMetric) {}
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
@@ -213,6 +260,7 @@ pub struct ExecCommandConfig {
     pub supported_commands: Option<Vec<String>>,
     pub max_output_bytes: usize,
     pub default_timeout: Duration,
+    pub metrics_recorder: Arc<dyn ExecCommandMetricsRecorder>,
 }
 
 impl ExecCommandConfig {
@@ -236,6 +284,7 @@ impl ExecCommandConfig {
             supported_commands: None,
             max_output_bytes: 20 * 1024 * 1024,
             default_timeout: Duration::from_secs(30),
+            metrics_recorder: Arc::new(NoopExecCommandMetricsRecorder),
         }
     }
 
@@ -259,6 +308,14 @@ impl ExecCommandConfig {
 
     pub fn with_supported_commands(mut self, commands: Vec<String>) -> Self {
         self.supported_commands = Some(commands);
+        self
+    }
+
+    pub fn with_metrics_recorder<R>(mut self, recorder: R) -> Self
+    where
+        R: ExecCommandMetricsRecorder + 'static,
+    {
+        self.metrics_recorder = Arc::new(recorder);
         self
     }
 }
@@ -321,7 +378,21 @@ impl AgentFunction for ExecCommandTool {
         args: Value,
         context: FunctionContext,
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
-        Box::pin(async move { self.execute(args, context).await })
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = self.execute(args, context).await;
+            self.config
+                .metrics_recorder
+                .record(ExecCommandMetric::Finished {
+                    outcome: exec_command_outcome(&result),
+                    duration: started.elapsed(),
+                    stdout_bytes: output_bytes(&result, "stdout"),
+                    stderr_bytes: output_bytes(&result, "stderr"),
+                    stdout_truncated: output_truncated(&result, "stdout_truncated"),
+                    stderr_truncated: output_truncated(&result, "stderr_truncated"),
+                });
+            result
+        })
     }
 }
 
@@ -558,6 +629,42 @@ fn tool_error(message: String) -> AgentError {
     AgentError::Function {
         name: "exec_command".to_string(),
         message,
+    }
+}
+
+fn exec_command_outcome(result: &Result<FunctionExecution>) -> ExecCommandOutcome {
+    let Ok(execution) = result else {
+        return ExecCommandOutcome::Failed;
+    };
+    match execution {
+        FunctionExecution::SuspendedBeforeExecution { .. } => ExecCommandOutcome::ApprovalRequired,
+        FunctionExecution::SuspendedAfterExecution { .. } => ExecCommandOutcome::Executed,
+        FunctionExecution::Completed { output } => match output["outcome"].as_str() {
+            Some("timed_out") => ExecCommandOutcome::TimedOut,
+            Some("cancelled") => ExecCommandOutcome::Cancelled,
+            Some("policy_violation") => ExecCommandOutcome::PolicyViolation,
+            _ => ExecCommandOutcome::Executed,
+        },
+    }
+}
+
+fn output_bytes(result: &Result<FunctionExecution>, field: &str) -> usize {
+    match result {
+        Ok(FunctionExecution::Completed { output })
+        | Ok(FunctionExecution::SuspendedAfterExecution { output, .. }) => {
+            output[field].as_str().map(str::len).unwrap_or_default()
+        }
+        _ => 0,
+    }
+}
+
+fn output_truncated(result: &Result<FunctionExecution>, field: &str) -> bool {
+    match result {
+        Ok(FunctionExecution::Completed { output })
+        | Ok(FunctionExecution::SuspendedAfterExecution { output, .. }) => {
+            output[field].as_bool().unwrap_or(false)
+        }
+        _ => false,
     }
 }
 

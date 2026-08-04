@@ -830,6 +830,7 @@ dependencies = [
  "libc",
  "lite-agent-kernel",
  "lite-agent-runtime",
+ "prometheus",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
