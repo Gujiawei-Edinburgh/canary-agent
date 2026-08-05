@@ -28,7 +28,6 @@ mod tests {
         )
         .expect("prometheus recorder");
         recorder.record(RuntimeMetric::TurnFinished {
-            thread_id: "thread-1".to_string(),
             status: MetricStatus::Completed,
             duration: std::time::Duration::from_millis(10),
             function_calls: 2,

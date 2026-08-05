@@ -7,7 +7,6 @@ use std::sync::Arc;
 pub struct PromRecorder {
     registry: Arc<Registry>,
     turns: IntCounterVec,
-    turns_per_thread: IntCounterVec,
     turn_latency: HistogramVec,
     function_calls_per_turn: HistogramVec,
     ttft: HistogramVec,
@@ -31,11 +30,6 @@ impl PromRecorder {
             prometheus::Opts::new("lite_agent_turns_total", "Agent turn outcomes")
                 .const_labels(labels.clone()),
             &["status"],
-        )?;
-        let turns_per_thread = IntCounterVec::new(
-            prometheus::Opts::new("lite_agent_turns_per_thread_total", "Agent turns by thread")
-                .const_labels(labels.clone()),
-            &["thread", "status"],
         )?;
         let turn_latency = HistogramVec::new(
             prometheus::HistogramOpts::new("lite_agent_turn_latency_seconds", "Agent turn latency")
@@ -88,7 +82,6 @@ impl PromRecorder {
             &["function", "reason"],
         )?;
         registry.register(Box::new(turns.clone()))?;
-        registry.register(Box::new(turns_per_thread.clone()))?;
         registry.register(Box::new(turn_latency.clone()))?;
         registry.register(Box::new(function_calls_per_turn.clone()))?;
         registry.register(Box::new(ttft.clone()))?;
@@ -99,7 +92,6 @@ impl PromRecorder {
         Ok(Self {
             registry,
             turns,
-            turns_per_thread,
             turn_latency,
             function_calls_per_turn,
             ttft,
@@ -131,15 +123,12 @@ impl MetricsRecorder for PromRecorder {
     fn record(&self, metric: RuntimeMetric) {
         match metric {
             RuntimeMetric::TurnFinished {
-                thread_id,
                 status,
                 duration,
                 function_calls,
+                ..
             } => {
                 self.turns.with_label_values(&[status.as_str()]).inc();
-                self.turns_per_thread
-                    .with_label_values(&[&thread_id, status.as_str()])
-                    .inc();
                 self.turn_latency
                     .with_label_values(&[status.as_str()])
                     .observe(duration.as_secs_f64());

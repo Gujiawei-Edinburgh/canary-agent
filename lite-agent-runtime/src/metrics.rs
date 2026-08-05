@@ -60,7 +60,6 @@ impl FunctionCallSkipReason {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeMetric {
     TurnFinished {
-        thread_id: String,
         status: MetricStatus,
         duration: Duration,
         function_calls: usize,

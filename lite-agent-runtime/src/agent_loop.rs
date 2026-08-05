@@ -1462,7 +1462,6 @@ impl Agent {
             TurnOutcome::Aborted { .. } => TraceTurnStatus::Aborted,
         };
         self.record_metric(RuntimeMetric::TurnFinished {
-            thread_id: thread_id.to_string(),
             status: match &outcome {
                 TurnOutcome::AssistantMessage { .. } => MetricStatus::Completed,
                 TurnOutcome::Suspended { .. } => MetricStatus::Suspended,
