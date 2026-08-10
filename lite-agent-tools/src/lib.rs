@@ -16,6 +16,8 @@ use std::time::Duration;
 mod exec_command;
 mod exec_command_metrics;
 pub mod sandbox;
+pub mod web_search;
+mod web_search_metrics;
 
 pub use exec_command::{
     ApprovalHandling, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandMetric,
@@ -24,6 +26,11 @@ pub use exec_command::{
     ThreadExecAuthorizer, WorkspaceResolveRequest, WorkspaceResolver,
 };
 pub use exec_command_metrics::PromExecCommandRecorder;
+pub use web_search::{register_web_search_tools, ExaWebSearchConfig, ExaWebSearchTool};
+pub use web_search_metrics::{
+    NoopWebSearchMetricsRecorder, PromWebSearchRecorder, WebSearchMetric, WebSearchMetricsRecorder,
+    WebSearchOutcome,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GetCurrentTime;
