@@ -745,6 +745,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "lite-agent-eval"
+version = "0.1.0"
+dependencies = [
+ "lite-agent-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lite-agent-eval-example"
+version = "0.1.0"
+dependencies = [
+ "lite-agent-eval",
+ "lite-agent-openai",
+ "lite-agent-runtime",
+ "lite-agent-store-json",
+ "lite-agent-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lite-agent-kernel"
 version = "0.1.0"
 dependencies = [
@@ -831,6 +855,8 @@ dependencies = [
  "lite-agent-kernel",
  "lite-agent-runtime",
  "prometheus",
+ "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

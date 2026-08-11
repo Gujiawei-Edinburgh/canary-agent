@@ -6,6 +6,8 @@ members = [
     "lite-agent-openai",
     "lite-agent-store-json",
     "lite-agent-observability",
+    "lite-agent-eval",
     "examples/repl",
+    "examples/eval",
 ]
 resolver = "2"
