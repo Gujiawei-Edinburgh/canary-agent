@@ -12,23 +12,22 @@
 //! metrics are intentionally opaque to this crate. Hosts provide those parts.
 
 mod error;
+mod eval_command_tool;
 mod program;
 mod roles;
-mod eval_command_tool;
 mod vm;
 
 pub use error::{EvalError, Result};
+pub use eval_command_tool::{EvalCommandSink, EvalCommandTool};
 pub use program::{
     ActivationPolicy, ConstraintDelta, ConstraintId, ConstraintOperation, EvalProgram, NodeId,
     Obligation, TaskCase, TaskNode, TaskTransition, TransitionId, TransitionKind,
 };
 pub use roles::{
     AgentInput, AgentObservation, AgentObservationEvent, AgentObservationStatus, AgentRoleIo,
-    AgentRoleOutput, EvalMetric, EvalReport, MetricReferee, MetricResult, ProcessorInput, Referee,
-    RefereeInput, RoleFuture, RuntimeAgentIo, SimulatedUserCommand, SimulatedUserProcessor,
-    TestedAgentIo,
+    AgentRoleOutput, EvalMetric, EvalReport, MetricResult, ProcessorInput, Referee, RefereeInput,
+    RoleFuture, RuntimeAgentIo, SimulatedUserCommand, SimulatedUserProcessor, TestedAgentIo,
 };
-pub use eval_command_tool::{EvalCommandSink, EvalCommandTool};
 pub use vm::{
     ConstraintApplication, ConstraintLedger, EvalEvent, EvalEventKind, EvalPhase, EvalProjection,
     EvalVm, EvalVmComponents, EvalVmStatus, EvidenceRef, TransitionDelivery,

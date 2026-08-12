@@ -3,7 +3,7 @@ use crate::program::{EvalProgram, TransitionId};
 use crate::vm::{EvalEvent, EvalProjection, EvidenceRef, TransitionDelivery};
 use lite_agent_runtime::{Agent, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -230,43 +230,4 @@ pub struct EvalReport {
 
 pub trait Referee: Send + Sync {
     fn evaluate<'a>(&'a self, input: RefereeInput) -> RoleFuture<'a, EvalReport>;
-}
-
-#[derive(Default)]
-pub struct MetricReferee {
-    metrics: Vec<Arc<dyn EvalMetric>>,
-}
-
-impl MetricReferee {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_metric<M>(mut self, metric: M) -> Self
-    where
-        M: EvalMetric + 'static,
-    {
-        self.metrics.push(Arc::new(metric));
-        self
-    }
-}
-
-impl Referee for MetricReferee {
-    fn evaluate<'a>(&'a self, input: RefereeInput) -> RoleFuture<'a, EvalReport> {
-        Box::pin(async move {
-            let metrics = self
-                .metrics
-                .iter()
-                .map(|metric| metric.evaluate(&input))
-                .collect::<Vec<_>>();
-            let overall_score = (!metrics.is_empty()).then(|| {
-                metrics.iter().map(|metric| metric.score).sum::<f64>() / metrics.len() as f64
-            });
-            Ok(EvalReport {
-                metrics,
-                overall_score,
-                details: json!({}),
-            })
-        })
-    }
 }
