@@ -69,16 +69,6 @@ impl ConstraintOperation {
             Self::Remove { .. } => None,
         }
     }
-
-    pub fn epsilon_eligible(&self) -> bool {
-        matches!(
-            self,
-            Self::Add {
-                activation: ActivationPolicy::AlreadyAuthorized | ActivationPolicy::Derivable,
-                ..
-            }
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,7 +107,6 @@ pub struct TaskTransition {
     pub from: NodeId,
     pub to: NodeId,
     pub kind: TransitionKind,
-    pub user_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,7 +119,7 @@ pub struct TaskCase {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EvalProgram {
+pub struct TaskGraph {
     pub case_id: String,
     pub version: String,
     pub start: NodeId,
@@ -140,25 +129,25 @@ pub struct EvalProgram {
 
 impl TaskCase {
     /// Validate and lower an authored case into an immutable, indexed program.
-    pub fn compile(self) -> Result<EvalProgram> {
+    pub fn compile(self) -> Result<TaskGraph> {
         if self.id.trim().is_empty() {
-            return Err(EvalError::InvalidProgram("case id is empty".to_string()));
+            return Err(EvalError::InvalidTaskGraph("case id is empty".to_string()));
         }
         if self.nodes.is_empty() {
-            return Err(EvalError::InvalidProgram("case has no nodes".to_string()));
+            return Err(EvalError::InvalidTaskGraph("case has no nodes".to_string()));
         }
 
         let mut nodes = BTreeMap::new();
         for node in self.nodes {
             if node.id.0.trim().is_empty() {
-                return Err(EvalError::InvalidProgram("node id is empty".to_string()));
+                return Err(EvalError::InvalidTaskGraph("node id is empty".to_string()));
             }
             if nodes.insert(node.id.clone(), node).is_some() {
-                return Err(EvalError::InvalidProgram("duplicate node id".to_string()));
+                return Err(EvalError::InvalidTaskGraph("duplicate node id".to_string()));
             }
         }
         if !nodes.contains_key(&self.start) {
-            return Err(EvalError::InvalidProgram(format!(
+            return Err(EvalError::InvalidTaskGraph(format!(
                 "start node does not exist: {}",
                 self.start.0
             )));
@@ -167,12 +156,12 @@ impl TaskCase {
         let mut transitions = BTreeMap::new();
         for transition in self.transitions {
             if transition.id.0.trim().is_empty() {
-                return Err(EvalError::InvalidProgram(
+                return Err(EvalError::InvalidTaskGraph(
                     "transition id is empty".to_string(),
                 ));
             }
             if !nodes.contains_key(&transition.from) || !nodes.contains_key(&transition.to) {
-                return Err(EvalError::InvalidProgram(format!(
+                return Err(EvalError::InvalidTaskGraph(format!(
                     "transition {} references an unknown node",
                     transition.id.0
                 )));
@@ -181,14 +170,14 @@ impl TaskCase {
                 .insert(transition.id.clone(), transition)
                 .is_some()
             {
-                return Err(EvalError::InvalidProgram(
+                return Err(EvalError::InvalidTaskGraph(
                     "duplicate transition id".to_string(),
                 ));
             }
         }
 
         validate_constraint_ids(&nodes)?;
-        Ok(EvalProgram {
+        Ok(TaskGraph {
             case_id: self.id,
             version: self.version,
             start: self.start,
@@ -198,7 +187,7 @@ impl TaskCase {
     }
 }
 
-impl EvalProgram {
+impl TaskGraph {
     pub fn outgoing(&self, node: &NodeId) -> Vec<&TaskTransition> {
         self.transitions
             .values()
@@ -207,29 +196,15 @@ impl EvalProgram {
     }
 
     pub fn transition(&self, id: &TransitionId) -> Result<&TaskTransition> {
-        self.transitions
-            .get(id)
-            .ok_or_else(|| EvalError::InvalidCommand(format!("unknown transition: {}", id.0)))
+        self.transitions.get(id).ok_or_else(|| {
+            EvalError::InvalidEnvironmentAction(format!("unknown transition: {}", id.0))
+        })
     }
 
     pub fn node(&self, id: &NodeId) -> Result<&TaskNode> {
         self.nodes
             .get(id)
-            .ok_or_else(|| EvalError::InvalidProgram(format!("unknown node: {}", id.0)))
-    }
-
-    pub fn epsilon_eligible(&self, transition: &TaskTransition) -> Result<bool> {
-        if self.outgoing(&transition.from).len() != 1 {
-            return Ok(false);
-        }
-        if !matches!(transition.kind, TransitionKind::Progress) {
-            return Ok(false);
-        }
-        Ok(self
-            .node(&transition.to)?
-            .constraints
-            .iter()
-            .all(|delta| delta.operation.epsilon_eligible()))
+            .ok_or_else(|| EvalError::InvalidTaskGraph(format!("unknown node: {}", id.0)))
     }
 }
 
@@ -238,13 +213,13 @@ fn validate_constraint_ids(nodes: &BTreeMap<NodeId, TaskNode>) -> Result<()> {
     let mut targets = Vec::new();
     for node in nodes.values() {
         for delta in &node.constraints {
-            if let Some(id) = delta.operation.id() {
-                if !declared.insert(id.clone()) {
-                    return Err(EvalError::InvalidProgram(format!(
-                        "duplicate constraint id: {}",
-                        id.0
-                    )));
-                }
+            if let Some(id) = delta.operation.id()
+                && !declared.insert(id.clone())
+            {
+                return Err(EvalError::InvalidTaskGraph(format!(
+                    "duplicate constraint id: {}",
+                    id.0
+                )));
             }
             if let ConstraintOperation::Replace { target, .. } = &delta.operation {
                 targets.push(target.clone());
@@ -253,7 +228,7 @@ fn validate_constraint_ids(nodes: &BTreeMap<NodeId, TaskNode>) -> Result<()> {
     }
     for target in targets {
         if !declared.contains(&target) {
-            return Err(EvalError::InvalidProgram(format!(
+            return Err(EvalError::InvalidTaskGraph(format!(
                 "replacement targets unknown constraint: {}",
                 target.0
             )));

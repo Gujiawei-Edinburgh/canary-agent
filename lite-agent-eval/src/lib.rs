@@ -1,34 +1,33 @@
-//! Business-agnostic evaluation primitives for tool-using agents.
+//! Business-agnostic evaluation environments for tool-using agents.
 //!
-//! The crate separates four concerns:
-//!
-//! - a source [`TaskCase`] compiled into an immutable [`EvalProgram`];
-//! - an [`EvalVm`] that owns execution state and the factual trajectory;
-//! - a simulated-user processor that controls task progression through typed
-//!   [`SimulatedUserCommand`] values;
-//! - a post-run [`Referee`] that evaluates the program and trajectory.
-//!
-//! Constraint payloads, guard semantics, simulated-user policy, and referee
-//! metrics are intentionally opaque to this crate. Hosts provide those parts.
+//! An [`EvalEnvironment`] owns task state and produces observations. An
+//! [`EvaluatedPolicy`] turns each observation into an [`AgentAction`]. The
+//! [`EvalRunner`] drives that interaction and sends the factual trajectory to
+//! a [`Referee`] after the environment terminates.
 
+mod environment;
 mod error;
 mod eval_command_tool;
 mod program;
 mod roles;
-mod vm;
+mod runner;
 
+pub use environment::{
+    ConstraintApplication, ConstraintLedger, EnvironmentController, EnvironmentControllerInput,
+    EnvironmentDecision, EnvironmentEvent, EnvironmentEventKind, EnvironmentFuture,
+    EnvironmentObservation, EnvironmentOutput, EnvironmentSnapshot, EnvironmentState,
+    EnvironmentStatus, EvalEnvironment, EvidenceRef, GraphEnvironment, ObservationCause,
+    ObservationContent, ObservationRealizer, ObservationRealizerInput, TerminationReason,
+    VisibilityChange, VisibilityState,
+};
 pub use error::{EvalError, Result};
-pub use eval_command_tool::{EvalCommandSink, EvalCommandTool};
+pub use eval_command_tool::{EnvironmentDecisionSink, EnvironmentDecisionTool};
 pub use program::{
-    ActivationPolicy, ConstraintDelta, ConstraintId, ConstraintOperation, EvalProgram, NodeId,
-    Obligation, TaskCase, TaskNode, TaskTransition, TransitionId, TransitionKind,
+    ActivationPolicy, ConstraintDelta, ConstraintId, ConstraintOperation, NodeId, Obligation,
+    TaskCase, TaskGraph, TaskNode, TaskTransition, TransitionId, TransitionKind,
 };
 pub use roles::{
-    AgentInput, AgentObservation, AgentObservationEvent, AgentObservationStatus, AgentRoleIo,
-    AgentRoleOutput, EvalMetric, EvalReport, MetricResult, ProcessorInput, Referee, RefereeInput,
-    RoleFuture, RuntimeAgentIo, SimulatedUserCommand, SimulatedUserProcessor, TestedAgentIo,
+    ActionFuture, AgentAction, AgentActionEvent, AgentActionStatus, EvalMetric, EvalReport,
+    EvalReportFuture, EvaluatedPolicy, MetricResult, Referee, RefereeInput, RuntimeAgentPolicy,
 };
-pub use vm::{
-    ConstraintApplication, ConstraintLedger, EvalEvent, EvalEventKind, EvalPhase, EvalProjection,
-    EvalVm, EvalVmComponents, EvalVmStatus, EvidenceRef, TransitionDelivery,
-};
+pub use runner::{EvalRunner, EvalRunnerComponents, EvalRunnerConfig};

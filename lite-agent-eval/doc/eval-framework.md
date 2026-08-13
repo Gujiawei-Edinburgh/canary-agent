@@ -19,8 +19,8 @@ input. The VM owns the mutable execution state and factual trajectory.
 
 An evaluation has three kinds of participants:
 
-1. **Tested agent**: the system being evaluated. It receives simulated-user
-   messages and returns observations.
+1. **Tested agent**: the policy being evaluated. It receives environment
+   observations and returns actions.
 2. **Simulated user**: the controller of the task interaction. It examines the
    VM state and the latest tested-agent observation, then chooses the next
    command.
@@ -31,11 +31,11 @@ The VM is the coordinator and authority. The simulated user does not mutate
 the VM directly. It emits a typed command, and the VM validates and applies
 that command.
 
-The tested agent is best understood as the VM's external execution device. It
-does not own the evaluation program, advance the task graph, or decide whether
-a transition is valid. It consumes an input selected by the simulated user
-and returns runtime data as an `AgentObservation`. The VM records that data and
-hands it back to the simulated user and, eventually, the referee.
+The tested agent is the policy being evaluated. It does not own the evaluation
+program, advance the task graph, or decide whether a transition is valid. It
+consumes an `EnvironmentObservation` and returns an `AgentAction`. The VM
+records that action and hands it back to the simulated user and, eventually,
+the referee.
 
 ```mermaid
 flowchart LR
@@ -44,8 +44,8 @@ flowchart LR
     subgraph Runtime[VM runtime]
         VM -->|typed command| SU[Simulated user]
         SU -->|command| VM
-        VM -->|input| TA[Tested agent device]
-        TA -->|observation| VM
+        VM -->|observation| TA[Tested agent policy]
+        TA -->|action| VM
     end
     VM -->|final projection and events| R[Referee]
     R --> REPORT[EvalReport]
@@ -58,10 +58,10 @@ This gives the framework a useful separation of concerns:
 - the VM enforces sequencing and transition invariants;
 - the event history records what actually happened.
 
-The tested agent is therefore inside the execution boundary as an I/O device,
-but it is not part of the VM's state machine. The simulated user is the
-processor that chooses VM commands; the VM is the machine that validates and
-applies them.
+The tested agent is therefore inside the execution boundary as a policy, but
+it is not part of the VM's state machine. The simulated user is the current
+environment controller that chooses VM commands; the VM is the machine that
+validates and applies them.
 
 ## Modeling A Task
 
@@ -86,7 +86,6 @@ A transition has:
 - an ID;
 - source and destination nodes;
 - a transition kind;
-- an optional user message.
 
 The graph is the authored interaction shape. For example:
 
@@ -99,9 +98,10 @@ flowchart LR
 ```
 
 The edge selected by the simulated user determines which node-local deltas
-are applied next. A revision or conflict-resolution edge is still an ordinary
-typed transition; the framework does not assume that every path is a simple
-linear progression.
+are applied next. Natural-language realization is produced by the simulated
+user or a future observation realizer; it is not stored in the graph. A
+revision or conflict-resolution edge is still an ordinary typed transition;
+the framework does not assume that every path is a simple linear progression.
 
 The transition kind is descriptive rather than business-specific:
 
@@ -188,11 +188,28 @@ authored test data and executable evaluation data.
 
 ## VM State Machine
 
-`EvalVm` owns three pieces of runtime state:
+`EvalVm` owns the compiled program, an environment state, a runtime projection,
+and the factual event history:
 
 - the immutable `EvalProgram`;
-- an `EvalProjection` describing the current state;
+- an `EvalState` containing latent constraints and visibility state;
+- an `EvalProjection` describing control state and the public read model;
 - an append-only in-memory list of `EvalEvent` values.
+
+The environment state and the tested-policy observation are different things:
+
+```text
+latent EvalState
+      | visibility rules
+      v
+EnvironmentObservation -> TestedPolicy -> AgentAction
+```
+
+The current implementation exposes only disclosed or derivable constraints in
+the tested policy's environment observation. Explicitly disclosed constraints
+remain latent until an environment-policy step marks them as disclosed. The
+simulated-user processor receives a visibility-filtered projection; the
+referee receives the complete projection.
 
 The projection contains:
 
@@ -208,9 +225,9 @@ The phases are:
 ```mermaid
 stateDiagram-v2
     [*] --> SimulatedUserAction
-    SimulatedUserAction --> AwaitingAgentObservation: SendUserMessage
-    AwaitingAgentObservation --> AwaitingSimulatorDecision: observe agent
-    AwaitingSimulatorDecision --> AwaitingAgentObservation: Retry
+    SimulatedUserAction --> AwaitingAgentAction: SendUserMessage
+    AwaitingAgentAction --> AwaitingSimulatorDecision: record agent action
+    AwaitingSimulatorDecision --> AwaitingAgentAction: Retry
     AwaitingSimulatorDecision --> SimulatedUserAction: Commit
     SimulatedUserAction --> Halted: Halt
     AwaitingSimulatorDecision --> Halted: Halt
@@ -219,13 +236,14 @@ stateDiagram-v2
 ```
 
 The implementation currently names `SimulatedUserAction` as
-`EvalPhase::AwaitingUserAction`. The diagram uses the semantic name because
+`EvalPhase::AwaitingUserAction` and the next phase as
+`EvalPhase::AwaitingAgentAction`. The diagram uses semantic names because
 the eval VM has no direct human-input phase: all user actions are generated by
 the simulated-user component.
 
 The VM exposes reducer-style operations for deterministic testing:
 
-- `observe_agent(observation)` records an observation in the expected phase;
+- `record_agent_action(action)` records an agent action in the expected phase;
 - `apply_command(command)` validates and applies a simulated-user command.
 
 In particular, `SendUserMessage` does not mean that a human is interacting
@@ -253,7 +271,10 @@ let report = vm.run().await?;
 The components are trait-based:
 
 ```rust
-pub trait TestedAgentIo: AgentRoleIo {}
+pub trait TestedPolicy {
+    fn act<'a>(&'a self, observation: EnvironmentObservation)
+        -> RoleFuture<'a, AgentAction>;
+}
 
 pub trait SimulatedUserProcessor {
     fn decide<'a>(&'a self, input: ProcessorInput)
@@ -292,12 +313,12 @@ tested agent from seeing evaluation-control functions.
 `EvalVm::run()` performs the orchestration loop:
 
 1. The simulated user receives a `ProcessorInput` containing the program,
-   current projection, and latest observation.
+   visibility-filtered projection, and latest agent action.
 2. It returns a `SimulatedUserCommand`.
 3. The VM applies and validates the command.
 4. If the command sends or retries a user message, the tested agent executes
    that message.
-5. The VM records the resulting `AgentObservation`.
+5. The VM records the resulting `AgentAction`.
 6. The loop continues until the VM reaches a terminal status.
 7. The referee receives the final program, projection, and event history.
 8. The VM returns the referee's `EvalReport`.
@@ -306,7 +327,7 @@ tested agent from seeing evaluation-control functions.
 sequenceDiagram
     participant VM as EvalVm
     participant SU as Simulated user
-    participant TA as Tested agent
+    participant TA as Tested policy
     participant RF as Referee
 
     loop While VM is running
@@ -314,9 +335,9 @@ sequenceDiagram
         SU->>VM: SimulatedUserCommand
         VM->>VM: validate and record command
         alt SendUserMessage or Retry
-            VM->>TA: AgentInput
-            TA->>VM: AgentObservation
-            VM->>VM: record observation
+            VM->>TA: EnvironmentObservation
+            TA->>VM: AgentAction
+            VM->>VM: record action
         else Commit or Halt
             VM->>VM: advance or stop
         end
@@ -325,10 +346,10 @@ sequenceDiagram
     RF->>VM: EvalReport
 ```
 
-The simulated user is therefore the processor that advances the evaluation
-program. The VM is the execution container and state authority. The tested
-agent is an I/O participant, not the component that decides whether a task
-transition is valid.
+The simulated user is therefore the current environment controller that
+advances the evaluation program. The VM is the execution container and state
+authority. The tested agent is the policy under evaluation, and its action is
+observed by the environment rather than treated as a direct VM command.
 
 ## Typed `eval_command`
 
@@ -434,7 +455,7 @@ The main extension points are:
 
 - `TaskCase` construction for new evaluation programs;
 - JSON constraint and obligation payloads for domain semantics;
-- `TestedAgentIo` for different agent adapters;
+- `TestedPolicy` for different tested-agent adapters;
 - `SimulatedUserProcessor` for rules, LLMs, or hybrid controllers;
 - `Referee` and `EvalMetric` for scoring;
 - additional typed evaluation tools if future VM control operations are needed.

@@ -1,6 +1,5 @@
+use crate::environment::{EnvironmentEvent, EnvironmentObservation, EnvironmentSnapshot};
 use crate::error::Result;
-use crate::program::{EvalProgram, TransitionId};
-use crate::vm::{EvalEvent, EvalProjection, EvidenceRef, TransitionDelivery};
 use lite_agent_runtime::{Agent, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,11 +7,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-pub type RoleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+pub type ActionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+pub type EvalReportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentObservationStatus {
+pub enum AgentActionStatus {
     Completed,
     Suspended,
     Failed,
@@ -21,7 +21,7 @@ pub enum AgentObservationStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentObservationEvent {
+pub enum AgentActionEvent {
     AssistantText {
         text: String,
     },
@@ -52,116 +52,109 @@ pub enum AgentObservationEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentObservation {
-    pub status: AgentObservationStatus,
+pub struct AgentAction {
+    pub status: AgentActionStatus,
     pub assistant_text: String,
-    pub events: Vec<AgentObservationEvent>,
+    pub events: Vec<AgentActionEvent>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AgentInput {
-    pub thread_id: String,
-    pub user_text: String,
+pub trait EvaluatedPolicy: Send + Sync {
+    fn act<'a>(&'a self, observation: EnvironmentObservation) -> ActionFuture<'a, AgentAction>;
 }
 
-pub type AgentRoleOutput = AgentObservation;
-
-pub trait AgentRoleIo: Send + Sync {
-    fn execute<'a>(&'a self, input: AgentInput) -> RoleFuture<'a, AgentObservation>;
-}
-
-pub trait TestedAgentIo: AgentRoleIo {}
-
-impl<T> TestedAgentIo for T where T: AgentRoleIo + ?Sized {}
-
-/// Adapts one runtime `Agent` instance to the evaluation I/O contract.
-///
-/// Hosts can clone this adapter for the tested agent, simulated-user model,
-/// and referee model. Each role should use a distinct thread ID so their
-/// conversations remain isolated while sharing the same agent instance.
+/// Adapts a runtime `Agent` to the evaluated-policy contract.
 #[derive(Clone)]
-pub struct RuntimeAgentIo {
+pub struct RuntimeAgentPolicy {
     agent: Arc<Agent>,
+    thread_id: String,
 }
 
-impl RuntimeAgentIo {
-    pub fn new(agent: Arc<Agent>) -> Self {
-        Self { agent }
+impl RuntimeAgentPolicy {
+    pub fn new(agent: Arc<Agent>, thread_id: impl Into<String>) -> Self {
+        Self {
+            agent,
+            thread_id: thread_id.into(),
+        }
     }
 
     pub fn agent(&self) -> Arc<Agent> {
         self.agent.clone()
     }
-
-    pub async fn run(&self, input: AgentInput) -> Result<AgentObservation> {
-        self.execute(input).await
-    }
 }
 
-impl AgentRoleIo for RuntimeAgentIo {
-    fn execute<'a>(&'a self, input: AgentInput) -> RoleFuture<'a, AgentObservation> {
+impl EvaluatedPolicy for RuntimeAgentPolicy {
+    fn act<'a>(&'a self, observation: EnvironmentObservation) -> ActionFuture<'a, AgentAction> {
         Box::pin(async move {
-            let AgentInput {
-                thread_id,
-                user_text,
-            } = input;
             let mut assistant_text = String::new();
             let mut events = Vec::new();
+            let metadata = serde_json::json!({
+                "environment": observation.metadata,
+                "visible_state": observation.visible_state,
+            });
             let outcome = self
                 .agent
-                .run_turn(&thread_id, user_text, Value::Null, |event| match event {
-                    TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { text }) => {
-                        assistant_text = text.clone();
-                        events.push(AgentObservationEvent::AssistantText { text });
-                    }
-                    TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { .. }) => {}
-                    TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested { calls }) => {
-                        events.push(AgentObservationEvent::FunctionCallsRequested {
-                            calls: serde_json::to_value(calls).unwrap_or(Value::Null),
-                        });
-                    }
-                    TurnStreamEvent::State(TurnStateEvent::FunctionStarted { call_id, name }) => {
-                        events.push(AgentObservationEvent::FunctionStarted { call_id, name })
-                    }
-                    TurnStreamEvent::State(TurnStateEvent::FunctionCompleted { call_id, name }) => {
-                        events.push(AgentObservationEvent::FunctionCompleted { call_id, name })
-                    }
-                    TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
-                        call_id,
-                        name,
-                        error,
-                    }) => events.push(AgentObservationEvent::FunctionFailed {
-                        call_id,
-                        name,
-                        error,
-                    }),
-                    TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => {
-                        events.push(AgentObservationEvent::TokenUsage {
-                            usage: serde_json::to_value(usage).unwrap_or(Value::Null),
-                        });
-                    }
-                    TurnStreamEvent::Runtime(runtime) => {
-                        events.push(AgentObservationEvent::Runtime {
-                            source: runtime.source,
-                            message: runtime.message,
-                            metadata: runtime.metadata,
-                        });
-                    }
-                    TurnStreamEvent::State(_) | TurnStreamEvent::Model(_) => {}
-                })
+                .run_turn(
+                    &self.thread_id,
+                    observation.user_text,
+                    metadata,
+                    |event| match event {
+                        TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { text }) => {
+                            assistant_text = text.clone();
+                            events.push(AgentActionEvent::AssistantText { text });
+                        }
+                        TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { .. }) => {}
+                        TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested {
+                            calls,
+                        }) => {
+                            events.push(AgentActionEvent::FunctionCallsRequested {
+                                calls: serde_json::to_value(calls).unwrap_or(Value::Null),
+                            });
+                        }
+                        TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
+                            call_id,
+                            name,
+                        }) => events.push(AgentActionEvent::FunctionStarted { call_id, name }),
+                        TurnStreamEvent::State(TurnStateEvent::FunctionCompleted {
+                            call_id,
+                            name,
+                        }) => events.push(AgentActionEvent::FunctionCompleted { call_id, name }),
+                        TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
+                            call_id,
+                            name,
+                            error,
+                        }) => events.push(AgentActionEvent::FunctionFailed {
+                            call_id,
+                            name,
+                            error,
+                        }),
+                        TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => {
+                            events.push(AgentActionEvent::TokenUsage {
+                                usage: serde_json::to_value(usage).unwrap_or(Value::Null),
+                            });
+                        }
+                        TurnStreamEvent::Runtime(runtime) => {
+                            events.push(AgentActionEvent::Runtime {
+                                source: runtime.source,
+                                message: runtime.message,
+                                metadata: runtime.metadata,
+                            });
+                        }
+                        TurnStreamEvent::State(_) | TurnStreamEvent::Model(_) => {}
+                    },
+                )
                 .await?;
             let status = match outcome {
                 TurnOutcome::AssistantMessage { text } => {
                     if assistant_text.is_empty() {
                         assistant_text = text;
                     }
-                    AgentObservationStatus::Completed
+                    AgentActionStatus::Completed
                 }
-                TurnOutcome::Suspended { .. } => AgentObservationStatus::Suspended,
-                TurnOutcome::Failed { .. } => AgentObservationStatus::Failed,
-                TurnOutcome::Aborted { .. } => AgentObservationStatus::Aborted,
+                TurnOutcome::Suspended { .. } => AgentActionStatus::Suspended,
+                TurnOutcome::Failed { .. } => AgentActionStatus::Failed,
+                TurnOutcome::Aborted { .. } => AgentActionStatus::Aborted,
             };
-            Ok(AgentObservation {
+            Ok(AgentAction {
                 status,
                 assistant_text,
                 events,
@@ -171,42 +164,9 @@ impl AgentRoleIo for RuntimeAgentIo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProcessorInput {
-    pub program: EvalProgram,
-    pub projection: EvalProjection,
-    pub latest_observation: Option<AgentObservation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum SimulatedUserCommand {
-    SendUserMessage {
-        transition: Option<TransitionId>,
-        message: String,
-    },
-    Retry {
-        message: String,
-        reason: String,
-    },
-    Commit {
-        transition: TransitionId,
-        delivery: TransitionDelivery,
-        evidence: Vec<EvidenceRef>,
-        reason: String,
-    },
-    Halt {
-        reason: String,
-    },
-}
-
-pub trait SimulatedUserProcessor: Send + Sync {
-    fn decide<'a>(&'a self, input: ProcessorInput) -> RoleFuture<'a, SimulatedUserCommand>;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RefereeInput {
-    pub program: EvalProgram,
-    pub projection: EvalProjection,
-    pub events: Vec<EvalEvent>,
+    pub snapshot: EnvironmentSnapshot,
+    pub trajectory: Vec<EnvironmentEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -229,5 +189,5 @@ pub struct EvalReport {
 }
 
 pub trait Referee: Send + Sync {
-    fn evaluate<'a>(&'a self, input: RefereeInput) -> RoleFuture<'a, EvalReport>;
+    fn evaluate<'a>(&'a self, input: RefereeInput) -> EvalReportFuture<'a, EvalReport>;
 }

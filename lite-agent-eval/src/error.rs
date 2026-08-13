@@ -4,11 +4,14 @@ pub type Result<T> = std::result::Result<T, EvalError>;
 
 #[derive(Debug, Error)]
 pub enum EvalError {
-    #[error("invalid evaluation program: {0}")]
-    InvalidProgram(String),
+    #[error("invalid task graph: {0}")]
+    InvalidTaskGraph(String),
 
-    #[error("invalid VM command: {0}")]
-    InvalidCommand(String),
+    #[error("invalid environment action: {0}")]
+    InvalidEnvironmentAction(String),
+
+    #[error("environment failed: {0}")]
+    Environment(String),
 
     #[error("evaluation role failed: {0}")]
     Role(String),

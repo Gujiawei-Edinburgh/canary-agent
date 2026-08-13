@@ -1,6 +1,5 @@
-use crate::program::TransitionId;
-use crate::roles::SimulatedUserCommand;
-use crate::vm::{EvidenceRef, TransitionDelivery};
+use crate::environment::{EnvironmentDecision, EvidenceRef, VisibilityChange};
+use crate::program::{ConstraintId, TransitionId};
 use lite_agent_runtime::{
     AgentFunction, DiscardResolver, FunctionContext, FunctionExecution, FunctionLimits,
     FunctionOutputResolver, FunctionRecoveryPolicy, FunctionSpec, Result as AgentResult,
@@ -13,84 +12,103 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Default)]
-pub struct EvalCommandSink {
-    command: Mutex<Option<SimulatedUserCommand>>,
+pub struct EnvironmentDecisionSink {
+    decision: Mutex<Option<EnvironmentDecision>>,
 }
 
-impl EvalCommandSink {
-    pub fn take(&self) -> Option<SimulatedUserCommand> {
-        self.command.lock().ok()?.take()
+impl EnvironmentDecisionSink {
+    pub fn take(&self) -> Option<EnvironmentDecision> {
+        self.decision.lock().ok()?.take()
     }
 
-    fn submit(&self, command: SimulatedUserCommand) -> Result<(), String> {
+    fn submit(&self, decision: EnvironmentDecision) -> Result<(), String> {
         let mut pending = self
-            .command
+            .decision
             .lock()
-            .map_err(|_| "eval command sink is poisoned".to_string())?;
-        if pending.is_some() {
-            return Err("only one eval command may be submitted per turn".to_string());
+            .map_err(|_| "environment decision sink is poisoned".to_string())?;
+        if pending.as_ref() == Some(&decision) {
+            return Ok(());
         }
-        *pending = Some(command);
+        if pending.is_some() {
+            return Err("a different environment decision is already pending".to_string());
+        }
+        *pending = Some(decision);
         Ok(())
     }
 }
 
-pub struct EvalCommandTool {
-    sink: Arc<EvalCommandSink>,
+pub struct EnvironmentDecisionTool {
+    sink: Arc<EnvironmentDecisionSink>,
 }
 
-impl EvalCommandTool {
-    pub fn new(sink: Arc<EvalCommandSink>) -> Self {
+impl EnvironmentDecisionTool {
+    pub fn new(sink: Arc<EnvironmentDecisionSink>) -> Self {
         Self { sink }
     }
 }
 
-impl AgentFunction for EvalCommandTool {
+impl AgentFunction for EnvironmentDecisionTool {
     fn spec(&self) -> FunctionSpec {
         FunctionSpec {
-            name: "eval_command".to_string(),
-            description: "Submit exactly one typed command to the evaluation VM. Use this instead of writing a command in assistant text.".to_string(),
+            name: "environment_decision".to_string(),
+            description: "Submit exactly one typed environment decision after inspecting the evaluated policy's action.".to_string(),
             parameters: json!({
                 "type": "object",
                 "oneOf": [
                     {
                         "properties": {
-                            "kind": { "const": "send_user_message" },
-                            "transition": { "type": ["string", "null"] },
-                            "message": { "type": "string" }
+                            "kind": { "const": "transition" },
+                            "transition": { "type": "string" },
+                            "visibility": { "$ref": "#/$defs/visibility_changes" },
+                            "evidence": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string" },
+                                        "reference": { "type": "string" }
+                                    },
+                                    "required": ["kind", "reference"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "reason": { "type": "string" }
                         },
-                        "required": ["kind", "transition", "message"],
+                        "required": ["kind", "transition", "visibility", "evidence", "reason"],
                         "additionalProperties": false
                     },
                     {
                         "properties": {
                             "kind": { "const": "retry" },
-                            "message": { "type": "string" },
+                            "visibility": { "$ref": "#/$defs/visibility_changes" },
                             "reason": { "type": "string" }
                         },
-                        "required": ["kind", "message", "reason"],
+                        "required": ["kind", "visibility", "reason"],
                         "additionalProperties": false
                     },
                     {
                         "properties": {
-                            "kind": { "const": "commit" },
-                            "transition": { "type": "string" },
-                            "delivery": { "enum": ["explicit", "epsilon"] },
-                            "evidence": { "type": "array" },
-                            "reason": { "type": "string" }
-                        },
-                        "required": ["kind", "transition", "delivery", "evidence", "reason"],
-                        "additionalProperties": false
-                    },
-                    {
-                        "properties": {
-                            "kind": { "const": "halt" },
+                            "kind": { "const": "terminate" },
                             "reason": { "type": "string" }
                         },
                         "required": ["kind", "reason"],
                         "additionalProperties": false
                     }
-                ]
+                ],
+                "$defs": {
+                    "visibility_changes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "enum": ["disclose", "derive", "conceal"] },
+                                "constraint": { "type": "string" }
+                            },
+                            "required": ["kind", "constraint"],
+                            "additionalProperties": false
+                        }
+                    }
+                }
             }),
         }
     }
@@ -116,24 +134,21 @@ impl AgentFunction for EvalCommandTool {
         _context: FunctionContext,
     ) -> Pin<Box<dyn Future<Output = AgentResult<FunctionExecution>> + Send + 'a>> {
         Box::pin(async move {
-            let request: EvalCommandRequest = serde_json::from_value(args).map_err(|error| {
-                lite_agent_runtime::AgentError::InvalidFunctionArguments {
-                    name: "eval_command".to_string(),
-                    message: error.to_string(),
-                }
-            })?;
-            let command = request.into_command().map_err(|message| {
-                lite_agent_runtime::AgentError::InvalidFunctionArguments {
-                    name: "eval_command".to_string(),
-                    message,
-                }
-            })?;
-            self.sink.submit(command).map_err(|message| {
-                lite_agent_runtime::AgentError::InvalidFunctionArguments {
-                    name: "eval_command".to_string(),
-                    message,
-                }
-            })?;
+            let request: EnvironmentDecisionRequest =
+                serde_json::from_value(args).map_err(|error| {
+                    lite_agent_runtime::AgentError::InvalidFunctionArguments {
+                        name: "environment_decision".to_string(),
+                        message: error.to_string(),
+                    }
+                })?;
+            self.sink
+                .submit(request.into_decision())
+                .map_err(
+                    |message| lite_agent_runtime::AgentError::InvalidFunctionArguments {
+                        name: "environment_decision".to_string(),
+                        message,
+                    },
+                )?;
             Ok(FunctionExecution::Completed {
                 output: json!({"accepted": true}),
             })
@@ -143,49 +158,71 @@ impl AgentFunction for EvalCommandTool {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum EvalCommandRequest {
-    SendUserMessage {
-        transition: Option<String>,
-        message: String,
-    },
-    Retry {
-        message: String,
-        reason: String,
-    },
-    Commit {
+enum EnvironmentDecisionRequest {
+    Transition {
         transition: String,
-        delivery: TransitionDelivery,
+        visibility: Vec<VisibilityChangeRequest>,
         evidence: Vec<EvidenceRef>,
         reason: String,
     },
-    Halt {
+    Retry {
+        visibility: Vec<VisibilityChangeRequest>,
+        reason: String,
+    },
+    Terminate {
         reason: String,
     },
 }
 
-impl EvalCommandRequest {
-    fn into_command(self) -> std::result::Result<SimulatedUserCommand, String> {
-        Ok(match self {
-            Self::SendUserMessage {
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum VisibilityChangeRequest {
+    Disclose { constraint: String },
+    Derive { constraint: String },
+    Conceal { constraint: String },
+}
+
+impl EnvironmentDecisionRequest {
+    fn into_decision(self) -> EnvironmentDecision {
+        match self {
+            Self::Transition {
                 transition,
-                message,
-            } => SimulatedUserCommand::SendUserMessage {
-                transition: transition.map(TransitionId),
-                message,
-            },
-            Self::Retry { message, reason } => SimulatedUserCommand::Retry { message, reason },
-            Self::Commit {
-                transition,
-                delivery,
+                visibility,
                 evidence,
                 reason,
-            } => SimulatedUserCommand::Commit {
+            } => EnvironmentDecision::Transition {
                 transition: TransitionId(transition),
-                delivery,
+                visibility: visibility
+                    .into_iter()
+                    .map(VisibilityChangeRequest::into_change)
+                    .collect(),
                 evidence,
                 reason,
             },
-            Self::Halt { reason } => SimulatedUserCommand::Halt { reason },
-        })
+            Self::Retry { visibility, reason } => EnvironmentDecision::Retry {
+                visibility: visibility
+                    .into_iter()
+                    .map(VisibilityChangeRequest::into_change)
+                    .collect(),
+                reason,
+            },
+            Self::Terminate { reason } => EnvironmentDecision::Terminate { reason },
+        }
+    }
+}
+
+impl VisibilityChangeRequest {
+    fn into_change(self) -> VisibilityChange {
+        match self {
+            Self::Disclose { constraint } => VisibilityChange::Disclose {
+                constraint: ConstraintId(constraint),
+            },
+            Self::Derive { constraint } => VisibilityChange::Derive {
+                constraint: ConstraintId(constraint),
+            },
+            Self::Conceal { constraint } => VisibilityChange::Conceal {
+                constraint: ConstraintId(constraint),
+            },
+        }
     }
 }
