@@ -1,11 +1,11 @@
 use lite_agent_eval::{
-    ActivationPolicy, AgentActionEvent, AgentActionStatus, ConstraintDelta, ConstraintId,
+    AgentActionEvent, AgentActionStatus, ConstraintDelta, ConstraintExposure, ConstraintId,
     ConstraintOperation, EnvironmentController, EnvironmentControllerInput, EnvironmentDecision,
     EnvironmentDecisionSink, EnvironmentDecisionTool, EnvironmentEventKind, EnvironmentFuture,
     EvalError, EvalReport, EvalReportFuture, EvalRunner, EvalRunnerComponents, GraphEnvironment,
     MetricResult, NodeId, ObservationCause, ObservationContent, ObservationRealizer,
     ObservationRealizerInput, Referee, RefereeInput, RuntimeAgentPolicy, TaskCase, TaskNode,
-    TaskTransition, TransitionId, TransitionKind, VisibilityChange,
+    TaskTransition, TransitionId, TransitionKind,
 };
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
 use lite_agent_runtime::{
@@ -141,7 +141,6 @@ fn example_case() -> TaskCase {
                         operation: ConstraintOperation::Add {
                             id: ConstraintId::from("topic"),
                             value: json!("the latest stable Rust release"),
-                            activation: ActivationPolicy::ExplicitDisclosure,
                         },
                         provenance: Some("initial request".to_string()),
                     },
@@ -149,7 +148,6 @@ fn example_case() -> TaskCase {
                         operation: ConstraintOperation::Add {
                             id: ConstraintId::from("source_policy"),
                             value: json!("use a credible current web source and cite its URL"),
-                            activation: ActivationPolicy::ExplicitDisclosure,
                         },
                         provenance: Some("initial request".to_string()),
                     },
@@ -179,7 +177,6 @@ fn example_case() -> TaskCase {
                         operation: ConstraintOperation::Add {
                             id: ConstraintId::from("release_date_requirement"),
                             value: json!("include the exact release date"),
-                            activation: ActivationPolicy::ExplicitDisclosure,
                         },
                         provenance: Some("user revision".to_string()),
                     },
@@ -205,7 +202,6 @@ fn example_case() -> TaskCase {
                         value: json!(
                             "compare with the immediately previous stable Rust release and explain one concrete user-visible change"
                         ),
-                        activation: ActivationPolicy::ExplicitDisclosure,
                     },
                     provenance: Some("follow-up request".to_string()),
                 }],
@@ -234,7 +230,6 @@ fn example_case() -> TaskCase {
                             "maximum_words": 180,
                             "required_sections": ["latest release", "comparison", "sources"]
                         }),
-                        activation: ActivationPolicy::ExplicitDisclosure,
                     },
                     provenance: Some("final formatting request".to_string()),
                 }],
@@ -257,7 +252,6 @@ fn example_case() -> TaskCase {
                     operation: ConstraintOperation::Add {
                         id: ConstraintId::from("evaluation_complete"),
                         value: json!(true),
-                        activation: ActivationPolicy::AlreadyAuthorized,
                     },
                     provenance: Some("terminal transition".to_string()),
                 }],
@@ -298,12 +292,12 @@ fn example_case() -> TaskCase {
 struct StagedObservationRealizer;
 
 impl ObservationRealizer for StagedObservationRealizer {
-    fn realize<'a>(
-        &'a self,
+    fn realize(
+        &self,
         input: ObservationRealizerInput,
-    ) -> EnvironmentFuture<'a, ObservationContent> {
+    ) -> EnvironmentFuture<'_, ObservationContent> {
         Box::pin(async move {
-            let (user_text, visibility) = match input.cause {
+            let (user_text, exposures) = match input.cause {
                 ObservationCause::Reset => (
                     "Find the latest stable Rust release. Use web_search, tell me the version, and cite a credible current source URL.".to_string(),
                     vec![
@@ -320,7 +314,10 @@ impl ObservationRealizer for StagedObservationRealizer {
                 ObservationCause::Transition { transition }
                     if transition.0 == "require_official_details" => (
                         "I want to revise the source requirement: use only official rust-lang.org sources, and include the exact release date.".to_string(),
-                        vec![disclose("release_date_requirement")],
+                        vec![
+                            disclose("official_source_policy"),
+                            disclose("release_date_requirement"),
+                        ],
                     ),
                 ObservationCause::Transition { transition }
                     if transition.0 == "compare_previous_release" => (
@@ -341,7 +338,7 @@ impl ObservationRealizer for StagedObservationRealizer {
             };
             Ok(ObservationContent {
                 user_text,
-                visibility,
+                exposures,
                 metadata: json!({
                     "case": "multi-stage-rust-release-research",
                     "node": input.state.current_node,
@@ -351,8 +348,8 @@ impl ObservationRealizer for StagedObservationRealizer {
     }
 }
 
-fn disclose(constraint: &str) -> VisibilityChange {
-    VisibilityChange::Disclose {
+fn disclose(constraint: &str) -> ConstraintExposure {
+    ConstraintExposure::Disclose {
         constraint: ConstraintId::from(constraint),
     }
 }

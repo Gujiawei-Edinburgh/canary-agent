@@ -83,10 +83,11 @@ impl RuntimeAgentPolicy {
 }
 
 impl EvaluatedPolicy for RuntimeAgentPolicy {
-    fn act<'a>(&'a self, observation: EnvironmentObservation) -> ActionFuture<'a, AgentAction> {
+    fn act(&self, observation: EnvironmentObservation) -> ActionFuture<'_, AgentAction> {
         Box::pin(async move {
             let mut assistant_text = String::new();
             let mut events = Vec::new();
+            let policy_input = render_policy_input(&observation)?;
             let metadata = serde_json::json!({
                 "environment": observation.metadata,
                 "visible_state": observation.visible_state,
@@ -95,7 +96,7 @@ impl EvaluatedPolicy for RuntimeAgentPolicy {
                 .agent
                 .run_turn(
                     &self.thread_id,
-                    observation.user_text,
+                    policy_input,
                     metadata,
                     |event| match event {
                         TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { text }) => {
@@ -163,6 +164,22 @@ impl EvaluatedPolicy for RuntimeAgentPolicy {
     }
 }
 
+fn render_policy_input(observation: &EnvironmentObservation) -> Result<String> {
+    let has_visible_state = match &observation.visible_state {
+        Value::Null => false,
+        Value::Object(values) => !values.is_empty(),
+        _ => true,
+    };
+    if !has_visible_state {
+        return Ok(observation.user_text.clone());
+    }
+    Ok(format!(
+        "{}\n\nActive exposed constraints (authoritative):\n{}",
+        observation.user_text,
+        serde_json::to_string_pretty(&observation.visible_state)?
+    ))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RefereeInput {
     pub snapshot: EnvironmentSnapshot,
@@ -190,4 +207,24 @@ pub struct EvalReport {
 
 pub trait Referee: Send + Sync {
     fn evaluate<'a>(&'a self, input: RefereeInput) -> EvalReportFuture<'a, EvalReport>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn policy_input_includes_the_active_exposed_projection() {
+        let rendered = render_policy_input(&EnvironmentObservation {
+            user_text: "Continue the task.".to_string(),
+            visible_state: json!({"budget": 1000}),
+            metadata: Value::Null,
+        })
+        .expect("policy input");
+
+        assert!(rendered.contains("Continue the task."));
+        assert!(rendered.contains("Active exposed constraints"));
+        assert!(rendered.contains("\"budget\": 1000"));
+    }
 }

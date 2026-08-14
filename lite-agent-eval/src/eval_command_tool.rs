@@ -1,5 +1,5 @@
-use crate::environment::{EnvironmentDecision, EvidenceRef, VisibilityChange};
-use crate::program::{ConstraintId, TransitionId};
+use crate::environment::{EnvironmentDecision, EvidenceRef};
+use crate::program::TransitionId;
 use lite_agent_runtime::{
     AgentFunction, DiscardResolver, FunctionContext, FunctionExecution, FunctionLimits,
     FunctionOutputResolver, FunctionRecoveryPolicy, FunctionSpec, Result as AgentResult,
@@ -59,7 +59,6 @@ impl AgentFunction for EnvironmentDecisionTool {
                         "properties": {
                             "kind": { "const": "transition" },
                             "transition": { "type": "string" },
-                            "visibility": { "$ref": "#/$defs/visibility_changes" },
                             "evidence": {
                                 "type": "array",
                                 "items": {
@@ -74,16 +73,15 @@ impl AgentFunction for EnvironmentDecisionTool {
                             },
                             "reason": { "type": "string" }
                         },
-                        "required": ["kind", "transition", "visibility", "evidence", "reason"],
+                        "required": ["kind", "transition", "evidence", "reason"],
                         "additionalProperties": false
                     },
                     {
                         "properties": {
                             "kind": { "const": "retry" },
-                            "visibility": { "$ref": "#/$defs/visibility_changes" },
                             "reason": { "type": "string" }
                         },
-                        "required": ["kind", "visibility", "reason"],
+                        "required": ["kind", "reason"],
                         "additionalProperties": false
                     },
                     {
@@ -94,21 +92,7 @@ impl AgentFunction for EnvironmentDecisionTool {
                         "required": ["kind", "reason"],
                         "additionalProperties": false
                     }
-                ],
-                "$defs": {
-                    "visibility_changes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "kind": { "enum": ["disclose", "derive", "conceal"] },
-                                "constraint": { "type": "string" }
-                            },
-                            "required": ["kind", "constraint"],
-                            "additionalProperties": false
-                        }
-                    }
-                }
+                ]
             }),
         }
     }
@@ -161,12 +145,10 @@ impl AgentFunction for EnvironmentDecisionTool {
 enum EnvironmentDecisionRequest {
     Transition {
         transition: String,
-        visibility: Vec<VisibilityChangeRequest>,
         evidence: Vec<EvidenceRef>,
         reason: String,
     },
     Retry {
-        visibility: Vec<VisibilityChangeRequest>,
         reason: String,
     },
     Terminate {
@@ -174,55 +156,20 @@ enum EnvironmentDecisionRequest {
     },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum VisibilityChangeRequest {
-    Disclose { constraint: String },
-    Derive { constraint: String },
-    Conceal { constraint: String },
-}
-
 impl EnvironmentDecisionRequest {
     fn into_decision(self) -> EnvironmentDecision {
         match self {
             Self::Transition {
                 transition,
-                visibility,
                 evidence,
                 reason,
             } => EnvironmentDecision::Transition {
                 transition: TransitionId(transition),
-                visibility: visibility
-                    .into_iter()
-                    .map(VisibilityChangeRequest::into_change)
-                    .collect(),
                 evidence,
                 reason,
             },
-            Self::Retry { visibility, reason } => EnvironmentDecision::Retry {
-                visibility: visibility
-                    .into_iter()
-                    .map(VisibilityChangeRequest::into_change)
-                    .collect(),
-                reason,
-            },
+            Self::Retry { reason } => EnvironmentDecision::Retry { reason },
             Self::Terminate { reason } => EnvironmentDecision::Terminate { reason },
-        }
-    }
-}
-
-impl VisibilityChangeRequest {
-    fn into_change(self) -> VisibilityChange {
-        match self {
-            Self::Disclose { constraint } => VisibilityChange::Disclose {
-                constraint: ConstraintId(constraint),
-            },
-            Self::Derive { constraint } => VisibilityChange::Derive {
-                constraint: ConstraintId(constraint),
-            },
-            Self::Conceal { constraint } => VisibilityChange::Conceal {
-                constraint: ConstraintId(constraint),
-            },
         }
     }
 }

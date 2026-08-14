@@ -130,14 +130,13 @@ mod tests {
     struct Controller;
 
     impl EnvironmentController for Controller {
-        fn decide<'a>(
-            &'a self,
+        fn decide(
+            &self,
             _input: EnvironmentControllerInput,
-        ) -> EnvironmentFuture<'a, EnvironmentDecision> {
+        ) -> EnvironmentFuture<'_, EnvironmentDecision> {
             Box::pin(async {
                 Ok(EnvironmentDecision::Transition {
                     transition: TransitionId::from("finish"),
-                    visibility: Vec::new(),
                     evidence: Vec::new(),
                     reason: "done".to_string(),
                 })
@@ -148,14 +147,14 @@ mod tests {
     struct Realizer;
 
     impl ObservationRealizer for Realizer {
-        fn realize<'a>(
-            &'a self,
+        fn realize(
+            &self,
             _input: ObservationRealizerInput,
-        ) -> EnvironmentFuture<'a, ObservationContent> {
+        ) -> EnvironmentFuture<'_, ObservationContent> {
             Box::pin(async {
                 Ok(ObservationContent {
                     user_text: "perform task".to_string(),
-                    visibility: Vec::new(),
+                    exposures: Vec::new(),
                     metadata: Value::Null,
                 })
             })
@@ -165,7 +164,7 @@ mod tests {
     struct TestReferee;
 
     impl Referee for TestReferee {
-        fn evaluate<'a>(&'a self, input: RefereeInput) -> EvalReportFuture<'a, EvalReport> {
+        fn evaluate(&self, input: RefereeInput) -> EvalReportFuture<'_, EvalReport> {
             Box::pin(async move {
                 assert_eq!(input.snapshot.status, EnvironmentStatus::Terminated);
                 assert!(!input.trajectory.is_empty());

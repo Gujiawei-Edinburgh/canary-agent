@@ -1,7 +1,6 @@
 use crate::error::{EvalError, Result};
 use crate::program::{
-    ActivationPolicy, ConstraintDelta, ConstraintId, ConstraintOperation, NodeId, TaskGraph,
-    TransitionId,
+    ConstraintDelta, ConstraintId, ConstraintOperation, NodeId, TaskGraph, TransitionId,
 };
 use crate::roles::AgentAction;
 use serde::{Deserialize, Serialize};
@@ -46,10 +45,35 @@ pub struct ConstraintApplication {
     pub delta: ConstraintDelta,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExposureOrigin {
+    ExplicitDisclosure,
+    EnvironmentDerived {
+        inputs: Vec<ConstraintId>,
+        rule: String,
+    },
+    ContextProvided {
+        source: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExposureRecord {
+    pub constraint: ConstraintId,
+    pub origin: ExposureOrigin,
+    pub observation_sequence: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VisibilityState {
-    pub disclosed: BTreeSet<ConstraintId>,
-    pub derived: BTreeSet<ConstraintId>,
+pub struct ExposureLedger {
+    pub records: BTreeMap<ConstraintId, ExposureRecord>,
+}
+
+impl ExposureLedger {
+    pub fn contains(&self, constraint: &ConstraintId) -> bool {
+        self.records.contains_key(constraint)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -57,7 +81,7 @@ pub struct EnvironmentState {
     pub status: EnvironmentStatus,
     pub current_node: NodeId,
     pub constraints: ConstraintLedger,
-    pub visibility: VisibilityState,
+    pub exposures: ExposureLedger,
     pub termination: Option<TerminationReason>,
     pub step: u64,
 }
@@ -81,7 +105,7 @@ pub struct EnvironmentObservation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservationContent {
     pub user_text: String,
-    pub visibility: Vec<VisibilityChange>,
+    pub exposures: Vec<ConstraintExposure>,
     pub metadata: Value,
 }
 
@@ -102,18 +126,48 @@ pub struct ObservationRealizerInput {
 }
 
 pub trait ObservationRealizer: Send + Sync {
-    fn realize<'a>(
-        &'a self,
-        input: ObservationRealizerInput,
-    ) -> EnvironmentFuture<'a, ObservationContent>;
+    fn realize(&self, input: ObservationRealizerInput)
+    -> EnvironmentFuture<'_, ObservationContent>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum VisibilityChange {
-    Disclose { constraint: ConstraintId },
-    Derive { constraint: ConstraintId },
-    Conceal { constraint: ConstraintId },
+pub enum ConstraintExposure {
+    Disclose {
+        constraint: ConstraintId,
+    },
+    Derive {
+        constraint: ConstraintId,
+        inputs: Vec<ConstraintId>,
+        rule: String,
+    },
+    ProvideContext {
+        constraint: ConstraintId,
+        source: String,
+    },
+}
+
+impl ConstraintExposure {
+    fn constraint(&self) -> &ConstraintId {
+        match self {
+            Self::Disclose { constraint }
+            | Self::Derive { constraint, .. }
+            | Self::ProvideContext { constraint, .. } => constraint,
+        }
+    }
+
+    fn origin(&self) -> ExposureOrigin {
+        match self {
+            Self::Disclose { .. } => ExposureOrigin::ExplicitDisclosure,
+            Self::Derive { inputs, rule, .. } => ExposureOrigin::EnvironmentDerived {
+                inputs: inputs.clone(),
+                rule: rule.clone(),
+            },
+            Self::ProvideContext { source, .. } => ExposureOrigin::ContextProvided {
+                source: source.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,12 +175,10 @@ pub enum VisibilityChange {
 pub enum EnvironmentDecision {
     Transition {
         transition: TransitionId,
-        visibility: Vec<VisibilityChange>,
         evidence: Vec<EvidenceRef>,
         reason: String,
     },
     Retry {
-        visibility: Vec<VisibilityChange>,
         reason: String,
     },
     Terminate {
@@ -168,6 +220,7 @@ pub enum EnvironmentEventKind {
     },
     ObservationEmitted {
         observation: EnvironmentObservation,
+        exposures: Vec<ExposureRecord>,
     },
     AgentActionRecorded {
         action: AgentAction,
@@ -191,9 +244,9 @@ pub enum EnvironmentEventKind {
 }
 
 pub trait EvalEnvironment: Send {
-    fn reset<'a>(&'a mut self) -> EnvironmentFuture<'a, EnvironmentOutput>;
+    fn reset(&mut self) -> EnvironmentFuture<'_, EnvironmentOutput>;
 
-    fn step<'a>(&'a mut self, action: AgentAction) -> EnvironmentFuture<'a, EnvironmentOutput>;
+    fn step(&mut self, action: AgentAction) -> EnvironmentFuture<'_, EnvironmentOutput>;
 
     fn snapshot(&self) -> Result<EnvironmentSnapshot>;
 
@@ -221,7 +274,7 @@ impl GraphEnvironment {
                 status: EnvironmentStatus::NotStarted,
                 current_node: start.clone(),
                 constraints: ConstraintLedger::default(),
-                visibility: VisibilityState::default(),
+                exposures: ExposureLedger::default(),
                 termination: None,
                 step: 0,
             },
@@ -245,7 +298,6 @@ impl GraphEnvironment {
         match decision {
             EnvironmentDecision::Transition {
                 transition,
-                visibility,
                 evidence,
                 ..
             } => {
@@ -259,10 +311,6 @@ impl GraphEnvironment {
 
                 let previous_state = self.state.clone();
                 if let Err(error) = self.apply_node(&transition_spec.to) {
-                    self.state = previous_state;
-                    return Err(error);
-                }
-                if let Err(error) = self.apply_visibility_changes(visibility) {
                     self.state = previous_state;
                     return Err(error);
                 }
@@ -284,12 +332,9 @@ impl GraphEnvironment {
                     transition: transition.clone(),
                 })
             }
-            EnvironmentDecision::Retry { visibility, reason } => {
-                self.apply_visibility_changes(visibility)?;
-                Ok(ObservationCause::Retry {
-                    reason: reason.clone(),
-                })
-            }
+            EnvironmentDecision::Retry { reason } => Ok(ObservationCause::Retry {
+                reason: reason.clone(),
+            }),
             EnvironmentDecision::Terminate { reason } => {
                 self.terminate(TerminationReason::Controller {
                     reason: reason.clone(),
@@ -315,11 +360,7 @@ impl GraphEnvironment {
 
     fn apply_constraint(&mut self, node: &NodeId, delta: ConstraintDelta) -> Result<()> {
         match &delta.operation {
-            ConstraintOperation::Add {
-                id,
-                value,
-                activation,
-            } => {
+            ConstraintOperation::Add { id, value } => {
                 if self
                     .state
                     .constraints
@@ -332,15 +373,6 @@ impl GraphEnvironment {
                         id.0
                     )));
                 }
-                match activation {
-                    ActivationPolicy::ExplicitDisclosure => {}
-                    ActivationPolicy::AlreadyAuthorized => {
-                        self.state.visibility.disclosed.insert(id.clone());
-                    }
-                    ActivationPolicy::Derivable => {
-                        self.state.visibility.derived.insert(id.clone());
-                    }
-                }
             }
             ConstraintOperation::Replace { target, id, value } => {
                 if self.state.constraints.active.remove(target).is_none() {
@@ -349,18 +381,10 @@ impl GraphEnvironment {
                         target.0
                     )));
                 }
-                let was_disclosed = self.state.visibility.disclosed.remove(target);
-                let was_derived = self.state.visibility.derived.remove(target);
                 self.state
                     .constraints
                     .active
                     .insert(id.clone(), value.clone());
-                if was_disclosed {
-                    self.state.visibility.disclosed.insert(id.clone());
-                }
-                if was_derived {
-                    self.state.visibility.derived.insert(id.clone());
-                }
             }
             ConstraintOperation::Remove { target } => {
                 if self.state.constraints.active.remove(target).is_none() {
@@ -369,8 +393,6 @@ impl GraphEnvironment {
                         target.0
                     )));
                 }
-                self.state.visibility.disclosed.remove(target);
-                self.state.visibility.derived.remove(target);
             }
         }
         self.state.constraints.applied.push(ConstraintApplication {
@@ -380,46 +402,89 @@ impl GraphEnvironment {
         Ok(())
     }
 
-    fn apply_visibility_changes(&mut self, changes: &[VisibilityChange]) -> Result<()> {
-        for change in changes {
-            let id = match change {
-                VisibilityChange::Disclose { constraint }
-                | VisibilityChange::Derive { constraint }
-                | VisibilityChange::Conceal { constraint } => constraint,
-            };
-            if !self.state.constraints.active.contains_key(id) {
+    fn prepare_exposure_records(
+        &self,
+        exposures: &[ConstraintExposure],
+        observation_sequence: u64,
+    ) -> Result<Vec<ExposureRecord>> {
+        let mut available = self
+            .state
+            .exposures
+            .records
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut records = Vec::with_capacity(exposures.len());
+
+        for exposure in exposures {
+            let constraint = exposure.constraint();
+            if !self.state.constraints.active.contains_key(constraint) {
                 return Err(EvalError::InvalidEnvironmentAction(format!(
-                    "visibility change references inactive constraint: {}",
-                    id.0
+                    "exposure references inactive constraint: {}",
+                    constraint.0
                 )));
             }
-            match change {
-                VisibilityChange::Disclose { constraint } => {
-                    self.state.visibility.derived.remove(constraint);
-                    self.state.visibility.disclosed.insert(constraint.clone());
+            if available.contains(constraint) {
+                return Err(EvalError::InvalidEnvironmentAction(format!(
+                    "constraint is already exposed: {}",
+                    constraint.0
+                )));
+            }
+
+            match exposure {
+                ConstraintExposure::Disclose { .. } => {}
+                ConstraintExposure::Derive { inputs, rule, .. } => {
+                    if inputs.is_empty() {
+                        return Err(EvalError::InvalidEnvironmentAction(format!(
+                            "derived exposure has no inputs: {}",
+                            constraint.0
+                        )));
+                    }
+                    if rule.trim().is_empty() {
+                        return Err(EvalError::InvalidEnvironmentAction(format!(
+                            "derived exposure has an empty rule: {}",
+                            constraint.0
+                        )));
+                    }
+                    for input in inputs {
+                        if !self.state.constraints.active.contains_key(input) {
+                            return Err(EvalError::InvalidEnvironmentAction(format!(
+                                "derived exposure references inactive input {} for {}",
+                                input.0, constraint.0
+                            )));
+                        }
+                        if !available.contains(input) {
+                            return Err(EvalError::InvalidEnvironmentAction(format!(
+                                "derived exposure references unexposed input {} for {}",
+                                input.0, constraint.0
+                            )));
+                        }
+                    }
                 }
-                VisibilityChange::Derive { constraint } => {
-                    self.state.visibility.disclosed.remove(constraint);
-                    self.state.visibility.derived.insert(constraint.clone());
-                }
-                VisibilityChange::Conceal { constraint } => {
-                    self.state.visibility.disclosed.remove(constraint);
-                    self.state.visibility.derived.remove(constraint);
+                ConstraintExposure::ProvideContext { source, .. } => {
+                    if source.trim().is_empty() {
+                        return Err(EvalError::InvalidEnvironmentAction(format!(
+                            "context-provided exposure has an empty source: {}",
+                            constraint.0
+                        )));
+                    }
                 }
             }
+
+            available.insert(constraint.clone());
+            records.push(ExposureRecord {
+                constraint: constraint.clone(),
+                origin: exposure.origin(),
+                observation_sequence,
+            });
         }
-        Ok(())
+
+        Ok(records)
     }
 
     fn visible_state(&self) -> Value {
         let mut visible = serde_json::Map::new();
-        for id in self
-            .state
-            .visibility
-            .disclosed
-            .iter()
-            .chain(self.state.visibility.derived.iter())
-        {
+        for id in self.state.exposures.records.keys() {
             if let Some(value) = self.state.constraints.active.get(id) {
                 visible.insert(id.0.clone(), value.clone());
             }
@@ -460,7 +525,15 @@ impl GraphEnvironment {
                 "observation text is empty".to_string(),
             ));
         }
-        self.apply_visibility_changes(&content.visibility)?;
+        let observation_sequence = self.state.step.saturating_add(1);
+        let exposure_records =
+            self.prepare_exposure_records(&content.exposures, observation_sequence)?;
+        for record in &exposure_records {
+            self.state
+                .exposures
+                .records
+                .insert(record.constraint.clone(), record.clone());
+        }
         let observation = EnvironmentObservation {
             user_text: content.user_text,
             visible_state: self.visible_state(),
@@ -468,13 +541,14 @@ impl GraphEnvironment {
         };
         self.record(EnvironmentEventKind::ObservationEmitted {
             observation: observation.clone(),
+            exposures: exposure_records,
         });
         Ok(observation)
     }
 }
 
 impl EvalEnvironment for GraphEnvironment {
-    fn reset<'a>(&'a mut self) -> EnvironmentFuture<'a, EnvironmentOutput> {
+    fn reset(&mut self) -> EnvironmentFuture<'_, EnvironmentOutput> {
         Box::pin(async move {
             if self.state.status != EnvironmentStatus::NotStarted {
                 return Err(EvalError::InvalidEnvironmentAction(
@@ -502,7 +576,7 @@ impl EvalEnvironment for GraphEnvironment {
         })
     }
 
-    fn step<'a>(&'a mut self, action: AgentAction) -> EnvironmentFuture<'a, EnvironmentOutput> {
+    fn step(&mut self, action: AgentAction) -> EnvironmentFuture<'_, EnvironmentOutput> {
         Box::pin(async move {
             if self.state.status != EnvironmentStatus::Running {
                 return Err(EvalError::InvalidEnvironmentAction(
@@ -563,16 +637,13 @@ mod tests {
     struct CompleteController;
 
     impl EnvironmentController for CompleteController {
-        fn decide<'a>(
-            &'a self,
+        fn decide(
+            &self,
             _input: EnvironmentControllerInput,
-        ) -> EnvironmentFuture<'a, EnvironmentDecision> {
+        ) -> EnvironmentFuture<'_, EnvironmentDecision> {
             Box::pin(async {
                 Ok(EnvironmentDecision::Transition {
                     transition: TransitionId::from("finish"),
-                    visibility: vec![VisibilityChange::Disclose {
-                        constraint: ConstraintId::from("hidden"),
-                    }],
                     evidence: Vec::new(),
                     reason: "completed".to_string(),
                 })
@@ -583,17 +654,33 @@ mod tests {
     struct StaticRealizer;
 
     impl ObservationRealizer for StaticRealizer {
-        fn realize<'a>(
-            &'a self,
+        fn realize(
+            &self,
             input: ObservationRealizerInput,
-        ) -> EnvironmentFuture<'a, ObservationContent> {
+        ) -> EnvironmentFuture<'_, ObservationContent> {
             Box::pin(async move {
                 Ok(ObservationContent {
-                    user_text: match input.cause {
+                    user_text: match &input.cause {
                         ObservationCause::Reset => "start".to_string(),
                         _ => "continue".to_string(),
                     },
-                    visibility: Vec::new(),
+                    exposures: match &input.cause {
+                        ObservationCause::Reset => vec![
+                            ConstraintExposure::Disclose {
+                                constraint: ConstraintId::from("premise"),
+                            },
+                            ConstraintExposure::Derive {
+                                constraint: ConstraintId::from("computed"),
+                                inputs: vec![ConstraintId::from("premise")],
+                                rule: "copy premise".to_string(),
+                            },
+                            ConstraintExposure::ProvideContext {
+                                constraint: ConstraintId::from("context"),
+                                source: "evaluation fixture".to_string(),
+                            },
+                        ],
+                        _ => Vec::new(),
+                    },
                     metadata: Value::Null,
                 })
             })
@@ -611,17 +698,29 @@ mod tests {
                     constraints: vec![
                         ConstraintDelta {
                             operation: ConstraintOperation::Add {
-                                id: ConstraintId::from("hidden"),
-                                value: json!("secret"),
-                                activation: ActivationPolicy::ExplicitDisclosure,
+                                id: ConstraintId::from("premise"),
+                                value: json!("known premise"),
                             },
                             provenance: None,
                         },
                         ConstraintDelta {
                             operation: ConstraintOperation::Add {
-                                id: ConstraintId::from("authorized"),
+                                id: ConstraintId::from("computed"),
+                                value: json!("derived value"),
+                            },
+                            provenance: None,
+                        },
+                        ConstraintDelta {
+                            operation: ConstraintOperation::Add {
+                                id: ConstraintId::from("context"),
                                 value: json!(true),
-                                activation: ActivationPolicy::AlreadyAuthorized,
+                            },
+                            provenance: None,
+                        },
+                        ConstraintDelta {
+                            operation: ConstraintOperation::Add {
+                                id: ConstraintId::from("unexposed"),
+                                value: json!("hidden"),
                             },
                             provenance: None,
                         },
@@ -650,7 +749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_filters_latent_state_and_applies_transition() {
+    async fn observation_atomically_records_exposures_and_filters_unexposed_state() {
         let mut environment = GraphEnvironment::new(graph(), CompleteController, StaticRealizer)
             .expect("environment");
 
@@ -658,7 +757,32 @@ mod tests {
         assert_eq!(initial.status, EnvironmentStatus::Running);
         assert_eq!(
             initial.observation.expect("observation").visible_state,
-            json!({"authorized": true})
+            json!({
+                "context": true,
+                "computed": "derived value",
+                "premise": "known premise"
+            })
+        );
+
+        let observation_event = environment
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EnvironmentEventKind::ObservationEmitted { exposures, .. } => Some(exposures),
+                _ => None,
+            })
+            .expect("observation event");
+        assert_eq!(observation_event.len(), 3);
+        assert!(
+            observation_event
+                .iter()
+                .all(|record| record.observation_sequence == 2)
+        );
+        assert!(
+            !environment
+                .state()
+                .exposures
+                .contains(&ConstraintId::from("unexposed"))
         );
 
         let output = environment
@@ -674,13 +798,171 @@ mod tests {
         assert!(
             environment
                 .state()
-                .visibility
-                .disclosed
-                .contains(&ConstraintId::from("hidden"))
+                .exposures
+                .contains(&ConstraintId::from("premise"))
         );
         assert!(matches!(
             environment.state().termination,
             Some(TerminationReason::TerminalNode { .. })
         ));
+    }
+
+    struct InvalidRealizer;
+
+    impl ObservationRealizer for InvalidRealizer {
+        fn realize(
+            &self,
+            _input: ObservationRealizerInput,
+        ) -> EnvironmentFuture<'_, ObservationContent> {
+            Box::pin(async {
+                Ok(ObservationContent {
+                    user_text: "invalid duplicate exposure".to_string(),
+                    exposures: vec![
+                        ConstraintExposure::Disclose {
+                            constraint: ConstraintId::from("premise"),
+                        },
+                        ConstraintExposure::ProvideContext {
+                            constraint: ConstraintId::from("premise"),
+                            source: "duplicate".to_string(),
+                        },
+                    ],
+                    metadata: Value::Null,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_exposure_does_not_partially_update_the_ledger() {
+        let mut environment = GraphEnvironment::new(graph(), CompleteController, InvalidRealizer)
+            .expect("environment");
+
+        let error = environment.reset().await.expect_err("duplicate exposure");
+        assert!(error.to_string().contains("already exposed"));
+        assert!(environment.state().exposures.records.is_empty());
+        assert!(
+            !environment
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, EnvironmentEventKind::ObservationEmitted { .. }))
+        );
+    }
+
+    struct RevisionController;
+
+    impl EnvironmentController for RevisionController {
+        fn decide(
+            &self,
+            _input: EnvironmentControllerInput,
+        ) -> EnvironmentFuture<'_, EnvironmentDecision> {
+            Box::pin(async {
+                Ok(EnvironmentDecision::Transition {
+                    transition: TransitionId::from("revise"),
+                    evidence: Vec::new(),
+                    reason: "requirement changed".to_string(),
+                })
+            })
+        }
+    }
+
+    struct RevisionRealizer;
+
+    impl ObservationRealizer for RevisionRealizer {
+        fn realize(
+            &self,
+            input: ObservationRealizerInput,
+        ) -> EnvironmentFuture<'_, ObservationContent> {
+            Box::pin(async move {
+                Ok(ObservationContent {
+                    user_text: "requirement".to_string(),
+                    exposures: match input.cause {
+                        ObservationCause::Reset => vec![ConstraintExposure::Disclose {
+                            constraint: ConstraintId::from("old"),
+                        }],
+                        _ => Vec::new(),
+                    },
+                    metadata: Value::Null,
+                })
+            })
+        }
+    }
+
+    fn revision_graph() -> TaskGraph {
+        TaskCase {
+            id: "revision".to_string(),
+            version: "1".to_string(),
+            start: NodeId::from("start"),
+            nodes: vec![
+                TaskNode {
+                    id: NodeId::from("start"),
+                    constraints: vec![ConstraintDelta {
+                        operation: ConstraintOperation::Add {
+                            id: ConstraintId::from("old"),
+                            value: json!("old value"),
+                        },
+                        provenance: None,
+                    }],
+                    result_obligation: None,
+                    evidence_obligation: None,
+                    terminal: false,
+                },
+                TaskNode {
+                    id: NodeId::from("revised"),
+                    constraints: vec![ConstraintDelta {
+                        operation: ConstraintOperation::Replace {
+                            target: ConstraintId::from("old"),
+                            id: ConstraintId::from("new"),
+                            value: json!("new value"),
+                        },
+                        provenance: None,
+                    }],
+                    result_obligation: None,
+                    evidence_obligation: None,
+                    terminal: false,
+                },
+            ],
+            transitions: vec![TaskTransition {
+                id: TransitionId::from("revise"),
+                from: NodeId::from("start"),
+                to: NodeId::from("revised"),
+                kind: TransitionKind::Revision,
+            }],
+        }
+        .compile()
+        .expect("revision graph")
+    }
+
+    #[tokio::test]
+    async fn replacement_does_not_inherit_exposure() {
+        let mut environment =
+            GraphEnvironment::new(revision_graph(), RevisionController, RevisionRealizer)
+                .expect("environment");
+        environment.reset().await.expect("reset");
+
+        let output = environment
+            .step(AgentAction {
+                status: AgentActionStatus::Completed,
+                assistant_text: "done".to_string(),
+                events: Vec::new(),
+            })
+            .await
+            .expect("revision");
+
+        assert_eq!(
+            output.observation.expect("observation").visible_state,
+            json!({})
+        );
+        assert!(
+            environment
+                .state()
+                .exposures
+                .contains(&ConstraintId::from("old"))
+        );
+        assert!(
+            !environment
+                .state()
+                .exposures
+                .contains(&ConstraintId::from("new"))
+        );
     }
 }

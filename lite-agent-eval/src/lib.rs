@@ -13,18 +13,18 @@ mod roles;
 mod runner;
 
 pub use environment::{
-    ConstraintApplication, ConstraintLedger, EnvironmentController, EnvironmentControllerInput,
-    EnvironmentDecision, EnvironmentEvent, EnvironmentEventKind, EnvironmentFuture,
-    EnvironmentObservation, EnvironmentOutput, EnvironmentSnapshot, EnvironmentState,
-    EnvironmentStatus, EvalEnvironment, EvidenceRef, GraphEnvironment, ObservationCause,
-    ObservationContent, ObservationRealizer, ObservationRealizerInput, TerminationReason,
-    VisibilityChange, VisibilityState,
+    ConstraintApplication, ConstraintExposure, ConstraintLedger, EnvironmentController,
+    EnvironmentControllerInput, EnvironmentDecision, EnvironmentEvent, EnvironmentEventKind,
+    EnvironmentFuture, EnvironmentObservation, EnvironmentOutput, EnvironmentSnapshot,
+    EnvironmentState, EnvironmentStatus, EvalEnvironment, EvidenceRef, ExposureLedger,
+    ExposureOrigin, ExposureRecord, GraphEnvironment, ObservationCause, ObservationContent,
+    ObservationRealizer, ObservationRealizerInput, TerminationReason,
 };
 pub use error::{EvalError, Result};
 pub use eval_command_tool::{EnvironmentDecisionSink, EnvironmentDecisionTool};
 pub use program::{
-    ActivationPolicy, ConstraintDelta, ConstraintId, ConstraintOperation, NodeId, Obligation,
-    TaskCase, TaskGraph, TaskNode, TaskTransition, TransitionId, TransitionKind,
+    ConstraintDelta, ConstraintId, ConstraintOperation, NodeId, Obligation, TaskCase, TaskGraph,
+    TaskNode, TaskTransition, TransitionId, TransitionKind,
 };
 pub use roles::{
     ActionFuture, AgentAction, AgentActionEvent, AgentActionStatus, EvalMetric, EvalReport,

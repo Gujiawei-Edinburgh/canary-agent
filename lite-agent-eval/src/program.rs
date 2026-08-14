@@ -33,24 +33,12 @@ impl From<&str> for NodeId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActivationPolicy {
-    /// The requirement must be introduced by an explicit user action.
-    ExplicitDisclosure,
-    /// Existing conversation facts may authorize the requirement.
-    AlreadyAuthorized,
-    /// The domain may derive the requirement from existing facts.
-    Derivable,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConstraintOperation {
     Add {
         id: ConstraintId,
         value: Value,
-        activation: ActivationPolicy,
     },
     Replace {
         target: ConstraintId,
