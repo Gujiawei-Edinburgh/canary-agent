@@ -421,7 +421,7 @@ impl LlmReferee {
 }
 
 impl Referee for LlmReferee {
-    fn evaluate<'a>(&'a self, input: RefereeInput) -> EvalReportFuture<'a, EvalReport> {
+    fn evaluate(&self, input: RefereeInput) -> EvalReportFuture<'_, EvalReport> {
         Box::pin(async move {
             let prompt = format!(
                 "Assess this completed evaluation. Explain whether the tested policy identified the latest release, honored the official-source revision, compared the previous release accurately, and produced the requested final synthesis. Note any unnecessary retries or unsupported claims. Do not emit JSON; your assessment will be attached to deterministic metrics.\n\n{}",
