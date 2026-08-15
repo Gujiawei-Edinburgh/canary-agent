@@ -1,0 +1,202 @@
+use crate::diff::AgentDiff;
+use crate::error::{Result, RevisionError};
+use crate::ids::{validate_component, AgentId, SpecDigest};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentRef {
+    pub kind: String,
+    pub name: String,
+    pub version: String,
+    pub configuration: Value,
+}
+
+impl ComponentRef {
+    pub fn new(
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        version: impl Into<String>,
+        configuration: Value,
+    ) -> Result<Self> {
+        let component = Self {
+            kind: kind.into(),
+            name: name.into(),
+            version: version.into(),
+            configuration,
+        };
+        component.validate()?;
+        Ok(component)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_component("component kind", &self.kind)
+            .map_err(|error| RevisionError::InvalidSpec(error.to_string()))?;
+        validate_component("component name", &self.name)
+            .map_err(|error| RevisionError::InvalidSpec(error.to_string()))?;
+        if self.version.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec(format!(
+                "component {} has an empty version",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSpec {
+    pub provider: String,
+    pub model: String,
+    pub settings: Value,
+}
+
+impl ModelSpec {
+    fn validate(&self) -> Result<()> {
+        if self.provider.trim().is_empty() || self.model.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec(
+                "model provider and model are required".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptSpec {
+    pub system: String,
+    pub templates: BTreeMap<String, String>,
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl PromptSpec {
+    fn validate(&self) -> Result<()> {
+        for name in self.templates.keys().chain(self.extensions.keys()) {
+            if name.trim().is_empty() {
+                return Err(RevisionError::InvalidSpec(
+                    "prompt extension name is empty".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolInterfaceSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ToolInterfaceSpec {
+    fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec("tool name is empty".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub interface: ToolInterfaceSpec,
+    pub implementation: ComponentRef,
+    pub output: Option<ComponentRef>,
+    pub execution: Option<ComponentRef>,
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl ToolSpec {
+    fn validate(&self, expected_name: &str) -> Result<()> {
+        self.interface.validate()?;
+        if self.interface.name != expected_name {
+            return Err(RevisionError::InvalidSpec(format!(
+                "tool map key {expected_name} does not match interface name {}",
+                self.interface.name
+            )));
+        }
+        self.implementation.validate()?;
+        if let Some(output) = &self.output {
+            output.validate()?;
+        }
+        if let Some(execution) = &self.execution {
+            execution.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePolicySpec {
+    pub context_builder: Option<ComponentRef>,
+    pub function_selector: Option<ComponentRef>,
+    pub execution: Option<ComponentRef>,
+    pub hooks: Vec<ComponentRef>,
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl RuntimePolicySpec {
+    fn validate(&self) -> Result<()> {
+        for component in [
+            self.context_builder.as_ref(),
+            self.function_selector.as_ref(),
+            self.execution.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            component.validate()?;
+        }
+        for hook in &self.hooks {
+            hook.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSpec {
+    pub agent_id: AgentId,
+    pub model: ModelSpec,
+    pub prompts: PromptSpec,
+    pub tools: BTreeMap<String, ToolSpec>,
+    pub runtime: RuntimePolicySpec,
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl AgentSpec {
+    pub fn validate(&self) -> Result<()> {
+        validate_component("agent id", &self.agent_id.0)
+            .map_err(|error| RevisionError::InvalidSpec(error.to_string()))?;
+        self.model.validate()?;
+        self.prompts.validate()?;
+        for (name, tool) in &self.tools {
+            tool.validate(name)?;
+        }
+        self.runtime.validate()?;
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<SpecDigest> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| RevisionError::Serialization(error.to_string()))?;
+        let digest = Sha256::digest(bytes);
+        Ok(SpecDigest(format!(
+            "sha256:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )))
+    }
+
+    pub fn diff(&self, other: &Self) -> Result<AgentDiff> {
+        self.validate()?;
+        other.validate()?;
+        AgentDiff::between(self, other)
+    }
+}
