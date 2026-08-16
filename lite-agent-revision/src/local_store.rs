@@ -1,12 +1,12 @@
-use crate::error::{canonical_json, Result, RevisionError};
+use crate::error::{canonical_json, RevisionError};
 use crate::ids::{BranchRef, RevisionId};
 use crate::revision::AgentRevision;
-use crate::store::RevisionStore;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use crate::store::{RevisionFuture, RevisionStore};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 /// A small JSON filesystem store for local development and embedding.
 ///
@@ -19,11 +19,13 @@ pub struct LocalRevisionStore {
 }
 
 impl LocalRevisionStore {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+    pub async fn open(root: impl Into<PathBuf>) -> crate::Result<Self> {
         let root = root.into();
         fs::create_dir_all(root.join("objects"))
+            .await
             .map_err(|error| RevisionError::Store(error.to_string()))?;
         fs::create_dir_all(root.join("refs").join("heads"))
+            .await
             .map_err(|error| RevisionError::Store(error.to_string()))?;
         Ok(Self {
             root,
@@ -46,16 +48,13 @@ impl LocalRevisionStore {
             .join(&branch.name.0)
     }
 
-    fn read_branch_unlocked(&self, branch: &BranchRef) -> Result<Option<RevisionId>> {
+    async fn read_branch_unlocked(&self, branch: &BranchRef) -> crate::Result<Option<RevisionId>> {
         let path = self.branch_path(branch);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let mut raw = String::new();
-        File::open(path)
-            .map_err(|error| RevisionError::Store(error.to_string()))?
-            .read_to_string(&mut raw)
-            .map_err(|error| RevisionError::Store(error.to_string()))?;
+        let raw = match fs::read_to_string(path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RevisionError::Store(error.to_string())),
+        };
         let value = raw.trim();
         if value.is_empty() {
             return Err(RevisionError::Store(format!(
@@ -66,11 +65,13 @@ impl LocalRevisionStore {
         Ok(Some(RevisionId(value.to_string())))
     }
 
-    fn atomic_write(&self, path: &Path, contents: &[u8]) -> Result<()> {
+    async fn atomic_write(&self, path: &Path, contents: &[u8]) -> crate::Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| RevisionError::Store("path has no parent".to_string()))?;
-        fs::create_dir_all(parent).map_err(|error| RevisionError::Store(error.to_string()))?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|error| RevisionError::Store(error.to_string()))?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| RevisionError::Store(error.to_string()))?
@@ -80,74 +81,83 @@ impl LocalRevisionStore {
             .create_new(true)
             .write(true)
             .open(&temporary)
+            .await
             .map_err(|error| RevisionError::Store(error.to_string()))?;
         file.write_all(contents)
-            .and_then(|_| file.sync_all())
+            .await
             .map_err(|error| RevisionError::Store(error.to_string()))?;
-        fs::rename(temporary, path).map_err(|error| RevisionError::Store(error.to_string()))
+        file.sync_all()
+            .await
+            .map_err(|error| RevisionError::Store(error.to_string()))?;
+        fs::rename(temporary, path)
+            .await
+            .map_err(|error| RevisionError::Store(error.to_string()))
     }
 }
 
 impl RevisionStore for LocalRevisionStore {
-    fn load_revision(&self, id: &RevisionId) -> Result<Option<AgentRevision>> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| RevisionError::Store("store lock poisoned".to_string()))?;
-        let path = self.object_path(id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents = fs::read(path).map_err(|error| RevisionError::Store(error.to_string()))?;
-        serde_json::from_slice(&contents)
-            .map(Some)
-            .map_err(|error| RevisionError::Serialization(error.to_string()))
+    fn load_revision<'a>(
+        &'a self,
+        id: &'a RevisionId,
+    ) -> RevisionFuture<'a, Option<AgentRevision>> {
+        Box::pin(async move {
+            let _guard = self.lock.lock().await;
+            let contents = match fs::read(self.object_path(id)).await {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(RevisionError::Store(error.to_string())),
+            };
+            serde_json::from_slice(&contents)
+                .map(Some)
+                .map_err(|error| RevisionError::Serialization(error.to_string()))
+        })
     }
 
-    fn save_revision(&self, revision: &AgentRevision) -> Result<()> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| RevisionError::Store("store lock poisoned".to_string()))?;
-        let bytes = canonical_json(revision)?;
-        let path = self.object_path(&revision.revision_id);
-        if path.exists() {
-            let existing =
-                fs::read(&path).map_err(|error| RevisionError::Store(error.to_string()))?;
-            if existing != bytes {
-                return Err(RevisionError::Store(format!(
-                    "revision object {} already contains different data",
-                    revision.revision_id.0
-                )));
+    fn save_revision<'a>(&'a self, revision: &'a AgentRevision) -> RevisionFuture<'a, ()> {
+        Box::pin(async move {
+            let _guard = self.lock.lock().await;
+            let bytes = canonical_json(revision)?;
+            let path = self.object_path(&revision.revision_id);
+            match fs::read(&path).await {
+                Ok(existing) => {
+                    if existing != bytes {
+                        return Err(RevisionError::Store(format!(
+                            "revision object {} already contains different data",
+                            revision.revision_id.0
+                        )));
+                    }
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.atomic_write(&path, &bytes).await
+                }
+                Err(error) => Err(RevisionError::Store(error.to_string())),
             }
-            return Ok(());
-        }
-        self.atomic_write(&path, &bytes)
+        })
     }
 
-    fn branch_head(&self, branch: &BranchRef) -> Result<Option<RevisionId>> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| RevisionError::Store("store lock poisoned".to_string()))?;
-        self.read_branch_unlocked(branch)
+    fn branch_head<'a>(&'a self, branch: &'a BranchRef) -> RevisionFuture<'a, Option<RevisionId>> {
+        Box::pin(async move {
+            let _guard = self.lock.lock().await;
+            self.read_branch_unlocked(branch).await
+        })
     }
 
-    fn compare_and_set_branch(
-        &self,
-        branch: &BranchRef,
-        expected: Option<&RevisionId>,
-        next: &RevisionId,
-    ) -> Result<bool> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| RevisionError::Store("store lock poisoned".to_string()))?;
-        let actual = self.read_branch_unlocked(branch)?;
-        if actual.as_ref() != expected {
-            return Ok(false);
-        }
-        self.atomic_write(&self.branch_path(branch), next.0.as_bytes())?;
-        Ok(true)
+    fn compare_and_set_branch<'a>(
+        &'a self,
+        branch: &'a BranchRef,
+        expected: Option<&'a RevisionId>,
+        next: &'a RevisionId,
+    ) -> RevisionFuture<'a, bool> {
+        Box::pin(async move {
+            let _guard = self.lock.lock().await;
+            let actual = self.read_branch_unlocked(branch).await?;
+            if actual.as_ref() != expected {
+                return Ok(false);
+            }
+            self.atomic_write(&self.branch_path(branch), next.0.as_bytes())
+                .await?;
+            Ok(true)
+        })
     }
 }

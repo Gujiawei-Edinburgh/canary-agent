@@ -23,4 +23,4 @@ pub use revision::{AgentRevision, CommitMessage, RevisionMetadata};
 pub use spec::{
     AgentSpec, ComponentRef, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec, ToolSpec,
 };
-pub use store::RevisionStore;
+pub use store::{RevisionFuture, RevisionStore};

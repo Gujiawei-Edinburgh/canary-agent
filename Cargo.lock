@@ -877,6 +877,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "lite-agent-revision-example"
+version = "0.1.0"
+dependencies = [
+ "lite-agent-revision",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

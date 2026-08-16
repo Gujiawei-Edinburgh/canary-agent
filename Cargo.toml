@@ -10,5 +10,6 @@ members = [
     "lite-agent-revision",
     "examples/repl",
     "examples/eval",
+    "examples/revision",
 ]
 resolver = "2"

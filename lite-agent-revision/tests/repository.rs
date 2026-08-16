@@ -63,10 +63,10 @@ fn repository_path() -> PathBuf {
     ))
 }
 
-#[test]
-fn commit_branch_checkout_and_lineage_are_persistent() {
+#[tokio::test]
+async fn commit_branch_checkout_and_lineage_are_persistent() {
     let path = repository_path();
-    let store = LocalRevisionStore::open(&path).expect("store");
+    let store = LocalRevisionStore::open(&path).await.expect("store");
     let controller = RevisionController::new(store);
     let main = BranchRef::new(AgentId::from("research-agent"), BranchName::from("main"));
 
@@ -76,6 +76,7 @@ fn commit_branch_checkout_and_lineage_are_persistent() {
             spec(),
             CommitMessage::new("create research agent").expect("message"),
         )
+        .await
         .expect("first commit");
     assert!(first.parents.is_empty());
 
@@ -85,6 +86,7 @@ fn commit_branch_checkout_and_lineage_are_persistent() {
     );
     let branch_head = controller
         .create_branch(&main, feature.clone())
+        .await
         .expect("branch");
     assert_eq!(branch_head, first.revision_id);
 
@@ -101,21 +103,30 @@ fn commit_branch_checkout_and_lineage_are_persistent() {
             next_spec,
             CommitMessage::new("upgrade search implementation").expect("message"),
         )
+        .await
         .expect("second commit");
     assert_eq!(second.parents, vec![first.revision_id.clone()]);
     assert_eq!(
-        controller.checkout(&feature).expect("checkout").revision,
+        controller
+            .checkout(&feature)
+            .await
+            .expect("checkout")
+            .revision,
         second
     );
     assert_eq!(
-        controller.parents(&second.revision_id).expect("parents")[0],
+        controller
+            .parents(&second.revision_id)
+            .await
+            .expect("parents")[0],
         first
     );
 
-    let reopened = RevisionController::new(LocalRevisionStore::open(&path).expect("reopen"));
+    let reopened = RevisionController::new(LocalRevisionStore::open(&path).await.expect("reopen"));
     assert_eq!(
         reopened
             .checkout(&feature)
+            .await
             .expect("reopen checkout")
             .revision,
         second
@@ -123,10 +134,10 @@ fn commit_branch_checkout_and_lineage_are_persistent() {
     fs::remove_dir_all(path).expect("cleanup");
 }
 
-#[test]
-fn commit_rejects_a_branch_for_another_agent() {
+#[tokio::test]
+async fn commit_rejects_a_branch_for_another_agent() {
     let path = repository_path();
-    let controller = RevisionController::new(LocalRevisionStore::open(&path).expect("store"));
+    let controller = RevisionController::new(LocalRevisionStore::open(&path).await.expect("store"));
     let branch = BranchRef::new(AgentId::from("other-agent"), BranchName::from("main"));
     let error = controller
         .commit(
@@ -134,13 +145,14 @@ fn commit_rejects_a_branch_for_another_agent() {
             spec(),
             CommitMessage::new("invalid ownership").expect("message"),
         )
+        .await
         .expect_err("ownership error");
     assert!(matches!(error, RevisionError::InvalidSpec(_)));
     fs::remove_dir_all(path).expect("cleanup");
 }
 
-#[test]
-fn structural_diff_identifies_tool_subcomponents() {
+#[tokio::test]
+async fn structural_diff_identifies_tool_subcomponents() {
     let before = AgentRevision::commit(
         spec(),
         Vec::new(),
@@ -176,10 +188,10 @@ fn structural_diff_identifies_tool_subcomponents() {
     }));
 }
 
-#[test]
-fn merge_combines_independent_static_changes_and_records_two_parents() {
+#[tokio::test]
+async fn merge_combines_independent_static_changes_and_records_two_parents() {
     let path = repository_path();
-    let controller = RevisionController::new(LocalRevisionStore::open(&path).expect("store"));
+    let controller = RevisionController::new(LocalRevisionStore::open(&path).await.expect("store"));
     let main = BranchRef::new(AgentId::from("research-agent"), BranchName::from("main"));
     let c0 = BranchRef::new(AgentId::from("research-agent"), BranchName::from("c0"));
     let c1 = BranchRef::new(AgentId::from("research-agent"), BranchName::from("c1"));
@@ -190,12 +202,15 @@ fn merge_combines_independent_static_changes_and_records_two_parents() {
             spec(),
             CommitMessage::new("create base agent").expect("message"),
         )
+        .await
         .expect("base");
     controller
         .create_branch(&main, c0.clone())
+        .await
         .expect("c0 branch");
     controller
         .create_branch(&main, c1.clone())
+        .await
         .expect("c1 branch");
 
     let mut c0_spec = spec();
@@ -206,6 +221,7 @@ fn merge_combines_independent_static_changes_and_records_two_parents() {
             c0_spec,
             CommitMessage::new("optimize c0 prompt").expect("message"),
         )
+        .await
         .expect("c0 commit");
 
     let mut c1_spec = spec();
@@ -221,9 +237,13 @@ fn merge_combines_independent_static_changes_and_records_two_parents() {
             c1_spec,
             CommitMessage::new("upgrade search for c1").expect("message"),
         )
+        .await
         .expect("c1 commit");
 
-    let prepared = controller.prepare_merge(&c1, &c0).expect("prepare merge");
+    let prepared = controller
+        .prepare_merge(&c1, &c0)
+        .await
+        .expect("prepare merge");
     assert!(prepared.is_clean());
     let merged = controller
         .merge(
@@ -231,6 +251,7 @@ fn merge_combines_independent_static_changes_and_records_two_parents() {
             &c0,
             CommitMessage::new("merge c1 search improvements into c0").expect("message"),
         )
+        .await
         .expect("merge");
     assert_eq!(
         merged.parents,
@@ -242,10 +263,10 @@ fn merge_combines_independent_static_changes_and_records_two_parents() {
     fs::remove_dir_all(path).expect("cleanup");
 }
 
-#[test]
-fn merge_reports_conflicting_static_changes_without_advancing_branch() {
+#[tokio::test]
+async fn merge_reports_conflicting_static_changes_without_advancing_branch() {
     let path = repository_path();
-    let controller = RevisionController::new(LocalRevisionStore::open(&path).expect("store"));
+    let controller = RevisionController::new(LocalRevisionStore::open(&path).await.expect("store"));
     let main = BranchRef::new(AgentId::from("research-agent"), BranchName::from("main"));
     let left = BranchRef::new(AgentId::from("research-agent"), BranchName::from("left"));
     let right = BranchRef::new(AgentId::from("research-agent"), BranchName::from("right"));
@@ -255,12 +276,15 @@ fn merge_reports_conflicting_static_changes_without_advancing_branch() {
             spec(),
             CommitMessage::new("create base agent").expect("message"),
         )
+        .await
         .expect("base");
     controller
         .create_branch(&main, left.clone())
+        .await
         .expect("left branch");
     controller
         .create_branch(&main, right.clone())
+        .await
         .expect("right branch");
 
     let mut left_spec = spec();
@@ -271,6 +295,7 @@ fn merge_reports_conflicting_static_changes_without_advancing_branch() {
             left_spec,
             CommitMessage::new("change prompt left").expect("message"),
         )
+        .await
         .expect("left commit");
 
     let mut right_spec = spec();
@@ -281,10 +306,12 @@ fn merge_reports_conflicting_static_changes_without_advancing_branch() {
             right_spec,
             CommitMessage::new("change prompt right").expect("message"),
         )
+        .await
         .expect("right commit");
 
     let result = controller
         .prepare_merge(&right, &left)
+        .await
         .expect("prepare merge");
     assert!(!result.is_clean());
     assert!(result
@@ -297,11 +324,13 @@ fn merge_reports_conflicting_static_changes_without_advancing_branch() {
             &left,
             CommitMessage::new("merge conflicting prompts").expect("message"),
         )
+        .await
         .expect_err("conflict");
     assert!(matches!(error, RevisionError::MergeConflicts(_)));
     assert_eq!(
         controller
             .checkout(&left)
+            .await
             .expect("checkout")
             .revision
             .message

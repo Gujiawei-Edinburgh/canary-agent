@@ -1,0 +1,9 @@
+[package]
+name = "lite-agent-revision-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lite-agent-revision = { path = "../../lite-agent-revision" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

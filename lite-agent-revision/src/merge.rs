@@ -3,7 +3,7 @@ use crate::ids::RevisionId;
 use crate::spec::AgentSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MergeResult {
@@ -86,27 +86,6 @@ pub(crate) fn choose_merge_base(
         })
         .min_by(|left, right| left.cmp(right))
         .map(|(_, id)| id)
-}
-
-pub(crate) fn collect_ancestors<F>(
-    start: &RevisionId,
-    mut parents: F,
-) -> Result<BTreeMap<RevisionId, usize>>
-where
-    F: FnMut(&RevisionId) -> Result<Vec<RevisionId>>,
-{
-    let mut distances = BTreeMap::new();
-    let mut queue = VecDeque::from([(start.clone(), 0usize)]);
-    while let Some((id, distance)) = queue.pop_front() {
-        if distances.contains_key(&id) {
-            continue;
-        }
-        distances.insert(id.clone(), distance);
-        for parent in parents(&id)? {
-            queue.push_back((parent, distance.saturating_add(1)));
-        }
-    }
-    Ok(distances)
 }
 
 fn merge_value(
