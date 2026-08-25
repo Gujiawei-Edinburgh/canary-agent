@@ -89,6 +89,145 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "canary-agent-eval"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "canary-agent-eval-example"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-eval",
+ "canary-agent-openai",
+ "canary-agent-runtime",
+ "canary-agent-store-json",
+ "canary-agent-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "canary-agent-kernel"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "canary-agent-observability"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-kernel",
+ "canary-agent-runtime",
+ "prometheus",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "canary-agent-openai"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-kernel",
+ "canary-agent-runtime",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "canary-agent-repl"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-kernel",
+ "canary-agent-observability",
+ "canary-agent-openai",
+ "canary-agent-runtime",
+ "canary-agent-store-json",
+ "canary-agent-tools",
+ "rustyline",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "canary-agent-revision"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "canary-agent-revision-example"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-revision",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "canary-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-kernel",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "canary-agent-store-json"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-kernel",
+ "canary-agent-runtime",
+ "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "canary-agent-tools"
+version = "0.1.0"
+dependencies = [
+ "canary-agent-kernel",
+ "canary-agent-runtime",
+ "chrono",
+ "libc",
+ "prometheus",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,145 +930,6 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
-name = "lite-agent-eval"
-version = "0.1.0"
-dependencies = [
- "lite-agent-runtime",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "lite-agent-eval-example"
-version = "0.1.0"
-dependencies = [
- "lite-agent-eval",
- "lite-agent-openai",
- "lite-agent-runtime",
- "lite-agent-store-json",
- "lite-agent-tools",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "lite-agent-kernel"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "lite-agent-observability"
-version = "0.1.0"
-dependencies = [
- "lite-agent-kernel",
- "lite-agent-runtime",
- "prometheus",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lite-agent-openai"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "lite-agent-kernel",
- "lite-agent-runtime",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "lite-agent-repl"
-version = "0.1.0"
-dependencies = [
- "lite-agent-kernel",
- "lite-agent-observability",
- "lite-agent-openai",
- "lite-agent-runtime",
- "lite-agent-store-json",
- "lite-agent-tools",
- "rustyline",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "lite-agent-revision"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
-name = "lite-agent-revision-example"
-version = "0.1.0"
-dependencies = [
- "lite-agent-revision",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "lite-agent-runtime"
-version = "0.1.0"
-dependencies = [
- "lite-agent-kernel",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "lite-agent-store-json"
-version = "0.1.0"
-dependencies = [
- "fs2",
- "lite-agent-kernel",
- "lite-agent-runtime",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "lite-agent-tools"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "libc",
- "lite-agent-kernel",
- "lite-agent-runtime",
- "prometheus",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
-]
 
 [[package]]
 name = "litemap"

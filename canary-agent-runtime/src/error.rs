@@ -1,0 +1,92 @@
+use canary_agent_kernel::RevisionToken;
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, AgentError>;
+
+#[derive(Debug, Error)]
+pub enum AgentError {
+    #[error("thread not found: {0}")]
+    ThreadNotFound(String),
+
+    #[error("invalid thread id: {0}")]
+    InvalidThreadId(String),
+
+    #[error("thread store directory is already owned: {0}")]
+    StoreLocked(String),
+
+    #[error("invalid revision token")]
+    InvalidRevision,
+
+    #[error("session coordinator error: {0}")]
+    SessionCoordinator(String),
+
+    #[error("thread revision conflict for {thread_id}: expected {expected:?}, actual {actual:?}")]
+    RevisionConflict {
+        thread_id: String,
+        expected: RevisionToken,
+        actual: RevisionToken,
+    },
+
+    #[error("context window exceeded: estimated {estimated} tokens, limit {limit}")]
+    ContextWindowExceeded { estimated: usize, limit: usize },
+
+    #[error("context compactor exceeded its budget: estimated {estimated} tokens, limit {limit}")]
+    ContextCompactorContractViolation { estimated: usize, limit: usize },
+
+    #[error("turn not found: {0}")]
+    TurnNotFound(String),
+
+    #[error("thread has an unresolved suspended turn: {thread_id} (suspension {suspension_id})")]
+    SuspendedTurn {
+        thread_id: String,
+        suspension_id: String,
+    },
+
+    #[error("thread has no active turn: {0}")]
+    TurnNotActive(String),
+
+    #[error("thread already has an active turn: {0}")]
+    TurnAlreadyActive(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("http error: {0}")]
+    Http(String),
+
+    #[error("model error: {0}")]
+    Model(String),
+
+    #[error("function not found: {0}")]
+    FunctionNotFound(String),
+
+    #[error("function {name} exceeded its time budget of {timeout_ms} ms")]
+    FunctionTimeout { name: String, timeout_ms: u128 },
+
+    #[error("function {name} declared an invalid zero time budget")]
+    InvalidFunctionTimeout { name: String },
+
+    #[error("function {name} output exceeded its limit of {max_bytes} bytes")]
+    FunctionOutputTooLarge { name: String, max_bytes: usize },
+
+    #[error("function {name} declared an invalid zero output limit")]
+    InvalidFunctionOutputLimit { name: String },
+
+    #[error("function error in {name}: {message}")]
+    Function { name: String, message: String },
+
+    #[error("invalid function arguments for {name}: {message}")]
+    InvalidFunctionArguments { name: String, message: String },
+
+    #[error("turn exceeded max model iterations: {0}")]
+    MaxIterations(usize),
+
+    #[error("turn exceeded max function calls: {0}")]
+    MaxFunctionCalls(usize),
+
+    #[error("logging error: {0}")]
+    Logging(String),
+}

@@ -1,4 +1,4 @@
 /target/
 /.idea/
-/.lite-agent/
-/.lite-agent-eval/
+/.canary-agent/
+/.canary-agent-eval/

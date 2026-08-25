@@ -1,16 +1,16 @@
-use lite_agent_kernel::model::{ModelRequest, ModelResponse};
-use lite_agent_kernel::ChatMessage;
-use lite_agent_observability::{init_file_logging, JsonlTraceCollector};
-use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
-use lite_agent_runtime::{
+use canary_agent_kernel::model::{ModelRequest, ModelResponse};
+use canary_agent_kernel::ChatMessage;
+use canary_agent_observability::{init_file_logging, JsonlTraceCollector};
+use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
+use canary_agent_runtime::{
     builtin_registry, Agent, AgentConfig, AgentError, CompactingContextBuilder, CompactionInput,
     ContextCompactor, FunctionContext, FunctionRegistry, LocalSessionCoordinator, ModelClient,
     Result, ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent,
     TurnStreamEvent,
 };
-use lite_agent_store_json::JsonFileThreadStore;
-use lite_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
-use lite_agent_tools::{
+use canary_agent_store_json::JsonFileThreadStore;
+use canary_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
+use canary_agent_tools::{
     register_time_tools, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
 };
 use rustyline::error::ReadlineError;
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     };
     let thread_id = args
         .thread
-        .unwrap_or_else(|| lite_agent_kernel::new_id("thread"));
+        .unwrap_or_else(|| canary_agent_kernel::new_id("thread"));
     let _logging_guard = init_file_logging(&args.state_dir)
         .map_err(|error| AgentError::Logging(error.to_string()))?;
     let store = Arc::new(JsonFileThreadStore::open(&args.state_dir)?);
@@ -95,7 +95,7 @@ struct ReplExecAuthorizer;
 impl ExecAuthorizer for ReplExecAuthorizer {
     fn authorize<'a>(
         &'a self,
-        _request: &'a lite_agent_tools::ExecRequest,
+        _request: &'a canary_agent_tools::ExecRequest,
         _current_policy: &'a SandboxPolicy,
         _violation: &'a str,
         _context: &'a FunctionContext,
@@ -170,12 +170,12 @@ fn native_sandbox_backend() -> Arc<dyn SandboxBackend> {
 
 #[cfg(target_os = "macos")]
 fn native_sandbox_backend_impl() -> Arc<dyn SandboxBackend> {
-    Arc::new(lite_agent_tools::sandbox::MacOsSeatbeltBackend::new())
+    Arc::new(canary_agent_tools::sandbox::MacOsSeatbeltBackend::new())
 }
 
 #[cfg(target_os = "linux")]
 fn native_sandbox_backend_impl() -> Arc<dyn SandboxBackend> {
-    Arc::new(lite_agent_tools::sandbox::LinuxNativeBackend::new())
+    Arc::new(canary_agent_tools::sandbox::LinuxNativeBackend::new())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -197,12 +197,12 @@ fn parse_args() -> Result<Command> {
 
     let mut parsed = ReplArgs {
         thread: None,
-        state_dir: PathBuf::from(".lite-agent"),
-        model: env::var("LITE_AGENT_MODEL").unwrap_or_default(),
-        base_url: env::var("LITE_AGENT_BASE_URL")
+        state_dir: PathBuf::from(".canary-agent"),
+        model: env::var("CANARY_AGENT_MODEL").unwrap_or_default(),
+        base_url: env::var("CANARY_AGENT_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-        api_key: env::var("LITE_AGENT_API_KEY").unwrap_or_default(),
-        reasoning_effort: env::var("LITE_AGENT_REASONING_EFFORT")
+        api_key: env::var("CANARY_AGENT_API_KEY").unwrap_or_default(),
+        reasoning_effort: env::var("CANARY_AGENT_REASONING_EFFORT")
             .unwrap_or_else(|_| ModelConfig::default_reasoning_effort()),
         command_cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
@@ -227,12 +227,12 @@ fn parse_args() -> Result<Command> {
 
     if parsed.model.is_empty() {
         return Err(AgentError::Model(
-            "missing --model or LITE_AGENT_MODEL".to_string(),
+            "missing --model or CANARY_AGENT_MODEL".to_string(),
         ));
     }
     if parsed.api_key.is_empty() {
         return Err(AgentError::Model(
-            "missing --api-key or LITE_AGENT_API_KEY".to_string(),
+            "missing --api-key or CANARY_AGENT_API_KEY".to_string(),
         ));
     }
     if parsed.reasoning_effort.is_empty() {
@@ -244,7 +244,7 @@ fn parse_args() -> Result<Command> {
 
 fn help_text() -> String {
     concat!(
-        "usage: lite-agent-repl repl [--thread ID] [--state-dir PATH] ",
+        "usage: canary-agent-repl repl [--thread ID] [--state-dir PATH] ",
         "[--model NAME] [--base-url URL] [--api-key KEY] ",
         "[--reasoning-effort VALUE] [--command-cwd PATH]"
     )
@@ -418,7 +418,7 @@ fn print_process_line(state: &mut StreamRenderState, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::{print_stream_event, StreamRenderState};
-    use lite_agent_runtime::{TurnModelEvent, TurnStreamEvent};
+    use canary_agent_runtime::{TurnModelEvent, TurnStreamEvent};
 
     #[test]
     fn assistant_delta_marks_line_open_until_newline() {

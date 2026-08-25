@@ -1,4 +1,4 @@
-use lite_agent_eval::{
+use canary_agent_eval::{
     AgentActionEvent, AgentActionStatus, ConstraintDelta, ConstraintExposure, ConstraintId,
     ConstraintOperation, EnvironmentController, EnvironmentControllerInput, EnvironmentDecision,
     EnvironmentDecisionSink, EnvironmentDecisionTool, EnvironmentEventKind, EnvironmentFuture,
@@ -7,12 +7,12 @@ use lite_agent_eval::{
     ObservationRealizerInput, Referee, RefereeInput, RuntimeAgentPolicy, TaskCase, TaskNode,
     TaskTransition, TransitionId, TransitionKind,
 };
-use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
-use lite_agent_runtime::{
+use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
+use canary_agent_runtime::{
     Agent, AgentConfig, FunctionRegistry, LocalSessionCoordinator, TurnOutcome,
 };
-use lite_agent_store_json::JsonFileThreadStore;
-use lite_agent_tools::{register_web_search_tools, ExaWebSearchConfig};
+use canary_agent_store_json::JsonFileThreadStore;
+use canary_agent_tools::{register_web_search_tools, ExaWebSearchConfig};
 use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
@@ -20,17 +20,17 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::main]
-async fn main() -> lite_agent_eval::Result<()> {
+async fn main() -> canary_agent_eval::Result<()> {
     let state_dir = PathBuf::from(
-        env::var("LITE_AGENT_EVAL_STATE_DIR").unwrap_or_else(|_| ".lite-agent-eval".into()),
+        env::var("CANARY_AGENT_EVAL_STATE_DIR").unwrap_or_else(|_| ".canary-agent-eval".into()),
     );
-    let model = required_env("LITE_AGENT_MODEL")?;
-    let api_key = required_env("LITE_AGENT_API_KEY")?;
-    let base_url =
-        env::var("LITE_AGENT_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let reasoning_effort = env::var("LITE_AGENT_REASONING_EFFORT")
+    let model = required_env("CANARY_AGENT_MODEL")?;
+    let api_key = required_env("CANARY_AGENT_API_KEY")?;
+    let base_url = env::var("CANARY_AGENT_BASE_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+    let reasoning_effort = env::var("CANARY_AGENT_REASONING_EFFORT")
         .unwrap_or_else(|_| ModelConfig::default_reasoning_effort());
-    let run_id = env::var("LITE_AGENT_EVAL_RUN_ID").unwrap_or_else(|_| default_run_id());
+    let run_id = env::var("CANARY_AGENT_EVAL_RUN_ID").unwrap_or_else(|_| default_run_id());
 
     let store = Arc::new(JsonFileThreadStore::open(&state_dir)?);
     let model_client = Arc::new(ChatCompletionsClient::new(ModelConfig {
@@ -106,9 +106,9 @@ async fn main() -> lite_agent_eval::Result<()> {
     Ok(())
 }
 
-fn required_env(name: &str) -> lite_agent_eval::Result<String> {
+fn required_env(name: &str) -> canary_agent_eval::Result<String> {
     env::var(name).map_err(|_| {
-        EvalError::Agent(lite_agent_runtime::AgentError::Model(format!(
+        EvalError::Agent(canary_agent_runtime::AgentError::Model(format!(
             "missing {name}"
         )))
     })
@@ -152,11 +152,11 @@ fn example_case() -> TaskCase {
                         provenance: Some("initial request".to_string()),
                     },
                 ],
-                result_obligation: Some(lite_agent_eval::Obligation {
+                result_obligation: Some(canary_agent_eval::Obligation {
                     id: "identify_release".to_string(),
                     payload: json!({"requires": ["release version", "supporting source URL"]}),
                 }),
-                evidence_obligation: Some(lite_agent_eval::Obligation {
+                evidence_obligation: Some(canary_agent_eval::Obligation {
                     id: "current_source".to_string(),
                     payload: json!({"minimum_urls": 1}),
                 }),
@@ -181,14 +181,14 @@ fn example_case() -> TaskCase {
                         provenance: Some("user revision".to_string()),
                     },
                 ],
-                result_obligation: Some(lite_agent_eval::Obligation {
+                result_obligation: Some(canary_agent_eval::Obligation {
                     id: "verify_official_details".to_string(),
                     payload: json!({
                         "requires": ["release version", "exact release date"],
                         "allowed_domains": ["rust-lang.org"]
                     }),
                 }),
-                evidence_obligation: Some(lite_agent_eval::Obligation {
+                evidence_obligation: Some(canary_agent_eval::Obligation {
                     id: "official_release_source".to_string(),
                     payload: json!({"minimum_official_urls": 1}),
                 }),
@@ -205,7 +205,7 @@ fn example_case() -> TaskCase {
                     },
                     provenance: Some("follow-up request".to_string()),
                 }],
-                result_obligation: Some(lite_agent_eval::Obligation {
+                result_obligation: Some(canary_agent_eval::Obligation {
                     id: "compare_releases".to_string(),
                     payload: json!({
                         "requires": [
@@ -215,7 +215,7 @@ fn example_case() -> TaskCase {
                         ]
                     }),
                 }),
-                evidence_obligation: Some(lite_agent_eval::Obligation {
+                evidence_obligation: Some(canary_agent_eval::Obligation {
                     id: "official_comparison_sources".to_string(),
                     payload: json!({"allowed_domains": ["rust-lang.org"]}),
                 }),
@@ -233,14 +233,14 @@ fn example_case() -> TaskCase {
                     },
                     provenance: Some("final formatting request".to_string()),
                 }],
-                result_obligation: Some(lite_agent_eval::Obligation {
+                result_obligation: Some(canary_agent_eval::Obligation {
                     id: "synthesize_result".to_string(),
                     payload: json!({
                         "maximum_words": 180,
                         "must_reconcile_prior_answers": true
                     }),
                 }),
-                evidence_obligation: Some(lite_agent_eval::Obligation {
+                evidence_obligation: Some(canary_agent_eval::Obligation {
                     id: "final_official_sources".to_string(),
                     payload: json!({"minimum_official_urls": 2}),
                 }),
@@ -484,7 +484,7 @@ impl Referee for LlmReferee {
     }
 }
 
-fn require_completed_turn(outcome: TurnOutcome, role: &str) -> lite_agent_eval::Result<String> {
+fn require_completed_turn(outcome: TurnOutcome, role: &str) -> canary_agent_eval::Result<String> {
     match outcome {
         TurnOutcome::AssistantMessage { text } => Ok(text),
         TurnOutcome::Suspended { suspension } => Err(EvalError::Role(format!(

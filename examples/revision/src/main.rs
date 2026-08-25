@@ -1,4 +1,4 @@
-use lite_agent_revision::{
+use canary_agent_revision::{
     AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage, ComponentRef,
     ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionFuture, RevisionId,
     RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
@@ -83,7 +83,7 @@ impl RevisionStore for InMemRevisionStore {
 }
 
 #[tokio::main]
-async fn main() -> lite_agent_revision::Result<()> {
+async fn main() -> canary_agent_revision::Result<()> {
     let store = InMemRevisionStore::new();
     let controller = RevisionController::new(store);
     let main = BranchRef::new(AgentId::from("research-agent"), BranchName::from("main"));

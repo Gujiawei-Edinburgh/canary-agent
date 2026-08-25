@@ -1,8 +1,8 @@
-# Lite Agent
+# Canary Agent
 
-Lite Agent is a Rust library for building agents with tool-assisted workflows. It gives an application a durable conversation, a streaming agent loop, and clear places to add its own functions and policies.
+Canary Agent is a Rust library for building agents with tool-assisted workflows. It gives an application a durable conversation, a streaming agent loop, and clear places to add its own functions and policies.
 
-It is intentionally business-agnostic. Your application owns the domain knowledge and user experience; Lite Agent coordinates the conversation and records what happened.
+It is intentionally business-agnostic. Your application owns the domain knowledge and user experience; Canary Agent coordinates the conversation and records what happened.
 
 > This project is under active development. Public APIs may change before the first release.
 
@@ -13,7 +13,7 @@ An application sends user input to an agent. The agent reads and updates a durab
 ```mermaid
 flowchart LR
     App[Your application]
-    Agent[Lite Agent]
+    Agent[Canary Agent]
     Thread[Durable thread]
     Model[Model]
     Functions[Your functions]
@@ -47,18 +47,18 @@ For example, user input, an assistant response, a tool call, and its output are 
 The REPL is a local example of using the library with an OpenAI-compatible Chat Completions endpoint. It is not a deployment model.
 
 ```bash
-export LITE_AGENT_API_KEY="your-api-key"
+export CANARY_AGENT_API_KEY="your-api-key"
 
-cargo run -p lite-agent-repl -- repl \
+cargo run -p canary-agent-repl -- repl \
   --model your-model
 ```
 
 For another OpenAI-compatible provider, set its endpoint explicitly:
 
 ```bash
-export LITE_AGENT_API_KEY="your-api-key"
+export CANARY_AGENT_API_KEY="your-api-key"
 
-cargo run -p lite-agent-repl -- repl \
+cargo run -p canary-agent-repl -- repl \
   --base-url https://api.deepseek.com \
   --model deepseek-chat
 ```
@@ -75,10 +75,10 @@ Useful options include:
 The example also writes logs and per-thread traces to the state directory:
 
 ```text
-.lite-agent/
+.canary-agent/
   threads/<thread_id>.json
   traces/<thread_id>.jsonl
-  lite-agent.log
+  canary-agent.log
 ```
 
 ## Library Usage
@@ -86,21 +86,21 @@ The example also writes logs and per-thread traces to the state directory:
 An application can assemble the runtime from the provided adapters:
 
 ```rust,no_run
-use lite_agent_kernel::new_id;
-use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
-use lite_agent_observability::JsonlTraceCollector;
-use lite_agent_runtime::{builtin_registry, Agent, AgentConfig};
-use lite_agent_store_json::JsonFileThreadStore;
+use canary_agent_kernel::new_id;
+use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
+use canary_agent_observability::JsonlTraceCollector;
+use canary_agent_runtime::{builtin_registry, Agent, AgentConfig};
+use canary_agent_store_json::JsonFileThreadStore;
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> lite_agent_runtime::Result<()> {
-    let state_dir = ".lite-agent";
+async fn main() -> canary_agent_runtime::Result<()> {
+    let state_dir = ".canary-agent";
     let thread_id = new_id("thread");
     let store = Arc::new(JsonFileThreadStore::open(state_dir)?);
     let model = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: "https://api.openai.com/v1".to_string(),
-        api_key: std::env::var("LITE_AGENT_API_KEY").unwrap(),
+        api_key: std::env::var("CANARY_AGENT_API_KEY").unwrap(),
         model: "your-model".to_string(),
         reasoning_effort: "medium".to_string(),
     }));
@@ -140,7 +140,7 @@ The built-in functions are deliberately small and scoped to the runtime. Applica
 
 ## Trajectory Tracing
 
-Tracing is optional. The runtime exposes a provider-neutral `TraceCollector` contract, while `lite-agent-observability` provides `JsonlTraceCollector`.
+Tracing is optional. The runtime exposes a provider-neutral `TraceCollector` contract, while `canary-agent-observability` provides `JsonlTraceCollector`.
 
 The JSONL collector writes one file per thread and records the logical trajectory:
 
