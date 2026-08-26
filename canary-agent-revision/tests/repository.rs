@@ -1,7 +1,7 @@
 use canary_agent_revision::{
-    AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage, ComponentRef,
-    LocalRevisionStore, ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionMetadata,
-    RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
+    AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage, GitCommit,
+    LocalRevisionStore, ModelSpec, PromptSpec, RepositoryId, RevisionController, RevisionError,
+    RevisionMetadata, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSourceRef, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -9,20 +9,21 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn component(kind: &str, name: &str, version: &str) -> ComponentRef {
-    ComponentRef::new(kind, name, version, json!({})).expect("component")
-}
-
-fn tool(name: &str, version: &str) -> ToolSpec {
+fn tool(name: &str) -> ToolSpec {
     ToolSpec {
         interface: ToolInterfaceSpec {
             name: name.to_string(),
             description: format!("{name} tool"),
             parameters: json!({"type": "object"}),
+            output_schema: json!({"type": "object"}),
         },
-        implementation: component("tool", name, version),
-        output: None,
-        execution: None,
+        source: ToolSourceRef {
+            repository: RepositoryId::from("canary-agent-tools"),
+            commit: GitCommit::from("commit-1"),
+            package: Some("canary-agent-tools".to_string()),
+            path: Some(format!("src/{name}.rs")),
+        },
+        configuration: json!({}),
         extensions: BTreeMap::new(),
     }
 }
@@ -40,7 +41,7 @@ fn spec() -> AgentSpec {
             templates: BTreeMap::new(),
             extensions: BTreeMap::new(),
         },
-        tools: BTreeMap::from([(String::from("search"), tool("search", "1"))]),
+        tools: BTreeMap::from([(String::from("search"), tool("search"))]),
         runtime: RuntimePolicySpec {
             context_builder: None,
             function_selector: None,
@@ -91,12 +92,7 @@ async fn commit_branch_checkout_and_lineage_are_persistent() {
     assert_eq!(branch_head, first.revision_id);
 
     let mut next_spec = spec();
-    next_spec
-        .tools
-        .get_mut("search")
-        .expect("search")
-        .implementation
-        .version = "2".to_string();
+    next_spec.tools.get_mut("search").unwrap().source.commit = GitCommit::from("commit-2");
     let second = controller
         .commit(
             &feature,
@@ -225,12 +221,7 @@ async fn merge_combines_independent_static_changes_and_records_two_parents() {
         .expect("c0 commit");
 
     let mut c1_spec = spec();
-    c1_spec
-        .tools
-        .get_mut("search")
-        .expect("search")
-        .implementation
-        .version = "2".to_string();
+    c1_spec.tools.get_mut("search").unwrap().source.commit = GitCommit::from("commit-2");
     let c1_revision = controller
         .commit(
             &c1,
@@ -258,7 +249,18 @@ async fn merge_combines_independent_static_changes_and_records_two_parents() {
         vec![c0_revision.revision_id, c1_revision.revision_id]
     );
     assert_eq!(merged.spec.prompts.system, "Focus on category c0.");
-    assert_eq!(merged.spec.tools["search"].implementation.version, "2");
+    assert_eq!(
+        merged.spec.tools["search"].source.commit,
+        GitCommit::from("commit-2")
+    );
+    assert_eq!(
+        controller
+            .checkout(&c0)
+            .await
+            .expect("merged checkout")
+            .revision,
+        merged
+    );
     assert_eq!(base.parents.len(), 0);
     fs::remove_dir_all(path).expect("cleanup");
 }

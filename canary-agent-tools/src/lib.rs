@@ -48,6 +48,10 @@ impl AgentFunction for GetCurrentTime {
         }
     }
 
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
     fn limits(&self) -> FunctionLimits {
         FunctionLimits {
             time_budget: Duration::from_secs(5),

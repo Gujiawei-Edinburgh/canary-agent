@@ -2221,6 +2221,7 @@ mod tests {
                     "additionalProperties": false
                 }),
             },
+            json!({"type": "object"}),
             FunctionLimits {
                 time_budget: Duration::from_secs(1),
                 max_output_bytes: 20 * 1024 * 1024,
@@ -2242,6 +2243,7 @@ mod tests {
                     "additionalProperties": false
                 }),
             },
+            json!({"type": "object"}),
             FunctionLimits {
                 time_budget: Duration::from_secs(1),
                 max_output_bytes: 20 * 1024 * 1024,

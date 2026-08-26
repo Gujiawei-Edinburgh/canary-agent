@@ -131,6 +131,10 @@ where
         )
     }
 
+    /// Performs a clean merge and creates a new two-parent revision on `target`.
+    ///
+    /// This is the revision-control equivalent of `git merge`: a clean merge
+    /// advances the target branch, while a conflicting merge leaves it unchanged.
     pub async fn merge(
         &self,
         source: &BranchRef,

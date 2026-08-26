@@ -1,7 +1,7 @@
 use canary_agent_revision::{
-    AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage, ComponentRef,
-    ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionFuture, RevisionId,
-    RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
+    AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage, GitCommit, ModelSpec,
+    PromptSpec, RepositoryId, RevisionController, RevisionError, RevisionFuture, RevisionId,
+    RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSourceRef, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -190,11 +190,19 @@ fn search_tool() -> ToolSpec {
                 "properties": {"query": {"type": "string"}},
                 "required": ["query"]
             }),
+            output_schema: json!({
+                "type": "object",
+                "properties": {"results": {"type": "array"}},
+                "required": ["results"]
+            }),
         },
-        implementation: ComponentRef::new("tool", "search", "1", json!({"backend": "example"}))
-            .expect("search implementation"),
-        output: None,
-        execution: None,
+        source: ToolSourceRef {
+            repository: RepositoryId::from("canary-agent-tools"),
+            commit: GitCommit::from("example-commit-1"),
+            package: Some("canary-agent-tools".to_string()),
+            path: Some("src/search.rs".to_string()),
+        },
+        configuration: json!({"backend": "example"}),
         extensions: BTreeMap::new(),
     }
 }
@@ -212,16 +220,19 @@ fn comparison_tool() -> ToolSpec {
                 },
                 "required": ["left", "right"]
             }),
+            output_schema: json!({
+                "type": "object",
+                "properties": {"equal": {"type": "boolean"}},
+                "required": ["equal"]
+            }),
         },
-        implementation: ComponentRef::new(
-            "tool",
-            "compare_results",
-            "1",
-            json!({"backend": "example"}),
-        )
-        .expect("comparison implementation"),
-        output: None,
-        execution: None,
+        source: ToolSourceRef {
+            repository: RepositoryId::from("canary-agent-tools"),
+            commit: GitCommit::from("example-commit-1"),
+            package: Some("canary-agent-tools".to_string()),
+            path: Some("src/compare_results.rs".to_string()),
+        },
+        configuration: json!({"backend": "example"}),
         extensions: BTreeMap::new(),
     }
 }

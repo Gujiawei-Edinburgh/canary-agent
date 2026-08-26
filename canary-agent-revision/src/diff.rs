@@ -1,6 +1,6 @@
 use crate::ids::AgentId;
 use crate::spec::{
-    AgentSpec, ComponentRef, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec, ToolSpec,
+    AgentSpec, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec, ToolSourceRef, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,18 +54,16 @@ pub enum ToolChange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDiff {
     pub interface: Option<ValueChange<ToolInterfaceSpec>>,
-    pub implementation: Option<ValueChange<ComponentRef>>,
-    pub output: Option<ValueChange<Option<ComponentRef>>>,
-    pub execution: Option<ValueChange<Option<ComponentRef>>>,
+    pub source: Option<ValueChange<ToolSourceRef>>,
+    pub configuration: Option<ValueChange<Value>>,
     pub extensions: Option<ValueChange<BTreeMap<String, Value>>>,
 }
 
 impl ToolDiff {
     pub fn is_empty(&self) -> bool {
         self.interface.is_none()
-            && self.implementation.is_none()
-            && self.output.is_none()
-            && self.execution.is_none()
+            && self.source.is_none()
+            && self.configuration.is_none()
             && self.extensions.is_none()
     }
 }
@@ -101,9 +99,8 @@ fn diff_tools(
                 name,
                 diff: Box::new(ToolDiff {
                     interface: changed(&before.interface, &after.interface),
-                    implementation: changed(&before.implementation, &after.implementation),
-                    output: changed(&before.output, &after.output),
-                    execution: changed(&before.execution, &after.execution),
+                    source: changed(&before.source, &after.source),
+                    configuration: changed(&before.configuration, &after.configuration),
                     extensions: changed(&before.extensions, &after.extensions),
                 }),
             }),

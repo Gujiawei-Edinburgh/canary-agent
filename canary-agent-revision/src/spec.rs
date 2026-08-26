@@ -1,6 +1,6 @@
 use crate::diff::AgentDiff;
 use crate::error::{Result, RevisionError};
-use crate::ids::{validate_component, AgentId, SpecDigest};
+use crate::ids::{validate_component, AgentId, GitCommit, RepositoryId, SpecDigest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -89,6 +89,7 @@ pub struct ToolInterfaceSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    pub output_schema: Value,
 }
 
 impl ToolInterfaceSpec {
@@ -100,12 +101,54 @@ impl ToolInterfaceSpec {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSourceRef {
+    pub repository: RepositoryId,
+    pub commit: GitCommit,
+    pub package: Option<String>,
+    pub path: Option<String>,
+}
+
+impl ToolSourceRef {
+    fn validate(&self) -> Result<()> {
+        if self.repository.0.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec(
+                "tool source repository is empty".to_string(),
+            ));
+        }
+        if self.commit.0.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec(format!(
+                "tool source repository {} has an empty Git commit",
+                self.repository.0
+            )));
+        }
+        if self
+            .package
+            .as_deref()
+            .is_some_and(|package| package.trim().is_empty())
+        {
+            return Err(RevisionError::InvalidSpec(
+                "tool source package is empty".to_string(),
+            ));
+        }
+        if self
+            .path
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(RevisionError::InvalidSpec(
+                "tool source path is empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub interface: ToolInterfaceSpec,
-    pub implementation: ComponentRef,
-    pub output: Option<ComponentRef>,
-    pub execution: Option<ComponentRef>,
+    pub source: ToolSourceRef,
+    pub configuration: Value,
     pub extensions: BTreeMap<String, Value>,
 }
 
@@ -118,13 +161,7 @@ impl ToolSpec {
                 self.interface.name
             )));
         }
-        self.implementation.validate()?;
-        if let Some(output) = &self.output {
-            output.validate()?;
-        }
-        if let Some(execution) = &self.execution {
-            execution.validate()?;
-        }
+        self.source.validate()?;
         Ok(())
     }
 }

@@ -153,6 +153,17 @@ impl AgentFunction for ExaWebSearchTool {
         }
     }
 
+    fn output_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "results": {"type": "array"}
+            },
+            "required": ["query", "results"]
+        })
+    }
+
     fn limits(&self) -> FunctionLimits {
         FunctionLimits {
             time_budget: self.config.timeout,

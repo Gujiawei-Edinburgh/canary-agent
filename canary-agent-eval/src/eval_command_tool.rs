@@ -97,6 +97,10 @@ impl AgentFunction for EnvironmentDecisionTool {
         }
     }
 
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
     fn limits(&self) -> FunctionLimits {
         FunctionLimits {
             time_budget: Duration::from_secs(5),

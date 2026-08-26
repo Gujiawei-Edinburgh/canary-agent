@@ -119,6 +119,7 @@ pub enum FunctionCallExecution {
 
 pub trait AgentFunction: Send + Sync {
     fn spec(&self) -> FunctionSpec;
+    fn output_schema(&self) -> Value;
     fn limits(&self) -> FunctionLimits;
     fn recovery_policy(&self) -> FunctionRecoveryPolicy;
     fn output_resolver(&self) -> &dyn FunctionOutputResolver;
@@ -131,6 +132,7 @@ pub trait AgentFunction: Send + Sync {
 
 pub trait RuntimeCommand: Send + Sync {
     fn spec(&self) -> FunctionSpec;
+    fn output_schema(&self) -> Value;
     fn limits(&self) -> FunctionLimits;
     fn recovery_policy(&self) -> FunctionRecoveryPolicy;
     fn output_resolver(&self) -> &dyn FunctionOutputResolver;
@@ -143,6 +145,7 @@ pub trait RuntimeCommand: Send + Sync {
 
 pub struct SimpleFunction<F> {
     spec: FunctionSpec,
+    output_schema: Value,
     limits: FunctionLimits,
     recovery_policy: FunctionRecoveryPolicy,
     output_resolver: Arc<dyn FunctionOutputResolver>,
@@ -152,12 +155,14 @@ pub struct SimpleFunction<F> {
 impl<F> SimpleFunction<F> {
     pub fn new(
         spec: FunctionSpec,
+        output_schema: Value,
         limits: FunctionLimits,
         recovery_policy: FunctionRecoveryPolicy,
         handler: F,
     ) -> Self {
         Self {
             spec,
+            output_schema,
             limits,
             recovery_policy,
             output_resolver: Arc::new(DiscardResolver),
@@ -181,6 +186,10 @@ where
 {
     fn spec(&self) -> FunctionSpec {
         self.spec.clone()
+    }
+
+    fn output_schema(&self) -> Value {
+        self.output_schema.clone()
     }
 
     fn limits(&self) -> FunctionLimits {
@@ -449,6 +458,10 @@ impl RuntimeCommand for UpdateGoal {
         }
     }
 
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
     fn limits(&self) -> FunctionLimits {
         FunctionLimits {
             time_budget: Duration::from_secs(1),
@@ -553,6 +566,7 @@ mod tests {
                 description: "Test function.".to_string(),
                 parameters: json!({"type": "object"}),
             },
+            json!({"type": "object"}),
             FunctionLimits {
                 time_budget: Duration::from_millis(10),
                 max_output_bytes: 20 * 1024 * 1024,
@@ -596,6 +610,7 @@ mod tests {
                 description: "Test function.".to_string(),
                 parameters: json!({"type": "object"}),
             },
+            json!({"type": "string"}),
             FunctionLimits {
                 time_budget: Duration::from_secs(1),
                 max_output_bytes: 10,
@@ -642,6 +657,7 @@ mod tests {
                     description: "Test function.".to_string(),
                     parameters: json!({"type": "object"}),
                 },
+                json!({"type": "string"}),
                 FunctionLimits {
                     time_budget: Duration::from_secs(1),
                     max_output_bytes: 10,

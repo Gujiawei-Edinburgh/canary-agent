@@ -358,6 +358,10 @@ impl AgentFunction for ExecCommandTool {
         }
     }
 
+    fn output_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
     fn limits(&self) -> FunctionLimits {
         FunctionLimits {
             time_budget: self.config.default_timeout,
