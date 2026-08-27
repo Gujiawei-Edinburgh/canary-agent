@@ -16,12 +16,12 @@ mod store;
 pub use controller::{AgentCheckout, RevisionController};
 pub use diff::{AgentDiff, ToolChange, ToolDiff, ValueChange};
 pub use error::{Result, RevisionError};
-pub use ids::{AgentId, BranchName, BranchRef, GitCommit, RepositoryId, RevisionId, SpecDigest};
+pub use ids::{AgentId, BranchName, BranchRef, RevisionId, SpecDigest};
 pub use local_store::LocalRevisionStore;
 pub use merge::{MergeConflict, MergeResult};
 pub use revision::{AgentRevision, CommitMessage, RevisionMetadata};
 pub use spec::{
-    AgentSpec, ComponentRef, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec,
-    ToolSourceRef, ToolSpec,
+    AgentBuildRef, AgentSpec, ComponentRef, ModelSpec, PromptSpec, RuntimePolicySpec,
+    ToolInterfaceSpec, ToolSpec,
 };
 pub use store::{RevisionFuture, RevisionStore};

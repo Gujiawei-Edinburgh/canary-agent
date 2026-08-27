@@ -1,6 +1,6 @@
 use crate::diff::AgentDiff;
 use crate::error::{Result, RevisionError};
-use crate::ids::{validate_component, AgentId, GitCommit, RepositoryId, SpecDigest};
+use crate::ids::{validate_component, AgentId, SpecDigest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -92,6 +92,24 @@ pub struct ToolInterfaceSpec {
     pub output_schema: Value,
 }
 
+/// Application-defined identity of the build that supplies the agent runtime
+/// and its opaque tool implementations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBuildRef {
+    pub id: String,
+}
+
+impl AgentBuildRef {
+    fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec(
+                "agent build id is empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ToolInterfaceSpec {
     fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
@@ -101,53 +119,9 @@ impl ToolInterfaceSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolSourceRef {
-    pub repository: RepositoryId,
-    pub commit: GitCommit,
-    pub package: Option<String>,
-    pub path: Option<String>,
-}
-
-impl ToolSourceRef {
-    fn validate(&self) -> Result<()> {
-        if self.repository.0.trim().is_empty() {
-            return Err(RevisionError::InvalidSpec(
-                "tool source repository is empty".to_string(),
-            ));
-        }
-        if self.commit.0.trim().is_empty() {
-            return Err(RevisionError::InvalidSpec(format!(
-                "tool source repository {} has an empty Git commit",
-                self.repository.0
-            )));
-        }
-        if self
-            .package
-            .as_deref()
-            .is_some_and(|package| package.trim().is_empty())
-        {
-            return Err(RevisionError::InvalidSpec(
-                "tool source package is empty".to_string(),
-            ));
-        }
-        if self
-            .path
-            .as_deref()
-            .is_some_and(|path| path.trim().is_empty())
-        {
-            return Err(RevisionError::InvalidSpec(
-                "tool source path is empty".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub interface: ToolInterfaceSpec,
-    pub source: ToolSourceRef,
     pub configuration: Value,
     pub extensions: BTreeMap<String, Value>,
 }
@@ -161,7 +135,6 @@ impl ToolSpec {
                 self.interface.name
             )));
         }
-        self.source.validate()?;
         Ok(())
     }
 }
@@ -201,6 +174,7 @@ pub struct AgentSpec {
     pub prompts: PromptSpec,
     pub tools: BTreeMap<String, ToolSpec>,
     pub runtime: RuntimePolicySpec,
+    pub build: Option<AgentBuildRef>,
     pub extensions: BTreeMap<String, Value>,
 }
 
@@ -214,6 +188,9 @@ impl AgentSpec {
             tool.validate(name)?;
         }
         self.runtime.validate()?;
+        if let Some(build) = &self.build {
+            build.validate()?;
+        }
         Ok(())
     }
 

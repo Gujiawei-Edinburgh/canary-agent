@@ -64,26 +64,6 @@ pub struct RevisionId(pub String);
 #[serde(transparent)]
 pub struct SpecDigest(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RepositoryId(pub String);
-
-impl From<&str> for RepositoryId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct GitCommit(pub String);
-
-impl From<&str> for GitCommit {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
 pub(crate) fn validate_component(kind: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(RevisionError::InvalidBranch(format!("{kind} is empty")));

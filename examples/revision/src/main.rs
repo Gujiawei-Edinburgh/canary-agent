@@ -1,7 +1,7 @@
 use canary_agent_revision::{
-    AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage, GitCommit, ModelSpec,
-    PromptSpec, RepositoryId, RevisionController, RevisionError, RevisionFuture, RevisionId,
-    RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSourceRef, ToolSpec,
+    AgentBuildRef, AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage,
+    ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionFuture, RevisionId,
+    RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -176,6 +176,9 @@ fn agent_spec() -> AgentSpec {
             hooks: Vec::new(),
             extensions: BTreeMap::new(),
         },
+        build: Some(AgentBuildRef {
+            id: "revision-example-build-1".to_string(),
+        }),
         extensions: BTreeMap::new(),
     }
 }
@@ -195,12 +198,6 @@ fn search_tool() -> ToolSpec {
                 "properties": {"results": {"type": "array"}},
                 "required": ["results"]
             }),
-        },
-        source: ToolSourceRef {
-            repository: RepositoryId::from("canary-agent-tools"),
-            commit: GitCommit::from("example-commit-1"),
-            package: Some("canary-agent-tools".to_string()),
-            path: Some("src/search.rs".to_string()),
         },
         configuration: json!({"backend": "example"}),
         extensions: BTreeMap::new(),
@@ -225,12 +222,6 @@ fn comparison_tool() -> ToolSpec {
                 "properties": {"equal": {"type": "boolean"}},
                 "required": ["equal"]
             }),
-        },
-        source: ToolSourceRef {
-            repository: RepositoryId::from("canary-agent-tools"),
-            commit: GitCommit::from("example-commit-1"),
-            package: Some("canary-agent-tools".to_string()),
-            path: Some("src/compare_results.rs".to_string()),
         },
         configuration: json!({"backend": "example"}),
         extensions: BTreeMap::new(),

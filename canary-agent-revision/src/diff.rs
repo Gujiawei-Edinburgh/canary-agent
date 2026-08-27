@@ -1,6 +1,6 @@
 use crate::ids::AgentId;
 use crate::spec::{
-    AgentSpec, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec, ToolSourceRef, ToolSpec,
+    AgentBuildRef, AgentSpec, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +13,7 @@ pub struct AgentDiff {
     pub prompts: Option<ValueChange<PromptSpec>>,
     pub tools: Vec<ToolChange>,
     pub runtime: Option<ValueChange<RuntimePolicySpec>>,
+    pub build: Option<ValueChange<Option<AgentBuildRef>>>,
     pub extensions: Option<ValueChange<BTreeMap<String, Value>>>,
 }
 
@@ -24,6 +25,7 @@ impl AgentDiff {
             prompts: changed(&before.prompts, &after.prompts),
             tools: diff_tools(&before.tools, &after.tools),
             runtime: changed(&before.runtime, &after.runtime),
+            build: changed(&before.build, &after.build),
             extensions: changed(&before.extensions, &after.extensions),
         })
     }
@@ -34,6 +36,7 @@ impl AgentDiff {
             && self.prompts.is_none()
             && self.tools.is_empty()
             && self.runtime.is_none()
+            && self.build.is_none()
             && self.extensions.is_none()
     }
 }
@@ -54,17 +57,13 @@ pub enum ToolChange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDiff {
     pub interface: Option<ValueChange<ToolInterfaceSpec>>,
-    pub source: Option<ValueChange<ToolSourceRef>>,
     pub configuration: Option<ValueChange<Value>>,
     pub extensions: Option<ValueChange<BTreeMap<String, Value>>>,
 }
 
 impl ToolDiff {
     pub fn is_empty(&self) -> bool {
-        self.interface.is_none()
-            && self.source.is_none()
-            && self.configuration.is_none()
-            && self.extensions.is_none()
+        self.interface.is_none() && self.configuration.is_none() && self.extensions.is_none()
     }
 }
 
@@ -99,7 +98,6 @@ fn diff_tools(
                 name,
                 diff: Box::new(ToolDiff {
                     interface: changed(&before.interface, &after.interface),
-                    source: changed(&before.source, &after.source),
                     configuration: changed(&before.configuration, &after.configuration),
                     extensions: changed(&before.extensions, &after.extensions),
                 }),
