@@ -1,3 +1,4 @@
+use crate::diff::AgentDiff;
 use crate::error::{Result, RevisionError};
 use crate::ids::{BranchRef, RevisionId};
 use crate::merge::{choose_merge_base, merge_specs, MergeResult};
@@ -104,6 +105,12 @@ where
             .load_revision(id)
             .await?
             .ok_or_else(|| RevisionError::RevisionNotFound(id.0.clone()))
+    }
+
+    pub async fn diff(&self, before: &RevisionId, after: &RevisionId) -> Result<AgentDiff> {
+        let before = self.load_revision(before).await?;
+        let after = self.load_revision(after).await?;
+        before.diff(&after)
     }
 
     pub async fn prepare_merge(

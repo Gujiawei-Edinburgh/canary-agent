@@ -332,7 +332,7 @@ impl Agent {
 
     /// Builds a declarative snapshot from the live model client and function
     /// registry. Tool implementations are intentionally not part of it.
-    pub fn spec_snapshot(&self, build: AgentBuildRef) -> AgentSpec {
+    pub fn spec_snapshot(&self, build: impl Into<AgentBuildRef>) -> AgentSpec {
         let model = self.model_client.model_descriptor();
         let tools = self
             .function_registry
@@ -378,7 +378,7 @@ impl Agent {
                     max_function_calls: self.config.turn_execution_limits.max_function_calls,
                 },
             },
-            build,
+            build: build.into(),
         }
     }
 
@@ -406,6 +406,19 @@ impl Agent {
         H: FunctionCallHook + 'static,
     {
         self.function_call_hooks.push(Arc::new(hook));
+        self
+    }
+
+    pub fn with_function<F>(mut self, function: F) -> Self
+    where
+        F: crate::functions::AgentFunction + 'static,
+    {
+        self.function_registry.register(function);
+        self
+    }
+
+    pub fn without_function(mut self, name: &str) -> Self {
+        self.function_registry.unregister(name);
         self
     }
 

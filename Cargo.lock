@@ -180,8 +180,13 @@ dependencies = [
 name = "canary-agent-revision-example"
 version = "0.1.0"
 dependencies = [
+ "canary-agent-openai",
  "canary-agent-revision",
+ "canary-agent-runtime",
+ "canary-agent-store-json",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

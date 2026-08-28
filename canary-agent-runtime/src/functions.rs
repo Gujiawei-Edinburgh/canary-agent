@@ -257,6 +257,10 @@ impl FunctionRegistry {
         );
     }
 
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.functions.remove(name).is_some()
+    }
+
     pub fn specs(&self) -> Vec<FunctionSpec> {
         self.functions
             .values()

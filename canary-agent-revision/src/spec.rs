@@ -24,7 +24,9 @@ impl ComponentRef {
 
     pub(crate) fn validate(&self) -> Result<()> {
         if self.fqn.trim().is_empty() {
-            return Err(RevisionError::InvalidSpec("component FQN is empty".to_string()));
+            return Err(RevisionError::InvalidSpec(
+                "component FQN is empty".to_string(),
+            ));
         }
         Ok(())
     }
@@ -89,6 +91,18 @@ impl AgentBuildRef {
             ));
         }
         Ok(())
+    }
+}
+
+impl From<&str> for AgentBuildRef {
+    fn from(id: &str) -> Self {
+        Self { id: id.to_string() }
+    }
+}
+
+impl From<String> for AgentBuildRef {
+    fn from(id: String) -> Self {
+        Self { id }
     }
 }
 

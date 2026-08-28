@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+canary-agent-openai = { path = "../../canary-agent-openai" }
 canary-agent-revision = { path = "../../canary-agent-revision" }
+canary-agent-runtime = { path = "../../canary-agent-runtime" }
+canary-agent-store-json = { path = "../../canary-agent-store-json" }
 serde_json = "1"
+serde = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
