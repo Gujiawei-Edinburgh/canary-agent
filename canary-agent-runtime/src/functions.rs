@@ -27,6 +27,14 @@ pub struct FunctionLimits {
     pub max_output_bytes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDescriptor {
+    pub spec: FunctionSpec,
+    pub output_schema: Value,
+    pub limits: FunctionLimits,
+    pub recovery_policy: FunctionRecoveryPolicy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FunctionRecoveryPolicy {
@@ -255,6 +263,26 @@ impl FunctionRegistry {
             .map(|function| match function {
                 RegisteredFunction::Tool(function) => function.spec(),
                 RegisteredFunction::RuntimeCommand(command) => command.spec(),
+            })
+            .collect()
+    }
+
+    pub fn descriptors(&self) -> Vec<FunctionDescriptor> {
+        self.functions
+            .values()
+            .map(|function| match function {
+                RegisteredFunction::Tool(function) => FunctionDescriptor {
+                    spec: function.spec(),
+                    output_schema: function.output_schema(),
+                    limits: function.limits(),
+                    recovery_policy: function.recovery_policy(),
+                },
+                RegisteredFunction::RuntimeCommand(command) => FunctionDescriptor {
+                    spec: command.spec(),
+                    output_schema: command.output_schema(),
+                    limits: command.limits(),
+                    recovery_policy: command.recovery_policy(),
+                },
             })
             .collect()
     }

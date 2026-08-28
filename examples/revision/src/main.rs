@@ -1,7 +1,8 @@
 use canary_agent_revision::{
     AgentBuildRef, AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage,
-    ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionFuture, RevisionId,
-    RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
+    ComponentRef, ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionFuture,
+    RevisionId, RevisionStore, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
+    TurnExecutionLimitsSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -159,27 +160,26 @@ fn agent_spec() -> AgentSpec {
     AgentSpec {
         agent_id: AgentId::from("research-agent"),
         model: ModelSpec {
-            provider: "example-provider".to_string(),
-            model: "example-model".to_string(),
+            fqn: "example-provider/example-model".to_string(),
             settings: json!({"reasoning_effort": "medium"}),
         },
         prompts: PromptSpec {
             system: "Research carefully and cite sources.".to_string(),
             templates: BTreeMap::new(),
-            extensions: BTreeMap::new(),
         },
         tools: BTreeMap::from([("search".to_string(), search_tool())]),
         runtime: RuntimePolicySpec {
-            context_builder: None,
-            function_selector: None,
-            execution: None,
+            context_builder: ComponentRef::new("example::ContextBuilder", json!({}))
+                .expect("context builder"),
             hooks: Vec::new(),
-            extensions: BTreeMap::new(),
+            turn_execution_limits: TurnExecutionLimitsSpec {
+                max_model_iterations: 128,
+                max_function_calls: 1024,
+            },
         },
-        build: Some(AgentBuildRef {
+        build: AgentBuildRef {
             id: "revision-example-build-1".to_string(),
-        }),
-        extensions: BTreeMap::new(),
+        },
     }
 }
 
@@ -200,7 +200,6 @@ fn search_tool() -> ToolSpec {
             }),
         },
         configuration: json!({"backend": "example"}),
-        extensions: BTreeMap::new(),
     }
 }
 
@@ -224,6 +223,5 @@ fn comparison_tool() -> ToolSpec {
             }),
         },
         configuration: json!({"backend": "example"}),
-        extensions: BTreeMap::new(),
     }
 }

@@ -2,6 +2,7 @@ use crate::error::{AgentError, Result};
 use crate::store::ThreadContextCache;
 use canary_agent_kernel::projection::{ChatMessage, ThreadProjection};
 use canary_agent_kernel::RevisionToken;
+use canary_agent_revision::ComponentRef;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -23,6 +24,8 @@ pub struct ContextBuildInput<'a> {
 }
 
 pub trait ContextBuilder: Send + Sync {
+    fn descriptor(&self) -> ComponentRef;
+
     fn build<'a>(
         &'a self,
         input: ContextBuildInput<'a>,
@@ -107,6 +110,20 @@ impl CompactingContextBuilder {
 }
 
 impl ContextBuilder for CompactingContextBuilder {
+    fn descriptor(&self) -> ComponentRef {
+        ComponentRef::new(
+            "canary_agent_runtime::CompactingContextBuilder",
+            serde_json::json!({
+                "max_context_tokens": self.max_context_tokens,
+                "summary_budget_tokens": self.summary_budget_tokens,
+                "oversized_group_policy": format!("{:?}", self.oversized_group_policy),
+                "policy_version": self.policy_version,
+                "has_compactor": self.compactor.is_some(),
+            }),
+        )
+        .expect("built-in context builder descriptor is valid")
+    }
+
     fn build<'a>(
         &'a self,
         input: ContextBuildInput<'a>,

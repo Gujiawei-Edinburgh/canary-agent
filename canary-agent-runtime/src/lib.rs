@@ -20,16 +20,17 @@ pub use context::{
 pub use error::{AgentError, Result};
 pub use functions::{
     builtin_registry, AgentFunction, DiscardResolver, FunctionCallExecution, FunctionContext,
-    FunctionExecution, FunctionLimits, FunctionOutputResolver, FunctionRecoveryPolicy,
-    FunctionRegistry, RuntimeCommand, RuntimeCommandExecution, RuntimeEffect, SimpleFunction,
-    SuspensionResolution,
+    FunctionDescriptor, FunctionExecution, FunctionLimits, FunctionOutputResolver,
+    FunctionRecoveryPolicy, FunctionRegistry, RuntimeCommand, RuntimeCommandExecution,
+    RuntimeEffect, SimpleFunction, SuspensionResolution,
 };
 pub use metrics::{
     FunctionCallOutcome, FunctionCallSkipReason, MetricStatus, MetricsRecorder,
     NoopMetricsRecorder, RuntimeMetric,
 };
 pub use model::{
-    FunctionSpec, ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
+    FunctionSpec, ModelClient, ModelDescriptor, ModelFunctionCall, ModelRequest, ModelResponse,
+    ModelStreamEvent,
 };
 pub use session::{LeaseFence, LocalSessionCoordinator, SessionCoordinator, SessionLease};
 pub use store::{ThreadContextCache, ThreadStore};

@@ -20,8 +20,12 @@ use canary_agent_kernel::events::{
 };
 use canary_agent_kernel::projection::ThreadProjection;
 use canary_agent_kernel::RevisionToken;
+use canary_agent_revision::{
+    AgentBuildRef, AgentId, AgentSpec, ModelSpec, PromptSpec, RuntimePolicySpec, ToolInterfaceSpec,
+    ToolSpec,
+};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +35,7 @@ use tokio::sync::watch;
 
 #[derive(Clone)]
 pub struct AgentConfig {
+    pub agent_id: String,
     pub turn_execution_limits: TurnExecutionLimits,
     pub system_prompt: String,
 }
@@ -53,6 +58,7 @@ impl Default for TurnExecutionLimits {
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
+            .field("agent_id", &self.agent_id)
             .field("turn_execution_limits", &self.turn_execution_limits)
             .field("system_prompt", &self.system_prompt)
             .finish()
@@ -62,6 +68,7 @@ impl std::fmt::Debug for AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            agent_id: "agent".to_string(),
             turn_execution_limits: TurnExecutionLimits::default(),
             system_prompt: concat!(
                 "You are an agent runtime assistant. Use functions only when they are useful. ",
@@ -211,6 +218,8 @@ pub enum FunctionCallHookResult {
 }
 
 pub trait FunctionCallHook: Send + Sync {
+    fn descriptor(&self) -> canary_agent_revision::ComponentRef;
+
     fn before_call<'a>(
         &'a self,
         _context: FunctionCallHookContext,
@@ -319,6 +328,58 @@ impl Agent {
             .ok_or_else(|| AgentError::TurnNotActive(thread_id.to_string()))?;
         turn.handle.abort();
         Ok(())
+    }
+
+    /// Builds a declarative snapshot from the live model client and function
+    /// registry. Tool implementations are intentionally not part of it.
+    pub fn spec_snapshot(&self, build: AgentBuildRef) -> AgentSpec {
+        let model = self.model_client.model_descriptor();
+        let tools = self
+            .function_registry
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| {
+                let name = descriptor.spec.name.clone();
+                (
+                    name.clone(),
+                    ToolSpec {
+                        interface: ToolInterfaceSpec {
+                            name,
+                            description: descriptor.spec.description,
+                            parameters: descriptor.spec.parameters,
+                            output_schema: descriptor.output_schema,
+                        },
+                        configuration: serde_json::json!({}),
+                    },
+                )
+            })
+            .collect();
+
+        AgentSpec {
+            agent_id: AgentId::from(self.config.agent_id.as_str()),
+            model: ModelSpec {
+                fqn: model.fqn,
+                settings: model.settings,
+            },
+            prompts: PromptSpec {
+                system: self.config.system_prompt.clone(),
+                templates: BTreeMap::new(),
+            },
+            tools,
+            runtime: RuntimePolicySpec {
+                context_builder: self.context_builder.descriptor(),
+                hooks: self
+                    .function_call_hooks
+                    .iter()
+                    .map(|hook| hook.descriptor())
+                    .collect(),
+                turn_execution_limits: canary_agent_revision::TurnExecutionLimitsSpec {
+                    max_model_iterations: self.config.turn_execution_limits.max_model_iterations,
+                    max_function_calls: self.config.turn_execution_limits.max_function_calls,
+                },
+            },
+            build,
+        }
     }
 
     fn register_active_turn(&self, thread_id: &str) -> Result<ActiveTurnGuard> {
@@ -2023,8 +2084,8 @@ impl Agent {
 mod tests {
     use crate::functions::{builtin_registry, FunctionRegistry, SimpleFunction};
     use crate::model::{
-        ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
-        ModelStreamHandler,
+        ModelClient, ModelDescriptor, ModelFunctionCall, ModelRequest, ModelResponse,
+        ModelStreamEvent, ModelStreamHandler,
     };
     use crate::store::{ThreadContextCache, ThreadStore};
     use crate::trace::{TraceCollector, TraceEvent, TraceEventKind};
@@ -2039,6 +2100,7 @@ mod tests {
         TurnItemSource, TurnStatus,
     };
     use canary_agent_kernel::projection::ThreadProjection;
+    use canary_agent_revision::AgentBuildRef;
     use serde_json::json;
     use std::collections::VecDeque;
     use std::future::Future;
@@ -2171,6 +2233,13 @@ mod tests {
     }
 
     impl ModelClient for MockModel {
+        fn model_descriptor(&self) -> ModelDescriptor {
+            ModelDescriptor {
+                fqn: "test/mock".to_string(),
+                settings: json!({}),
+            }
+        }
+
         fn stream_complete<'a>(
             &'a self,
             request: ModelRequest,
@@ -2190,6 +2259,13 @@ mod tests {
     struct PendingModel;
 
     impl ModelClient for PendingModel {
+        fn model_descriptor(&self) -> ModelDescriptor {
+            ModelDescriptor {
+                fqn: "test/pending".to_string(),
+                settings: json!({}),
+            }
+        }
+
         fn stream_complete<'a>(
             &'a self,
             _request: ModelRequest,
@@ -2292,6 +2368,17 @@ mod tests {
     }
 
     impl FunctionCallHook for RecordingHook {
+        fn descriptor(&self) -> canary_agent_revision::ComponentRef {
+            canary_agent_revision::ComponentRef::new(
+                format!("test::RecordingHook::{}", self.label),
+                json!({
+                    "fail_before": self.fail_before,
+                    "fail_after": self.fail_after,
+                }),
+            )
+            .expect("hook descriptor")
+        }
+
         fn before_call<'a>(
             &'a self,
             context: FunctionCallHookContext,
@@ -2368,6 +2455,59 @@ mod tests {
         assert_eq!(thread.turns.len(), 1);
         assert_eq!(thread.turns[0].status, TurnStatus::Completed);
         assert_eq!(thread.turns[0].items.len(), 2);
+    }
+
+    #[test]
+    fn spec_snapshot_projects_the_live_model_and_function_registry() {
+        let config = AgentConfig {
+            agent_id: "snapshot-agent".to_string(),
+            system_prompt: "Be precise.".to_string(),
+            ..AgentConfig::default()
+        };
+        let agent = Agent::new(
+            config,
+            Arc::new(TestStore::default()),
+            Arc::new(MockModel::new(Vec::new())),
+            test_registry(),
+            Arc::new(crate::session::LocalSessionCoordinator::default()),
+        )
+        .with_function_call_hook(RecordingHook::new(
+            "snapshot-hook",
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+
+        let snapshot = agent.spec_snapshot(AgentBuildRef {
+            id: "app-build-42".to_string(),
+        });
+
+        assert_eq!(snapshot.agent_id.0, "snapshot-agent");
+        assert_eq!(snapshot.build.id, "app-build-42");
+        assert_eq!(snapshot.model.fqn, "test/mock");
+        assert_eq!(snapshot.prompts.system, "Be precise.");
+        assert_eq!(
+            snapshot.runtime.context_builder.fqn,
+            "canary_agent_runtime::CompactingContextBuilder"
+        );
+        assert_eq!(
+            snapshot.runtime.hooks[0].fqn,
+            "test::RecordingHook::snapshot-hook"
+        );
+        assert_eq!(
+            snapshot.runtime.turn_execution_limits.max_model_iterations,
+            128
+        );
+        assert_eq!(
+            snapshot.runtime.turn_execution_limits.max_function_calls,
+            1024
+        );
+        assert_eq!(
+            snapshot.tools["test_function"].interface.output_schema,
+            json!({"type": "object"})
+        );
+        assert_eq!(
+            snapshot.tools["test_function"].interface.parameters["type"],
+            "object"
+        );
     }
 
     #[tokio::test]
@@ -2552,6 +2692,13 @@ mod tests {
         struct UsageModel;
 
         impl ModelClient for UsageModel {
+            fn model_descriptor(&self) -> ModelDescriptor {
+                ModelDescriptor {
+                    fqn: "test/usage".to_string(),
+                    settings: json!({}),
+                }
+            }
+
             fn stream_complete<'a>(
                 &'a self,
                 _request: ModelRequest,

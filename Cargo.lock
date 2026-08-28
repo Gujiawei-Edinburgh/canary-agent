@@ -190,6 +190,7 @@ name = "canary-agent-runtime"
 version = "0.1.0"
 dependencies = [
  "canary-agent-kernel",
+ "canary-agent-revision",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

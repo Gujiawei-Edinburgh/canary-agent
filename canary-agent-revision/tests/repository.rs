@@ -1,7 +1,8 @@
 use canary_agent_revision::{
     AgentBuildRef, AgentId, AgentRevision, AgentSpec, BranchName, BranchRef, CommitMessage,
-    LocalRevisionStore, ModelSpec, PromptSpec, RevisionController, RevisionError, RevisionMetadata,
-    RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
+    ComponentRef, LocalRevisionStore, ModelSpec, PromptSpec, RevisionController, RevisionError,
+    RevisionMetadata, RuntimePolicySpec, ToolChange, ToolInterfaceSpec, ToolSpec,
+    TurnExecutionLimitsSpec,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -18,7 +19,6 @@ fn tool(name: &str) -> ToolSpec {
             output_schema: json!({"type": "object"}),
         },
         configuration: json!({}),
-        extensions: BTreeMap::new(),
     }
 }
 
@@ -26,27 +26,26 @@ fn spec() -> AgentSpec {
     AgentSpec {
         agent_id: AgentId::from("research-agent"),
         model: ModelSpec {
-            provider: "provider".to_string(),
-            model: "model-v1".to_string(),
+            fqn: "provider/model-v1".to_string(),
             settings: json!({"reasoning_effort": "medium"}),
         },
         prompts: PromptSpec {
             system: "Answer carefully.".to_string(),
             templates: BTreeMap::new(),
-            extensions: BTreeMap::new(),
         },
         tools: BTreeMap::from([(String::from("search"), tool("search"))]),
         runtime: RuntimePolicySpec {
-            context_builder: None,
-            function_selector: None,
-            execution: None,
+            context_builder: ComponentRef::new("test::ContextBuilder", json!({}))
+                .expect("context builder"),
             hooks: Vec::new(),
-            extensions: BTreeMap::new(),
+            turn_execution_limits: TurnExecutionLimitsSpec {
+                max_model_iterations: 128,
+                max_function_calls: 1024,
+            },
         },
-        build: Some(AgentBuildRef {
+        build: AgentBuildRef {
             id: "application-build-1".to_string(),
-        }),
-        extensions: BTreeMap::new(),
+        },
     }
 }
 
@@ -89,7 +88,7 @@ async fn commit_branch_checkout_and_lineage_are_persistent() {
     assert_eq!(branch_head, first.revision_id);
 
     let mut next_spec = spec();
-    next_spec.build.as_mut().unwrap().id = "application-build-2".to_string();
+    next_spec.build.id = "application-build-2".to_string();
     let second = controller
         .commit(
             &feature,
@@ -218,7 +217,7 @@ async fn merge_combines_independent_static_changes_and_records_two_parents() {
         .expect("c0 commit");
 
     let mut c1_spec = spec();
-    c1_spec.build.as_mut().unwrap().id = "application-build-2".to_string();
+    c1_spec.build.id = "application-build-2".to_string();
     let c1_revision = controller
         .commit(
             &c1,
@@ -246,10 +245,7 @@ async fn merge_combines_independent_static_changes_and_records_two_parents() {
         vec![c0_revision.revision_id, c1_revision.revision_id]
     );
     assert_eq!(merged.spec.prompts.system, "Focus on category c0.");
-    assert_eq!(
-        merged.spec.build.as_ref().unwrap().id,
-        "application-build-2"
-    );
+    assert_eq!(merged.spec.build.id, "application-build-2");
     assert_eq!(
         controller
             .checkout(&c0)

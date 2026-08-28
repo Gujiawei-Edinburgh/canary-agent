@@ -13,8 +13,7 @@ pub struct AgentDiff {
     pub prompts: Option<ValueChange<PromptSpec>>,
     pub tools: Vec<ToolChange>,
     pub runtime: Option<ValueChange<RuntimePolicySpec>>,
-    pub build: Option<ValueChange<Option<AgentBuildRef>>>,
-    pub extensions: Option<ValueChange<BTreeMap<String, Value>>>,
+    pub build: Option<ValueChange<AgentBuildRef>>,
 }
 
 impl AgentDiff {
@@ -26,7 +25,6 @@ impl AgentDiff {
             tools: diff_tools(&before.tools, &after.tools),
             runtime: changed(&before.runtime, &after.runtime),
             build: changed(&before.build, &after.build),
-            extensions: changed(&before.extensions, &after.extensions),
         })
     }
 
@@ -37,7 +35,6 @@ impl AgentDiff {
             && self.tools.is_empty()
             && self.runtime.is_none()
             && self.build.is_none()
-            && self.extensions.is_none()
     }
 }
 
@@ -58,12 +55,11 @@ pub enum ToolChange {
 pub struct ToolDiff {
     pub interface: Option<ValueChange<ToolInterfaceSpec>>,
     pub configuration: Option<ValueChange<Value>>,
-    pub extensions: Option<ValueChange<BTreeMap<String, Value>>>,
 }
 
 impl ToolDiff {
     pub fn is_empty(&self) -> bool {
-        self.interface.is_none() && self.configuration.is_none() && self.extensions.is_none()
+        self.interface.is_none() && self.configuration.is_none()
     }
 }
 
@@ -99,7 +95,6 @@ fn diff_tools(
                 diff: Box::new(ToolDiff {
                     interface: changed(&before.interface, &after.interface),
                     configuration: changed(&before.configuration, &after.configuration),
-                    extensions: changed(&before.extensions, &after.extensions),
                 }),
             }),
             _ => None,

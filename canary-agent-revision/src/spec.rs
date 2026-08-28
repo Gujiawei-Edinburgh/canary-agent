@@ -8,23 +8,14 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComponentRef {
-    pub kind: String,
-    pub name: String,
-    pub version: String,
+    pub fqn: String,
     pub configuration: Value,
 }
 
 impl ComponentRef {
-    pub fn new(
-        kind: impl Into<String>,
-        name: impl Into<String>,
-        version: impl Into<String>,
-        configuration: Value,
-    ) -> Result<Self> {
+    pub fn new(fqn: impl Into<String>, configuration: Value) -> Result<Self> {
         let component = Self {
-            kind: kind.into(),
-            name: name.into(),
-            version: version.into(),
+            fqn: fqn.into(),
             configuration,
         };
         component.validate()?;
@@ -32,15 +23,8 @@ impl ComponentRef {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        validate_component("component kind", &self.kind)
-            .map_err(|error| RevisionError::InvalidSpec(error.to_string()))?;
-        validate_component("component name", &self.name)
-            .map_err(|error| RevisionError::InvalidSpec(error.to_string()))?;
-        if self.version.trim().is_empty() {
-            return Err(RevisionError::InvalidSpec(format!(
-                "component {} has an empty version",
-                self.name
-            )));
+        if self.fqn.trim().is_empty() {
+            return Err(RevisionError::InvalidSpec("component FQN is empty".to_string()));
         }
         Ok(())
     }
@@ -48,14 +32,13 @@ impl ComponentRef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelSpec {
-    pub provider: String,
-    pub model: String,
+    pub fqn: String,
     pub settings: Value,
 }
 
 impl ModelSpec {
     fn validate(&self) -> Result<()> {
-        if self.provider.trim().is_empty() || self.model.trim().is_empty() {
+        if self.fqn.trim().is_empty() {
             return Err(RevisionError::InvalidSpec(
                 "model provider and model are required".to_string(),
             ));
@@ -68,12 +51,11 @@ impl ModelSpec {
 pub struct PromptSpec {
     pub system: String,
     pub templates: BTreeMap<String, String>,
-    pub extensions: BTreeMap<String, Value>,
 }
 
 impl PromptSpec {
     fn validate(&self) -> Result<()> {
-        for name in self.templates.keys().chain(self.extensions.keys()) {
+        for name in self.templates.keys() {
             if name.trim().is_empty() {
                 return Err(RevisionError::InvalidSpec(
                     "prompt extension name is empty".to_string(),
@@ -123,7 +105,6 @@ impl ToolInterfaceSpec {
 pub struct ToolSpec {
     pub interface: ToolInterfaceSpec,
     pub configuration: Value,
-    pub extensions: BTreeMap<String, Value>,
 }
 
 impl ToolSpec {
@@ -141,30 +122,25 @@ impl ToolSpec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimePolicySpec {
-    pub context_builder: Option<ComponentRef>,
-    pub function_selector: Option<ComponentRef>,
-    pub execution: Option<ComponentRef>,
+    pub context_builder: ComponentRef,
     pub hooks: Vec<ComponentRef>,
-    pub extensions: BTreeMap<String, Value>,
+    pub turn_execution_limits: TurnExecutionLimitsSpec,
 }
 
 impl RuntimePolicySpec {
     fn validate(&self) -> Result<()> {
-        for component in [
-            self.context_builder.as_ref(),
-            self.function_selector.as_ref(),
-            self.execution.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            component.validate()?;
-        }
+        self.context_builder.validate()?;
         for hook in &self.hooks {
             hook.validate()?;
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnExecutionLimitsSpec {
+    pub max_model_iterations: usize,
+    pub max_function_calls: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,8 +150,7 @@ pub struct AgentSpec {
     pub prompts: PromptSpec,
     pub tools: BTreeMap<String, ToolSpec>,
     pub runtime: RuntimePolicySpec,
-    pub build: Option<AgentBuildRef>,
-    pub extensions: BTreeMap<String, Value>,
+    pub build: AgentBuildRef,
 }
 
 impl AgentSpec {
@@ -188,9 +163,7 @@ impl AgentSpec {
             tool.validate(name)?;
         }
         self.runtime.validate()?;
-        if let Some(build) = &self.build {
-            build.validate()?;
-        }
+        self.build.validate()?;
         Ok(())
     }
 

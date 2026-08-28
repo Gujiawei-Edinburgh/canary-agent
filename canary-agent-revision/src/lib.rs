@@ -22,6 +22,6 @@ pub use merge::{MergeConflict, MergeResult};
 pub use revision::{AgentRevision, CommitMessage, RevisionMetadata};
 pub use spec::{
     AgentBuildRef, AgentSpec, ComponentRef, ModelSpec, PromptSpec, RuntimePolicySpec,
-    ToolInterfaceSpec, ToolSpec,
+    ToolInterfaceSpec, ToolSpec, TurnExecutionLimitsSpec,
 };
 pub use store::{RevisionFuture, RevisionStore};

@@ -3,7 +3,7 @@ use canary_agent_kernel::projection::ChatMessage;
 use canary_agent_kernel::{
     FunctionSpec, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
 };
-use canary_agent_runtime::model::{ModelClient, ModelStreamHandler};
+use canary_agent_runtime::model::{ModelClient, ModelDescriptor, ModelStreamHandler};
 use canary_agent_runtime::{AgentError, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,15 @@ impl ChatCompletionsClient {
 }
 
 impl ModelClient for ChatCompletionsClient {
+    fn model_descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            fqn: self.config.model.clone(),
+            settings: serde_json::json!({
+                "reasoning_effort": self.config.reasoning_effort,
+            }),
+        }
+    }
+
     fn stream_complete<'a>(
         &'a self,
         request: ModelRequest,

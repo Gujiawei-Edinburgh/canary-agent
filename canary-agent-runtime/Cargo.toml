@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 canary-agent-kernel = { path = "../canary-agent-kernel" }
+canary-agent-revision = { path = "../canary-agent-revision" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
