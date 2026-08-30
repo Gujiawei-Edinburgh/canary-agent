@@ -113,11 +113,21 @@ where
         before.diff(&after)
     }
 
-    pub async fn prepare_merge(
-        &self,
-        source: &BranchRef,
-        target: &BranchRef,
-    ) -> Result<MergeResult> {
+    /// Returns the revisions reachable from `branch` through its first-parent
+    /// chain, newest first. This is the branch-oriented equivalent of
+    /// `git log --first-parent`.
+    pub async fn log(&self, branch: &BranchRef) -> Result<Vec<AgentRevision>> {
+        let mut current = Some(self.branch_head(branch).await?);
+        let mut history = Vec::new();
+        while let Some(id) = current {
+            let revision = self.load_revision(&id).await?;
+            current = revision.parents.first().cloned();
+            history.push(revision);
+        }
+        Ok(history)
+    }
+
+    async fn prepare_merge(&self, source: &BranchRef, target: &BranchRef) -> Result<MergeResult> {
         self.validate_branch_pair(source, target)?;
         let source_head = self.branch_head(source).await?;
         let target_head = self.branch_head(target).await?;
@@ -167,7 +177,7 @@ where
         .await
     }
 
-    pub async fn commit_merge(
+    async fn commit_merge(
         &self,
         target: &BranchRef,
         source_revision: &RevisionId,

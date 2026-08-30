@@ -113,6 +113,14 @@ async fn commit_branch_checkout_and_lineage_are_persistent() {
             .expect("parents")[0],
         first
     );
+    let history = controller.log(&feature).await.expect("log");
+    assert_eq!(
+        history
+            .iter()
+            .map(|revision| revision.message.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["upgrade search implementation", "create research agent"]
+    );
 
     let reopened = RevisionController::new(LocalRevisionStore::open(&path).await.expect("reopen"));
     assert_eq!(
@@ -227,11 +235,6 @@ async fn merge_combines_independent_static_changes_and_records_two_parents() {
         .await
         .expect("c1 commit");
 
-    let prepared = controller
-        .prepare_merge(&c1, &c0)
-        .await
-        .expect("prepare merge");
-    assert!(prepared.is_clean());
     let merged = controller
         .merge(
             &c1,
@@ -304,15 +307,6 @@ async fn merge_reports_conflicting_static_changes_without_advancing_branch() {
         .await
         .expect("right commit");
 
-    let result = controller
-        .prepare_merge(&right, &left)
-        .await
-        .expect("prepare merge");
-    assert!(!result.is_clean());
-    assert!(result
-        .conflicts
-        .iter()
-        .any(|conflict| conflict.path == "$.prompts.system"));
     let error = controller
         .merge(
             &right,
