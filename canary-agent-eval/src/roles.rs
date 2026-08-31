@@ -41,8 +41,11 @@ pub enum AgentActionEvent {
         name: String,
         error: String,
     },
-    Runtime {
-        source: String,
+    FunctionHook {
+        phase: String,
+        hook_fqn: String,
+        call_id: String,
+        name: String,
         message: String,
         metadata: Value,
     },
@@ -140,11 +143,22 @@ impl EvaluatedPolicy for RuntimeAgentPolicy {
                                 usage: serde_json::to_value(usage).unwrap_or(Value::Null),
                             });
                         }
-                        TurnStreamEvent::Runtime(runtime) => {
-                            events.push(AgentActionEvent::Runtime {
-                                source: runtime.source,
-                                message: runtime.message,
-                                metadata: runtime.metadata,
+                        TurnStreamEvent::FunctionHook(hook) => {
+                            events.push(AgentActionEvent::FunctionHook {
+                                phase: match hook.phase {
+                                    canary_agent_runtime::FunctionHookPhase::BeforeCall => {
+                                        "before_call"
+                                    }
+                                    canary_agent_runtime::FunctionHookPhase::AfterCall => {
+                                        "after_call"
+                                    }
+                                }
+                                .to_string(),
+                                call_id: hook.call_id,
+                                name: hook.name,
+                                hook_fqn: hook.hook_fqn,
+                                message: hook.message,
+                                metadata: hook.metadata,
                             });
                         }
                         TurnStreamEvent::State(_) | TurnStreamEvent::Model(_) => {}

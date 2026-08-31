@@ -92,7 +92,7 @@ pub enum TurnOutcome {
 pub enum TurnStreamEvent {
     State(TurnStateEvent),
     Model(TurnModelEvent),
-    Runtime(RuntimeEvent),
+    FunctionHook(FunctionHookEvent),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,10 +149,19 @@ pub enum TurnModelEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RuntimeEvent {
-    pub source: String,
+pub struct FunctionHookEvent {
+    pub phase: FunctionHookPhase,
+    pub hook_fqn: String,
+    pub call_id: String,
+    pub name: String,
     pub message: String,
     pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionHookPhase {
+    BeforeCall,
+    AfterCall,
 }
 
 pub type TurnEventHandler<'a> = dyn FnMut(TurnStreamEvent) + Send + 'a;
@@ -1965,8 +1974,11 @@ impl Agent {
                 .await
             {
                 tracing::warn!(error = %error, "function call post-hook failed");
-                on_event(TurnStreamEvent::Runtime(RuntimeEvent {
-                    source: "function_call_hook".to_string(),
+                on_event(TurnStreamEvent::FunctionHook(FunctionHookEvent {
+                    phase: FunctionHookPhase::AfterCall,
+                    hook_fqn: hook.descriptor().fqn,
+                    call_id: context.call_id.clone(),
+                    name: context.name.clone(),
                     message: "post-hook failed".to_string(),
                     metadata: serde_json::json!({
                         "call_id": context.call_id,
@@ -2110,9 +2122,9 @@ mod tests {
     use crate::trace::{TraceCollector, TraceEvent, TraceEventKind};
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
-        FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionRecoveryPolicy,
-        FunctionSpec, Result, RuntimeEvent, TurnExecutionLimits, TurnModelEvent, TurnOutcome,
-        TurnStateEvent, TurnStreamEvent,
+        FunctionCallHookResult, FunctionExecution, FunctionHookEvent, FunctionHookPhase,
+        FunctionLimits, FunctionRecoveryPolicy, FunctionSpec, Result, TurnExecutionLimits,
+        TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use canary_agent_kernel::events::{
         Suspension, SuspensionKind, Thread, TokenUsage, ToolResult, Turn, TurnItem, TurnItemKind,
@@ -2408,8 +2420,11 @@ mod tests {
                     .lock()
                     .expect("events")
                     .push(format!("before:{}:{}", self.label, context.name));
-                emit(TurnStreamEvent::Runtime(RuntimeEvent {
-                    source: self.label.to_string(),
+                emit(TurnStreamEvent::FunctionHook(FunctionHookEvent {
+                    phase: FunctionHookPhase::BeforeCall,
+                    hook_fqn: self.descriptor().fqn,
+                    call_id: context.call_id.clone(),
+                    name: context.name.clone(),
                     message: "before".to_string(),
                     metadata: json!({ "name": context.name }),
                 }));
@@ -3013,7 +3028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_hook_failure_is_non_blocking_runtime_event() {
+    async fn post_hook_failure_is_non_blocking_function_hook_event() {
         let store = Arc::new(TestStore::default());
         let hook_events = Arc::new(Mutex::new(Vec::new()));
         let agent = agent_with(
@@ -3057,9 +3072,16 @@ mod tests {
         );
         assert!(events.lock().expect("events").iter().any(|event| matches!(
             event,
-            TurnStreamEvent::Runtime(RuntimeEvent { source, message, metadata })
-                if source == "function_call_hook"
+            TurnStreamEvent::FunctionHook(FunctionHookEvent {
+                phase: FunctionHookPhase::AfterCall,
+                hook_fqn,
+                name,
+                message,
+                metadata,
+                ..
+            }) if hook_fqn == "test::RecordingHook::audit"
                     && message == "post-hook failed"
+                    && name == "test_function"
                     && metadata["name"] == "test_function"
         )));
 

@@ -397,8 +397,11 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
                 let _ = std_io::stdout().flush();
             }
         }
-        TurnStreamEvent::Runtime(event) => {
-            print_process_line(state, &format!("[{}] {}", event.source, event.message));
+        TurnStreamEvent::FunctionHook(event) => {
+            print_process_line(
+                state,
+                &format!("[function hook:{}] {}", event.hook_fqn, event.message),
+            );
         }
         TurnStreamEvent::Model(TurnModelEvent::AssistantResponse { .. })
         | TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { .. })
