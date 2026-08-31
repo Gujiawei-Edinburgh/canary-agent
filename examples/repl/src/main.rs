@@ -400,7 +400,7 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
         TurnStreamEvent::Runtime(event) => {
             print_process_line(state, &format!("[{}] {}", event.source, event.message));
         }
-        TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { .. })
+        TurnStreamEvent::Model(TurnModelEvent::AssistantResponse { .. })
         | TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { .. })
         | TurnStreamEvent::State(TurnStateEvent::TurnFinished { .. }) => {}
     }

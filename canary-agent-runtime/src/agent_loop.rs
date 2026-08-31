@@ -136,9 +136,16 @@ pub enum TurnStateEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnModelEvent {
-    RequestStarted { iteration: usize },
-    AssistantMessage { text: String },
-    AssistantDelta { text: String },
+    RequestStarted {
+        iteration: usize,
+    },
+    AssistantResponse {
+        text: Option<String>,
+        function_calls: Vec<ModelFunctionCall>,
+    },
+    AssistantDelta {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -965,11 +972,10 @@ impl Agent {
                             self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
                             break 'turn_loop TurnOutcome::Failed { error };
                         }
-                        if let Some(text) = &text {
-                            on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantMessage {
-                                text: text.clone(),
-                            }));
-                        }
+                        on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantResponse {
+                            text: text.clone(),
+                            function_calls: function_calls.clone(),
+                        }));
                         let trace_model_response = TraceEventKind::ModelResponse {
                             text: text.clone(),
                             function_calls: function_calls.clone(),
@@ -2105,8 +2111,8 @@ mod tests {
     use crate::{
         Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, FunctionExecution, FunctionLimits, FunctionRecoveryPolicy,
-        FunctionSpec, Result, RuntimeEvent, TurnExecutionLimits, TurnOutcome, TurnStateEvent,
-        TurnStreamEvent,
+        FunctionSpec, Result, RuntimeEvent, TurnExecutionLimits, TurnModelEvent, TurnOutcome,
+        TurnStateEvent, TurnStreamEvent,
     };
     use canary_agent_kernel::events::{
         Suspension, SuspensionKind, Thread, TokenUsage, ToolResult, Turn, TurnItem, TurnItemKind,
@@ -2585,8 +2591,17 @@ mod tests {
             ],
         );
 
+        let model_events = Arc::new(Mutex::new(Vec::new()));
+        let captured_model_events = model_events.clone();
         agent
-            .run_turn("t", "check", json!({}), |_| {})
+            .run_turn("t", "check", json!({}), move |event| {
+                if let TurnStreamEvent::Model(model_event) = event {
+                    captured_model_events
+                        .lock()
+                        .expect("model events")
+                        .push(model_event);
+                }
+            })
             .await
             .expect("turn");
         let thread = store.load("t").await.expect("thread");
@@ -2602,6 +2617,14 @@ mod tests {
             messages,
             vec!["I will check the goal first.", "The goal is not set."]
         );
+        let model_events = model_events.lock().expect("model events");
+        assert!(model_events.iter().any(|event| matches!(
+            event,
+            TurnModelEvent::AssistantResponse {
+                text: Some(text),
+                function_calls,
+            } if text == "I will check the goal first." && function_calls.len() == 1
+        )));
     }
 
     #[tokio::test]

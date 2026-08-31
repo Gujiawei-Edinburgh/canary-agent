@@ -99,10 +99,17 @@ impl EvaluatedPolicy for RuntimeAgentPolicy {
                     policy_input,
                     metadata,
                     |event| match event {
-                        TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { text }) => {
+                        TurnStreamEvent::Model(TurnModelEvent::AssistantResponse {
+                            text: Some(text),
+                            ..
+                        }) => {
                             assistant_text = text.clone();
                             events.push(AgentActionEvent::AssistantText { text });
                         }
+                        TurnStreamEvent::Model(TurnModelEvent::AssistantResponse {
+                            text: None,
+                            ..
+                        }) => {}
                         TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { .. }) => {}
                         TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested {
                             calls,
