@@ -231,3 +231,18 @@ particular environment fact means.
 Canary does not provide perception algorithms, robotics middleware, motor
 control, hard real-time guarantees, or model training. Such components can be
 integrated as sources, inference providers, or tool executors.
+
+## Pseudocode
+```rust
+while let Some(event) = event_ingress.next().await {
+    projection.apply(&event);
+
+    for pipeline in admission.issue(&event, &projection) {
+        tokio::spawn(async move {
+            let actions = pipeline.infer().await;
+            let outcome = executor.execute(actions).await;
+            publish(Event::Outcome(outcome)).await;
+        });
+    }
+}
+```
