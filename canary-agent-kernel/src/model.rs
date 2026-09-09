@@ -39,6 +39,14 @@ pub struct ModelFunctionCall {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelStreamEvent {
-    AssistantDelta { text: String },
-    TokenUsage { usage: TokenUsage },
+    /// One provider chunk containing nonempty text or tool-call output.
+    /// Emit before presentation events, once per chunk (not once per token).
+    /// Excludes role-only, usage-only, and termination chunks.
+    OutputProgress,
+    AssistantDelta {
+        text: String,
+    },
+    TokenUsage {
+        usage: TokenUsage,
+    },
 }

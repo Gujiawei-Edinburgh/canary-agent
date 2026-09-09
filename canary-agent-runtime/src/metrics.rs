@@ -80,6 +80,17 @@ pub enum RuntimeMetric {
     TimeToFirstToken {
         duration: Duration,
     },
+    /// Approximate client-observed output speed, excluding time to first output
+    /// and trailing usage/termination latency. Uses provider-reported tokens.
+    ModelStreamingThroughput {
+        output_tokens: u64,
+        streaming_duration: Duration,
+    },
+    /// Emitted live for each output chunk after the first in a model request.
+    /// Measures delivery gaps, not token throughput; no token usage is required.
+    ModelInterChunkLatency {
+        duration: Duration,
+    },
     TokenUsage {
         input_tokens: u64,
         cached_input_tokens: u64,

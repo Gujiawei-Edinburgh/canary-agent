@@ -43,6 +43,32 @@ mod tests {
         assert!(output.contains("canary_agent_turns_total"));
         assert!(output.contains("canary_agent_tokens_total"));
         assert!(output.contains("service=\"checkout\""));
+        recorder.record(RuntimeMetric::ModelStreamingThroughput {
+            output_tokens: 400,
+            streaming_duration: std::time::Duration::from_secs(2),
+        });
+        recorder.record(RuntimeMetric::ModelStreamingThroughput {
+            output_tokens: 400,
+            streaming_duration: std::time::Duration::ZERO,
+        });
+        for millis in [0, 20, 30] {
+            recorder.record(RuntimeMetric::ModelInterChunkLatency {
+                duration: std::time::Duration::from_millis(millis),
+            });
+        }
+        let output = recorder.encode().expect("metrics encoding");
+        assert!(output.contains(
+            "canary_agent_model_streaming_output_tokens_per_second_sum{service=\"checkout\"} 200"
+        ));
+        assert!(output.contains(
+            "canary_agent_model_streaming_output_tokens_per_second_count{service=\"checkout\"} 1"
+        ));
+        assert!(output.contains(
+            "canary_agent_model_inter_chunk_latency_seconds_count{service=\"checkout\"} 3"
+        ));
+        assert!(output.contains(
+            "canary_agent_model_inter_chunk_latency_seconds_sum{service=\"checkout\"} 0.05"
+        ));
     }
 
     #[tokio::test]

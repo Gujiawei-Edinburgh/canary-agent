@@ -872,7 +872,6 @@ impl Agent {
         }));
         let mut turn_token_usage = TokenUsage::default();
         let mut function_call_count = 0;
-        let mut first_token_recorded = false;
         let limits = self.config.turn_execution_limits;
 
         let outcome = 'turn_loop: {
@@ -905,26 +904,41 @@ impl Agent {
                 on_event(TurnStreamEvent::Model(TurnModelEvent::RequestStarted {
                     iteration,
                 }));
+                let model_started = Instant::now();
+                let mut first_token_recorded = false;
+                let mut first_output = None;
+                let mut last_output = None;
+                let mut request_output_tokens = 0;
                 let mut model_event_handler = |event| match event {
-                    ModelStreamEvent::AssistantDelta { text } => {
+                    ModelStreamEvent::OutputProgress => {
+                        let now = Instant::now();
+                        first_output.get_or_insert(now);
+                        if let Some(previous) = last_output {
+                            self.record_metric(RuntimeMetric::ModelInterChunkLatency {
+                                duration: now.duration_since(previous),
+                            });
+                        }
+                        last_output = Some(now);
                         if !first_token_recorded {
                             first_token_recorded = true;
                             self.record_metric(RuntimeMetric::TimeToFirstToken {
-                                duration: turn_started.elapsed(),
+                                duration: now.duration_since(model_started),
                             });
                         }
+                    }
+                    ModelStreamEvent::AssistantDelta { text } => {
                         on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
                             text,
                         }));
                     }
                     ModelStreamEvent::TokenUsage { usage } => {
+                        request_output_tokens = usage.output_tokens;
                         turn_token_usage.add_assign(usage);
                     }
                 };
                 let model_call = self
                     .model_client
                     .stream_complete(request, &mut model_event_handler);
-                let model_started = Instant::now();
                 let response = self
                     .await_step_or_abort(
                         model_call,
@@ -943,6 +957,17 @@ impl Agent {
                     },
                     duration: model_started.elapsed(),
                 });
+                if matches!(&response, Some(Ok(_))) && request_output_tokens > 0 {
+                    if let (Some(first), Some(last)) = (first_output, last_output) {
+                        let streaming_duration = last.duration_since(first);
+                        if !streaming_duration.is_zero() {
+                            self.record_metric(RuntimeMetric::ModelStreamingThroughput {
+                                output_tokens: request_output_tokens,
+                                streaming_duration,
+                            });
+                        }
+                    }
+                }
                 let Some(response) = response else {
                     break 'turn_loop TurnOutcome::Aborted {
                         reason: "turn aborted by caller".to_string(),
@@ -2736,6 +2761,137 @@ mod tests {
             event,
             TurnStreamEvent::State(TurnStateEvent::TurnFinished { .. })
         )));
+    }
+
+    #[tokio::test]
+    async fn streaming_metrics_use_output_interval_and_require_usage() {
+        use crate::{MetricsRecorder, RuntimeMetric};
+        use std::time::Duration;
+
+        #[derive(Clone, Default)]
+        struct Recorder(Arc<Mutex<Vec<RuntimeMetric>>>);
+        impl MetricsRecorder for Recorder {
+            fn record(&self, metric: RuntimeMetric) {
+                self.0.lock().unwrap().push(metric);
+            }
+        }
+        struct StreamingModel {
+            chunks: usize,
+            usage: bool,
+            fail: bool,
+        }
+        impl ModelClient for StreamingModel {
+            fn model_descriptor(&self) -> ModelDescriptor {
+                ModelDescriptor {
+                    fqn: "test/streaming".into(),
+                    settings: json!({}),
+                }
+            }
+            fn stream_complete<'a>(
+                &'a self,
+                _request: ModelRequest,
+                emit: &'a mut ModelStreamHandler<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    for _ in 0..self.chunks {
+                        // Progress without text also represents tool-only output.
+                        emit(ModelStreamEvent::OutputProgress);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    if self.usage {
+                        emit(ModelStreamEvent::TokenUsage {
+                            usage: TokenUsage {
+                                output_tokens: 400,
+                                total_tokens: 400,
+                                ..TokenUsage::default()
+                            },
+                        });
+                    }
+                    if self.fail {
+                        return Err(AgentError::Model("stream failed".into()));
+                    }
+                    Ok(ModelResponse::AssistantMessage {
+                        text: "done".into(),
+                    })
+                })
+            }
+        }
+        for (chunks, usage, fail, expected) in [
+            (2, true, false, 1),
+            (1, true, false, 0),
+            (2, false, false, 0),
+            (2, true, true, 0),
+        ] {
+            let recorder = Recorder::default();
+            let agent = Agent::new(
+                AgentConfig::default(),
+                Arc::new(TestStore::default()),
+                Arc::new(StreamingModel {
+                    chunks,
+                    usage,
+                    fail,
+                }),
+                test_registry(),
+                Arc::new(crate::LocalSessionCoordinator::default()),
+            )
+            .with_metrics_recorder(recorder.clone());
+            agent
+                .run_turn("streaming", "hello", json!({}), |_| {})
+                .await
+                .unwrap();
+            let metrics = recorder.0.lock().unwrap();
+            let speeds: Vec<_> = metrics
+                .iter()
+                .filter_map(|metric| match metric {
+                    RuntimeMetric::ModelStreamingThroughput {
+                        output_tokens,
+                        streaming_duration,
+                    } => {
+                        assert_eq!(*output_tokens, 400);
+                        Some(*streaming_duration)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(speeds.len(), expected);
+            let gaps: Vec<_> = metrics
+                .iter()
+                .filter_map(|metric| match metric {
+                    RuntimeMetric::ModelInterChunkLatency { duration } => Some(*duration),
+                    _ => None,
+                })
+                .collect();
+            // Gaps remain observable without usage and even if the stream fails.
+            assert_eq!(gaps.len(), chunks.saturating_sub(1));
+            let request_finished = metrics
+                .iter()
+                .position(|metric| matches!(metric, RuntimeMetric::ModelRequestFinished { .. }))
+                .unwrap();
+            assert!(metrics.iter().enumerate().all(|(index, metric)| {
+                !matches!(metric, RuntimeMetric::ModelInterChunkLatency { .. })
+                    || index < request_finished
+            }));
+            let request_duration = metrics
+                .iter()
+                .find_map(|metric| match metric {
+                    RuntimeMetric::ModelRequestFinished { duration, .. } => Some(*duration),
+                    _ => None,
+                })
+                .unwrap();
+            let ttft = metrics
+                .iter()
+                .find_map(|metric| match metric {
+                    RuntimeMetric::TimeToFirstToken { duration } => Some(*duration),
+                    _ => None,
+                })
+                .unwrap();
+            for speed_duration in speeds {
+                assert_eq!(gaps.iter().copied().sum::<Duration>(), speed_duration);
+                assert!(request_duration >= ttft + speed_duration + Duration::from_millis(40));
+            }
+        }
     }
 
     #[tokio::test]

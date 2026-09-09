@@ -10,6 +10,8 @@ pub struct PromRecorder {
     turn_latency: HistogramVec,
     function_calls_per_turn: HistogramVec,
     ttft: HistogramVec,
+    streaming_throughput: HistogramVec,
+    inter_chunk_latency: HistogramVec,
     model_requests: HistogramVec,
     function_calls: HistogramVec,
     function_calls_skipped: IntCounterVec,
@@ -50,8 +52,28 @@ impl PromRecorder {
         let ttft = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "canary_agent_time_to_first_token_seconds",
-                "Time to first streamed token",
+                "Time from each model request start to first nonempty output chunk",
             )
+            .const_labels(labels.clone()),
+            &[],
+        )?;
+        let streaming_throughput = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "canary_agent_model_streaming_output_tokens_per_second",
+                "Approximate provider output tokens per second between first and last output chunks",
+            )
+            .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0])
+            .const_labels(labels.clone()),
+            &[],
+        )?;
+        let inter_chunk_latency = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "canary_agent_model_inter_chunk_latency_seconds",
+                "Client-observed time between consecutive output chunks, recorded during streaming",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ])
             .const_labels(labels.clone()),
             &[],
         )?;
@@ -88,6 +110,8 @@ impl PromRecorder {
         registry.register(Box::new(turn_latency.clone()))?;
         registry.register(Box::new(function_calls_per_turn.clone()))?;
         registry.register(Box::new(ttft.clone()))?;
+        registry.register(Box::new(streaming_throughput.clone()))?;
+        registry.register(Box::new(inter_chunk_latency.clone()))?;
         registry.register(Box::new(model_requests.clone()))?;
         registry.register(Box::new(function_calls.clone()))?;
         registry.register(Box::new(function_calls_skipped.clone()))?;
@@ -98,6 +122,8 @@ impl PromRecorder {
             turn_latency,
             function_calls_per_turn,
             ttft,
+            streaming_throughput,
+            inter_chunk_latency,
             model_requests,
             function_calls,
             function_calls_skipped,
@@ -162,6 +188,21 @@ impl MetricsRecorder for PromRecorder {
                 self.ttft
                     .with_label_values(&[])
                     .observe(duration.as_secs_f64());
+            }
+            RuntimeMetric::ModelInterChunkLatency { duration } => {
+                self.inter_chunk_latency
+                    .with_label_values(&[])
+                    .observe(duration.as_secs_f64());
+            }
+            RuntimeMetric::ModelStreamingThroughput {
+                output_tokens,
+                streaming_duration,
+            } => {
+                if output_tokens > 0 && !streaming_duration.is_zero() {
+                    self.streaming_throughput
+                        .with_label_values(&[])
+                        .observe(output_tokens as f64 / streaming_duration.as_secs_f64());
+                }
             }
             RuntimeMetric::TokenUsage {
                 input_tokens,

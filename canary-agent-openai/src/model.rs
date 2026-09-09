@@ -424,6 +424,28 @@ fn handle_sse_frame(
                 error.message
             )));
         }
+        let has_output = event.choices.iter().any(|choice| {
+            choice
+                .delta
+                .content
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+                || choice.delta.tool_calls.as_ref().is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.id.as_ref().is_some_and(|id| !id.is_empty())
+                            || call.function.as_ref().is_some_and(|function| {
+                                function.name.as_ref().is_some_and(|name| !name.is_empty())
+                                    || function
+                                        .arguments
+                                        .as_ref()
+                                        .is_some_and(|args| !args.is_empty())
+                            })
+                    })
+                })
+        });
+        if has_output {
+            on_event(ModelStreamEvent::OutputProgress);
+        }
         if let Some(usage) = event.usage.and_then(OpenAiUsage::into_token_usage) {
             on_event(ModelStreamEvent::TokenUsage { usage });
         }
@@ -620,7 +642,9 @@ data: [DONE]
         .expect("frame");
 
         assert_eq!(text, "hello");
-        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas.len(), 4);
+        assert!(matches!(deltas[0], ModelStreamEvent::OutputProgress));
+        assert!(matches!(deltas[2], ModelStreamEvent::OutputProgress));
         assert!(calls.is_empty());
     }
 
@@ -635,6 +659,33 @@ data: [DONE]
         assert!(error.to_string().contains("provider error"));
         assert!(text.is_empty());
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn output_progress_includes_tools_and_ignores_empty_chunks() {
+        let mut text = String::new();
+        let mut calls = BTreeMap::new();
+        let mut events = Vec::new();
+        for delta in [
+            json!({"role": "assistant", "content": ""}),
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": ""}}]}),
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}),
+            json!({"content": "done", "tool_calls": [{"index": 0, "function": {"name": "test"}}]}),
+            json!({}),
+        ] {
+            let frame = format!("data: {}", json!({"choices": [{"delta": delta}]}));
+            handle_sse_frame(&frame, &mut text, &mut calls, &mut |event| {
+                events.push(event)
+            })
+            .expect("frame");
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ModelStreamEvent::OutputProgress))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -708,6 +759,6 @@ data: [DONE]
 
         assert!(buffer.is_empty());
         assert_eq!(text, "你好");
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
     }
 }
