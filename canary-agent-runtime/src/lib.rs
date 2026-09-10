@@ -29,8 +29,8 @@ pub use metrics::{
     NoopMetricsRecorder, RuntimeMetric,
 };
 pub use model::{
-    FunctionSpec, ModelClient, ModelDescriptor, ModelFunctionCall, ModelRequest, ModelResponse,
-    ModelStreamEvent,
+    FunctionSpec, ModelClient, ModelContinuation, ModelDescriptor, ModelFunctionCall, ModelRequest,
+    ModelResponse, ModelStreamEvent,
 };
 pub use session::{LeaseFence, LocalSessionCoordinator, SessionCoordinator, SessionLease};
 pub use store::{ThreadContextCache, ThreadStore};

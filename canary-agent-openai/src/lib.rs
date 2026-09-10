@@ -1,3 +1,8 @@
-mod model;
+mod chat_completions;
+mod config;
+mod responses;
+mod transport;
 
-pub use model::{ChatCompletionsClient, ModelConfig, RetryConfig};
+pub use chat_completions::ChatCompletionsClient;
+pub use config::{ModelConfig, RetryConfig};
+pub use responses::ResponsesClient;

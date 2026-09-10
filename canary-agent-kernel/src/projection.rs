@@ -26,6 +26,8 @@ pub enum ChatMessage {
         content: String,
     },
     Assistant {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<crate::model::ModelContinuation>,
         content: Option<String>,
         tool_calls: Vec<ModelFunctionCall>,
     },
@@ -80,6 +82,7 @@ impl ThreadProjection {
                         }
                     }
                     TurnItemKind::ModelResponse {
+                        continuation,
                         text,
                         function_calls,
                     } => {
@@ -87,6 +90,7 @@ impl ThreadProjection {
                             projection.last_assistant_message = Some(text.clone());
                         }
                         projection.conversation.push(ChatMessage::Assistant {
+                            continuation: continuation.clone(),
                             content: text.clone(),
                             tool_calls: function_calls.clone(),
                         });
@@ -232,6 +236,7 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: None,
                 text: None,
                 function_calls: vec![ModelFunctionCall {
                     call_id: "call_1".to_string(),
@@ -272,6 +277,7 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: None,
                 text: None,
                 function_calls: vec![ModelFunctionCall {
                     call_id: "call_1".to_string(),
@@ -307,6 +313,7 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: None,
                 text: None,
                 function_calls: ["call_1", "call_2"]
                     .into_iter()

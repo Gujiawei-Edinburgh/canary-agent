@@ -985,10 +985,12 @@ impl Agent {
 
                 let response = match response {
                     ModelResponse::AssistantMessage { text } => ModelResponse::Assistant {
+                        continuation: None,
                         text: Some(text),
                         function_calls: Vec::new(),
                     },
                     ModelResponse::FunctionCalls { calls } => ModelResponse::Assistant {
+                        continuation: None,
                         text: None,
                         function_calls: calls,
                     },
@@ -996,6 +998,7 @@ impl Agent {
                 };
                 match response {
                     ModelResponse::Assistant {
+                        continuation,
                         text,
                         function_calls,
                     } => {
@@ -1020,6 +1023,7 @@ impl Agent {
                             vec![TurnItem::new(
                                 TurnItemSource::Model,
                                 TurnItemKind::ModelResponse {
+                                    continuation,
                                     text: text.clone(),
                                     function_calls: function_calls.clone(),
                                 },
@@ -2594,6 +2598,7 @@ mod tests {
         let agent = agent_with(
             store.clone(),
             vec![ModelResponse::Assistant {
+                continuation: None,
                 text: None,
                 function_calls: Vec::new(),
             }],
@@ -2613,10 +2618,15 @@ mod tests {
     #[tokio::test]
     async fn persists_assistant_text_when_response_also_requests_tools() {
         let store = Arc::new(TestStore::default());
+        let continuation = crate::ModelContinuation {
+            format: "test.v1".into(),
+            payload: json!([{"type": "reasoning", "encrypted_content": "opaque"}]),
+        };
         let agent = agent_with(
             store.clone(),
             vec![
                 ModelResponse::Assistant {
+                    continuation: Some(continuation.clone()),
                     text: Some("I will check the goal first.".to_string()),
                     function_calls: vec![ModelFunctionCall {
                         call_id: "c1".to_string(),
@@ -2625,6 +2635,7 @@ mod tests {
                     }],
                 },
                 ModelResponse::Assistant {
+                    continuation: None,
                     text: Some("The goal is not set.".to_string()),
                     function_calls: Vec::new(),
                 },
@@ -2645,6 +2656,14 @@ mod tests {
             .await
             .expect("turn");
         let thread = store.load("t").await.expect("thread");
+        assert!(ThreadProjection::from_thread(&thread)
+            .conversation
+            .iter()
+            .any(|message| {
+                matches!(message, canary_agent_kernel::ChatMessage::Assistant {
+                continuation: Some(value), ..
+            } if value == &continuation)
+            }));
         let messages = thread.turns[0]
             .items
             .iter()
@@ -3406,6 +3425,7 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: None,
                 text: None,
                 function_calls: vec![ModelFunctionCall {
                     call_id: "c1".to_string(),
@@ -3467,6 +3487,7 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: None,
                 text: None,
                 function_calls: vec![ModelFunctionCall {
                     call_id: "c1".to_string(),
@@ -3519,6 +3540,7 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: None,
                 text: None,
                 function_calls: vec![ModelFunctionCall {
                     call_id: "c1".to_string(),

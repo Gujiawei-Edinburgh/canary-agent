@@ -8,6 +8,9 @@ pub use events::{
     TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemId, TurnItemKind, TurnItemSource,
     TurnStatus,
 };
-pub use model::{FunctionSpec, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent};
+pub use model::{
+    FunctionSpec, ModelContinuation, ModelFunctionCall, ModelRequest, ModelResponse,
+    ModelStreamEvent,
+};
 pub use projection::{ChatMessage, CompletedFunctionCall, PendingSuspension, ThreadProjection};
 pub use revision::RevisionToken;

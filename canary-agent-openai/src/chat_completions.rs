@@ -1,3 +1,7 @@
+use crate::config::{ModelConfig, RetryConfig};
+#[cfg(test)]
+use crate::transport::is_retryable_status;
+use crate::transport::{find_sse_frame_end, send_with_retries};
 use canary_agent_kernel::events::TokenUsage;
 use canary_agent_kernel::projection::ChatMessage;
 use canary_agent_kernel::{
@@ -10,38 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
-
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    pub max_retries: usize,
-    pub initial_backoff: Duration,
-    pub max_backoff: Duration,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            initial_backoff: Duration::from_millis(250),
-            max_backoff: Duration::from_secs(4),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub reasoning_effort: String,
-}
-
-impl ModelConfig {
-    pub fn default_reasoning_effort() -> String {
-        "medium".to_string()
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ChatCompletionsClient {
@@ -62,69 +34,6 @@ impl ChatCompletionsClient {
     pub fn with_retry_config(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
         self
-    }
-
-    async fn send_with_retries(
-        &self,
-        url: &str,
-        body: &OpenAiChatRequest,
-    ) -> Result<reqwest::Response> {
-        for retry_index in 0..=self.retry.max_retries {
-            let response = self
-                .http
-                .post(url)
-                .bearer_auth(&self.config.api_key)
-                .json(body)
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) => {
-                    let status = response.status();
-                    let raw = response
-                        .text()
-                        .await
-                        .map_err(|error| AgentError::Http(error.to_string()))?;
-                    if retry_index == self.retry.max_retries || !is_retryable_status(status) {
-                        return Err(AgentError::Http(format!(
-                            "HTTP status {status} for streamed chat/completions: {raw}"
-                        )));
-                    }
-                    self.wait_before_retry(retry_index).await;
-                    tracing::warn!(
-                        status = %status,
-                        retry = retry_index + 1,
-                        max_retries = self.retry.max_retries,
-                        "retrying chat/completions request"
-                    );
-                }
-                Err(error) => {
-                    let retryable = error.is_connect() || error.is_timeout();
-                    if retry_index == self.retry.max_retries || !retryable {
-                        return Err(AgentError::Http(error.to_string()));
-                    }
-                    self.wait_before_retry(retry_index).await;
-                    tracing::warn!(
-                        error = %error,
-                        retry = retry_index + 1,
-                        max_retries = self.retry.max_retries,
-                        "retrying chat/completions request"
-                    );
-                }
-            }
-        }
-        unreachable!("retry loop always returns a response or error")
-    }
-
-    async fn wait_before_retry(&self, retry_index: usize) {
-        let multiplier = 2u32.saturating_pow(retry_index.min(31) as u32);
-        let delay = self
-            .retry
-            .initial_backoff
-            .checked_mul(multiplier)
-            .unwrap_or(self.retry.max_backoff)
-            .min(self.retry.max_backoff);
-        tokio::time::sleep(delay).await;
     }
 }
 
@@ -154,7 +63,8 @@ impl ModelClient for ChatCompletionsClient {
                 request,
                 true,
             );
-            let response = self.send_with_retries(&url, &body).await?;
+            let response =
+                send_with_retries(&self.http, &self.config, &self.retry, &url, &body).await?;
 
             let mut stream = response.bytes_stream();
             let mut buffer = Vec::new();
@@ -179,15 +89,12 @@ impl ModelClient for ChatCompletionsClient {
                 .map(PartialToolCall::finish)
                 .collect::<Result<Vec<_>>>()?;
             Ok(ModelResponse::Assistant {
+                continuation: None,
                 text: (!assistant_text.is_empty()).then_some(assistant_text),
                 function_calls: calls,
             })
         })
     }
-}
-
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 425 | 429 | 500..=599)
 }
 
 #[derive(Debug, Serialize)]
@@ -275,6 +182,7 @@ impl From<ChatMessage> for OpenAiMessage {
             ChatMessage::Assistant {
                 content,
                 tool_calls,
+                ..
             } => Self {
                 role: "assistant",
                 content,
@@ -389,18 +297,6 @@ fn consume_sse_frames(
         buffer.drain(..frame_end + delimiter_len);
     }
     Ok(())
-}
-
-fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len() {
-        if buffer.get(index..index + 2) == Some(b"\n\n") {
-            return Some((index, 2));
-        }
-        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-    }
-    None
 }
 
 fn handle_sse_frame(
@@ -570,6 +466,7 @@ mod tests {
         let request = ModelRequest {
             messages: vec![
                 ChatMessage::Assistant {
+                    continuation: None,
                     content: None,
                     tool_calls: vec![ModelFunctionCall {
                         call_id: "call_1".to_string(),

@@ -177,6 +177,8 @@ pub enum TurnItemKind {
         response_to: Option<String>,
     },
     ModelResponse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuation: Option<crate::model::ModelContinuation>,
         text: Option<String>,
         function_calls: Vec<ModelFunctionCall>,
     },

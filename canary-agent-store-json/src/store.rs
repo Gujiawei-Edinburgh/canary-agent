@@ -247,6 +247,10 @@ mod tests {
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
+                continuation: Some(canary_agent_kernel::ModelContinuation {
+                    format: "openai.responses.v1".into(),
+                    payload: serde_json::json!([{"type": "reasoning", "encrypted_content": "opaque"}]),
+                }),
                 text: Some("hello".to_string()),
                 function_calls: Vec::new(),
             },
@@ -264,6 +268,11 @@ mod tests {
             .expect("commit");
 
         let thread = store.load("t1").await.expect("load");
+        assert!(matches!(
+            &thread.turns[0].items[0].kind,
+            TurnItemKind::ModelResponse { continuation: Some(value), .. }
+                if value.payload[0]["encrypted_content"] == "opaque"
+        ));
         assert_eq!(thread.id, "t1");
         assert_eq!(thread.turns.len(), 1);
         assert_eq!(thread.turns[0].id, turn_id);

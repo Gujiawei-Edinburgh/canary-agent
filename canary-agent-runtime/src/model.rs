@@ -3,7 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub use canary_agent_kernel::model::{
-    FunctionSpec, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
+    FunctionSpec, ModelContinuation, ModelFunctionCall, ModelRequest, ModelResponse,
+    ModelStreamEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
