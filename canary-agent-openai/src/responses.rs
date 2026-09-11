@@ -39,6 +39,7 @@ pub struct ResponsesClient {
     config: ModelConfig,
     retry: RetryConfig,
     stream_idle_timeout: Duration,
+    error_event_capture_bytes: usize,
 }
 
 impl ResponsesClient {
@@ -48,6 +49,7 @@ impl ResponsesClient {
             config,
             retry: RetryConfig::default(),
             stream_idle_timeout: Duration::from_secs(300),
+            error_event_capture_bytes: 0,
         }
     }
 
@@ -59,6 +61,19 @@ impl ResponsesClient {
     /// Maximum wait for the next complete SSE event (including lifecycle events).
     pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
         self.stream_idle_timeout = timeout;
+        self
+    }
+
+    /// Capture the most recent SSE data payloads and log them at ERROR on stream failure.
+    /// Disabled by default; zero disables capture. The byte limit applies per request.
+    /// Captures are discarded on success or cancellation. Oversized captures retain
+    /// a UTF-8-safe suffix, which may start inside an event or JSON value.
+    ///
+    /// WARNING: payloads are not redacted and can contain sensitive model output,
+    /// tool arguments, and continuation data. Enable only with trusted log storage.
+    /// This captures complete SSE data events, not HTTP headers or partial wire frames.
+    pub fn with_error_event_capture(mut self, max_bytes: usize) -> Self {
+        self.error_event_capture_bytes = max_bytes;
         self
     }
 }
@@ -84,7 +99,13 @@ impl ModelClient for ResponsesClient {
             let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
             let response =
                 send_with_retries(&self.http, &self.config, &self.retry, &url, &body).await?;
-            read_response_stream(response.bytes_stream(), self.stream_idle_timeout, on_event).await
+            read_response_stream(
+                response.bytes_stream(),
+                self.stream_idle_timeout,
+                self.error_event_capture_bytes,
+                on_event,
+            )
+            .await
         })
     }
 }
@@ -94,6 +115,7 @@ impl ModelClient for ResponsesClient {
 async fn read_response_stream<S, B, E>(
     stream: S,
     idle_timeout: Duration,
+    capture_bytes: usize,
     emit: &mut ModelStreamHandler<'_>,
 ) -> Result<ModelResponse>
 where
@@ -104,23 +126,93 @@ where
     let stream = stream.eventsource();
     futures_util::pin_mut!(stream);
     let mut decoder = ResponseDecoder::default();
-    loop {
-        let next = tokio::time::timeout(idle_timeout, stream.next())
-            .await
-            .map_err(|_| {
-                AgentError::Model("idle timeout waiting for Responses SSE event".into())
-            })?;
-        match next {
-            Some(Ok(event)) => {
-                decoder.data(&event.data, emit)?;
-                if let Some(response) = decoder.completed.take() {
-                    return Ok(response);
+    let mut capture = EventCapture::new(capture_bytes);
+    let result = async {
+        loop {
+            let next = tokio::time::timeout(idle_timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    AgentError::Model("idle timeout waiting for Responses SSE event".into())
+                })?;
+            match next {
+                Some(Ok(event)) => {
+                    capture.push(&event.data);
+                    decoder.data(&event.data, emit)?;
+                    if let Some(response) = decoder.completed.take() {
+                        return Ok(response);
+                    }
                 }
+                Some(Err(error)) => {
+                    return Err(AgentError::Model(format!("Responses SSE error: {error}")))
+                }
+                None => return decoder.finish(),
             }
-            Some(Err(error)) => {
-                return Err(AgentError::Model(format!("Responses SSE error: {error}")))
+        }
+    }
+    .await;
+    if let Err(error) = &result {
+        if capture_bytes > 0 {
+            tracing::error!(
+                error = %error,
+                sse_events_seen = capture.events,
+                sse_capture_truncated = capture.truncated,
+                sse_capture_limit_bytes = capture_bytes,
+                sse_data_tail = %capture.tail,
+                "Responses stream failed; captured SSE data (potentially sensitive)"
+            );
+        }
+    }
+    result
+}
+
+// A bounded tail rather than a list: even millions of tiny events cannot create
+// unbounded per-event allocation overhead. Separators count against the limit.
+struct EventCapture {
+    limit: usize,
+    tail: String,
+    events: u64,
+    truncated: bool,
+}
+
+impl EventCapture {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            tail: String::new(),
+            events: 0,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, data: &str) {
+        if self.limit == 0 {
+            return;
+        }
+        self.events = self.events.saturating_add(1);
+        self.append(data);
+        self.append("\n\n");
+    }
+
+    fn append(&mut self, data: &str) {
+        if data.len() >= self.limit {
+            self.truncated |= !self.tail.is_empty() || data.len() > self.limit;
+            self.tail.clear();
+            let mut start = data.len() - self.limit;
+            while !data.is_char_boundary(start) {
+                start += 1;
             }
-            None => return decoder.finish(),
+            self.tail.push_str(&data[start..]);
+        } else {
+            let remove = self.tail.len().saturating_sub(self.limit - data.len());
+            if remove > 0 {
+                self.truncated = true;
+                let mut end = remove;
+                while !self.tail.is_char_boundary(end) {
+                    end += 1;
+                }
+                self.tail.drain(..end);
+            }
+            self.tail.push_str(data);
         }
     }
 }
@@ -521,6 +613,34 @@ fn completed_response(response: &Value) -> Result<ModelResponse> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn event_capture_is_disabled_by_default_and_bounded() {
+        let mut disabled = super::EventCapture::new(0);
+        disabled.push("secret");
+        assert!(disabled.tail.is_empty());
+        assert_eq!(disabled.events, 0);
+
+        let mut capture = super::EventCapture::new(12);
+        capture.push("first");
+        assert_eq!(capture.tail, "first\n\n");
+        assert!(!capture.truncated);
+        capture.push("second");
+        assert_eq!(capture.tail, "st\n\nsecond\n\n");
+        assert!(capture.truncated);
+        assert_eq!(capture.events, 2);
+        for _ in 0..1000 {
+            capture.push("😀中文😀中文😀");
+            assert!(capture.tail.len() <= 12);
+            assert!(capture.tail.ends_with("\n\n"));
+        }
+        for limit in 1..8 {
+            let mut capture = super::EventCapture::new(limit);
+            capture.push("😀中文😀");
+            assert!(capture.tail.len() <= limit);
+            assert!(capture.truncated);
+        }
+    }
+
     use super::*;
 
     fn config() -> ModelConfig {
@@ -675,9 +795,11 @@ mod tests {
                 .bytes()
                 .map(|byte| Ok::<_, std::io::Error>(vec![byte])),
         );
-        read_response_stream(stream, Duration::from_secs(1), &mut |e| emitted.push(e))
-            .await
-            .unwrap();
+        read_response_stream(stream, Duration::from_secs(1), 1024, &mut |e| {
+            emitted.push(e)
+        })
+        .await
+        .unwrap();
         assert_eq!(
             emitted
                 .iter()
@@ -880,7 +1002,7 @@ mod tests {
             })
         ));
         let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(frames.into_bytes())]);
-        let result = read_response_stream(stream, Duration::from_secs(1), &mut |_| {})
+        let result = read_response_stream(stream, Duration::from_secs(1), 1024, &mut |_| {})
             .await
             .unwrap();
         assert!(matches!(result, ModelResponse::Assistant {
@@ -892,7 +1014,7 @@ mod tests {
     async fn stream_idle_timeout_and_early_close() {
         let pending =
             futures_util::stream::pending::<std::result::Result<Vec<u8>, std::io::Error>>();
-        let error = read_response_stream(pending, Duration::from_millis(10), &mut |_| {})
+        let error = read_response_stream(pending, Duration::from_millis(10), 1024, &mut |_| {})
             .await
             .unwrap_err()
             .to_string();
@@ -909,7 +1031,7 @@ mod tests {
             let stream =
                 futures_util::stream::iter([Ok::<_, std::io::Error>(payload.into_bytes())]);
             assert!(
-                read_response_stream(stream, Duration::from_secs(1), &mut |_| {})
+                read_response_stream(stream, Duration::from_secs(1), 1024, &mut |_| {})
                     .await
                     .is_err()
             );
@@ -921,7 +1043,7 @@ mod tests {
         let malformed =
             futures_util::stream::iter([Ok::<_, std::io::Error>(b"data: {\n\n".to_vec())]);
         assert!(
-            read_response_stream(malformed, Duration::from_secs(1), &mut |_| {})
+            read_response_stream(malformed, Duration::from_secs(1), 1024, &mut |_| {})
                 .await
                 .is_err()
         );
@@ -929,7 +1051,7 @@ mod tests {
             "broken connection",
         ))]);
         assert!(
-            read_response_stream(broken, Duration::from_secs(1), &mut |_| {})
+            read_response_stream(broken, Duration::from_secs(1), 1024, &mut |_| {})
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1009,7 +1131,7 @@ mod tests {
         config.base_url = format!("http://{address}/v1");
         let client = ResponsesClient::new(config);
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            Duration::from_secs(5),
             client.stream_complete(
                 ModelRequest {
                     messages: vec![],
