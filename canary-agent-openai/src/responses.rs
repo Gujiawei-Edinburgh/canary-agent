@@ -1,17 +1,35 @@
+// Portions adapted from OpenAI Codex (Apache-2.0), commit fc948f8c47.
+// Copyright 2025 OpenAI. See third_party/codex/NOTICE and LICENSE.
+// Adaptations: Canary callbacks/metrics, local continuation persistence,
+// completed-only provider fallback, and fail-closed malformed-event handling.
 use crate::config::{ModelConfig, RetryConfig};
-use crate::transport::{find_sse_frame_end, send_with_retries};
+use crate::transport::send_with_retries;
 use canary_agent_kernel::{
     ChatMessage, ModelContinuation, ModelFunctionCall, ModelRequest, ModelResponse,
     ModelStreamEvent, TokenUsage,
 };
 use canary_agent_runtime::model::{ModelClient, ModelDescriptor, ModelStreamHandler};
 use canary_agent_runtime::{AgentError, Result};
-use futures_util::StreamExt;
+use eventsource_stream::Eventsource;
+use futures_util::{Stream, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 const CONTINUATION_FORMAT: &str = "openai.responses.v1";
+const OUTPUT_TEXT_DELTA: &str = "response.output_text.delta";
+const REFUSAL_DELTA: &str = "response.refusal.delta";
+const FUNCTION_ARGUMENTS_DELTA: &str = "response.function_call_arguments.delta";
+const FUNCTION_ARGUMENTS_DONE: &str = "response.function_call_arguments.done";
+const OUTPUT_ITEM_ADDED: &str = "response.output_item.added";
+const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
+const RESPONSE_COMPLETED: &str = "response.completed";
+const RESPONSE_FAILED: &str = "response.failed";
+const RESPONSE_INCOMPLETE: &str = "response.incomplete";
+const ERROR: &str = "error";
 
 /// Stateless Responses API client. Continuation items travel through model history,
 /// rather than an in-memory cache or a server-side conversation.
@@ -20,6 +38,7 @@ pub struct ResponsesClient {
     http: reqwest::Client,
     config: ModelConfig,
     retry: RetryConfig,
+    stream_idle_timeout: Duration,
 }
 
 impl ResponsesClient {
@@ -28,11 +47,18 @@ impl ResponsesClient {
             http: reqwest::Client::new(),
             config,
             retry: RetryConfig::default(),
+            stream_idle_timeout: Duration::from_secs(300),
         }
     }
 
     pub fn with_retry_config(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Maximum wait for the next complete SSE event (including lifecycle events).
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
         self
     }
 }
@@ -58,25 +84,61 @@ impl ModelClient for ResponsesClient {
             let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
             let response =
                 send_with_retries(&self.http, &self.config, &self.retry, &url, &body).await?;
-            let mut stream = response.bytes_stream();
-            let mut buffer = Vec::new();
-            let mut decoder = ResponseDecoder::default();
-            while let Some(chunk) = stream.next().await {
-                buffer.extend_from_slice(&chunk.map_err(|e| AgentError::Http(e.to_string()))?);
-                decoder.consume(&mut buffer, on_event)?;
+            read_response_stream(response.bytes_stream(), self.stream_idle_timeout, on_event).await
+        })
+    }
+}
+
+// Port of Codex process_sse's eventsource/timeout/completion loop. The owning
+// request future provides cancellation; no detached task or Codex channel is needed.
+async fn read_response_stream<S, B, E>(
+    stream: S,
+    idle_timeout: Duration,
+    emit: &mut ModelStreamHandler<'_>,
+) -> Result<ModelResponse>
+where
+    S: Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let stream = stream.eventsource();
+    futures_util::pin_mut!(stream);
+    let mut decoder = ResponseDecoder::default();
+    loop {
+        let next = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                AgentError::Model("idle timeout waiting for Responses SSE event".into())
+            })?;
+        match next {
+            Some(Ok(event)) => {
+                decoder.data(&event.data, emit)?;
                 if let Some(response) = decoder.completed.take() {
                     return Ok(response);
                 }
             }
-            // EOF is not success: a terminal response.completed event is required.
-            if !buffer.iter().all(u8::is_ascii_whitespace) {
-                let frame = std::str::from_utf8(&buffer)
-                    .map_err(|e| AgentError::Model(format!("invalid Responses SSE UTF-8: {e}")))?;
-                decoder.frame(frame, on_event)?;
+            Some(Err(error)) => {
+                return Err(AgentError::Model(format!("Responses SSE error: {error}")))
             }
-            decoder.finish()
-        })
+            None => return decoder.finish(),
+        }
     }
+}
+
+// Adapted subset of Codex ResponsesStreamEvent. Provider output items remain
+// opaque so encrypted reasoning and additional item fields survive persistence.
+#[derive(Debug, Deserialize)]
+struct ResponsesStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    response: Option<Value>,
+    item: Option<Value>,
+    item_id: Option<String>,
+    output_index: Option<u64>,
+    delta: Option<String>,
+    arguments: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
 }
 
 fn request_body(config: &ModelConfig, request: ModelRequest) -> Result<Value> {
@@ -163,22 +225,12 @@ fn request_body(config: &ModelConfig, request: ModelRequest) -> Result<Value> {
 #[derive(Default)]
 struct ResponseDecoder {
     completed: Option<ModelResponse>,
+    added_items: BTreeMap<u64, Value>,
+    done_items: BTreeMap<u64, Value>,
 }
 
 impl ResponseDecoder {
-    fn consume(&mut self, buffer: &mut Vec<u8>, emit: &mut ModelStreamHandler<'_>) -> Result<()> {
-        while let Some((end, delimiter)) = find_sse_frame_end(buffer) {
-            let frame = std::str::from_utf8(&buffer[..end])
-                .map_err(|e| AgentError::Model(format!("invalid Responses SSE UTF-8: {e}")))?;
-            self.frame(frame, emit)?;
-            buffer.drain(..end + delimiter);
-            if self.completed.is_some() {
-                break;
-            }
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     fn frame(&mut self, frame: &str, emit: &mut ModelStreamHandler<'_>) -> Result<()> {
         let data = frame
             .lines()
@@ -186,28 +238,39 @@ impl ResponseDecoder {
             .map(|line| line.strip_prefix(' ').unwrap_or(line))
             .collect::<Vec<_>>()
             .join("\n");
+        self.data(&data, emit)
+    }
+
+    fn data(&mut self, data: &str, emit: &mut ModelStreamHandler<'_>) -> Result<()> {
         if data.trim().is_empty() || data.trim() == "[DONE]" {
             return Ok(());
         }
-        let event: Value = serde_json::from_str(&data)
-            .map_err(|e| AgentError::Model(format!("invalid Responses SSE JSON: {e}")))?;
-        match event["type"].as_str() {
-            Some("response.output_text.delta" | "response.refusal.delta") => {
-                let delta = required_string(&event, "delta")?;
+        let event: ResponsesStreamEvent = serde_json::from_str(data)
+            .map_err(|e| AgentError::Model(format!("invalid Responses SSE event: {e}")))?;
+        match event.kind.as_str() {
+            OUTPUT_TEXT_DELTA | REFUSAL_DELTA => {
+                let delta = event.delta.ok_or_else(|| {
+                    AgentError::Model("Responses text event missing delta".into())
+                })?;
                 if !delta.is_empty() {
                     emit(ModelStreamEvent::OutputProgress);
-                    emit(ModelStreamEvent::AssistantDelta {
-                        text: delta.to_owned(),
-                    });
+                    emit(ModelStreamEvent::AssistantDelta { text: delta });
                 }
             }
-            Some("response.function_call_arguments.delta") => {
-                if !required_string(&event, "delta")?.is_empty() {
+            FUNCTION_ARGUMENTS_DELTA => {
+                let delta = event.delta.ok_or_else(|| {
+                    AgentError::Model("Responses argument event missing delta".into())
+                })?;
+                if !delta.is_empty() {
                     emit(ModelStreamEvent::OutputProgress);
                 }
             }
-            Some("response.output_item.added") => {
-                let item = &event["item"];
+            OUTPUT_ITEM_ADDED => {
+                let item = event.item.ok_or_else(|| {
+                    AgentError::Model("Responses output_item.added missing item".into())
+                })?;
+                let index = self.item_index(event.output_index, &item);
+                self.added_items.insert(index, item.clone());
                 if item["type"] == "function_call"
                     && (item["name"].as_str().is_some_and(|s| !s.is_empty())
                         || item["call_id"].as_str().is_some_and(|s| !s.is_empty()))
@@ -215,14 +278,52 @@ impl ResponseDecoder {
                     emit(ModelStreamEvent::OutputProgress);
                 }
             }
-            Some("response.completed") => {
-                let response = &event["response"];
-                if response["status"] != "completed" {
-                    return Err(AgentError::Model(
-                        "Responses terminal event has non-completed status".into(),
-                    ));
+            OUTPUT_ITEM_DONE => {
+                let item = event.item.ok_or_else(|| {
+                    AgentError::Model("Responses output_item.done missing item".into())
+                })?;
+                let index = self.item_index(event.output_index, &item);
+                if let Some(added) = self.added_items.get(&index) {
+                    check_item_identity(added, &item)?;
                 }
-                let model_response = completed_response(response)?;
+                self.done_items.insert(index, item);
+            }
+            FUNCTION_ARGUMENTS_DONE => {
+                // Compatibility with providers that send arguments.done but omit
+                // output_item.done. Never concatenate a done snapshot onto deltas.
+                let index = event.output_index.or_else(|| {
+                    self.added_items
+                        .iter()
+                        .find(|(_, item)| {
+                            event.item_id.as_deref().is_some_and(|id| item["id"] == id)
+                        })
+                        .map(|(index, _)| *index)
+                });
+                if let Some(item) = index.and_then(|index| self.added_items.get(&index)) {
+                    if item["type"] == "function_call" {
+                        if let (Some(expected), Some(actual)) =
+                            (item["id"].as_str(), event.item_id.as_deref())
+                        {
+                            if expected != actual {
+                                return Err(AgentError::Model(
+                                    "Responses argument item_id mismatch".into(),
+                                ));
+                            }
+                        }
+                        let mut done = item.clone();
+                        done["arguments"] =
+                            json!(event.arguments.ok_or_else(|| AgentError::Model(
+                                "Responses arguments.done missing arguments".into()
+                            ))?);
+                        done["status"] = json!("completed");
+                        self.done_items.insert(index.unwrap(), done);
+                    }
+                }
+            }
+            RESPONSE_COMPLETED | RESPONSE_FAILED | RESPONSE_INCOMPLETE => {
+                let response = event.response.ok_or_else(|| {
+                    AgentError::Model("Responses terminal event missing response".into())
+                })?;
                 if let Some(usage) = response.get("usage").filter(|v| !v.is_null()) {
                     emit(ModelStreamEvent::TokenUsage {
                         usage: TokenUsage {
@@ -235,24 +336,115 @@ impl ResponseDecoder {
                         },
                     });
                 }
-                self.completed = Some(model_response);
+                let diagnostic = response_diagnostic(&response);
+                // Codex completion metadata does not require a status or output
+                // array. The event type is the completion signal; an explicitly
+                // contradictory status is still rejected.
+                if event.kind != RESPONSE_COMPLETED
+                    || response["status"]
+                        .as_str()
+                        .is_some_and(|status| status != "completed")
+                {
+                    return Err(AgentError::Model(format!(
+                        "Responses {}: class={}, {diagnostic}",
+                        event.kind,
+                        classify_response_error(&response["error"])
+                    )));
+                }
+                let mut normalized = response.clone();
+                if !self.done_items.is_empty() {
+                    for index in self.added_items.keys() {
+                        if !self.done_items.contains_key(index) {
+                            return Err(AgentError::Model(format!(
+                                "Responses completed before output item {index} finished; {diagnostic}"
+                            )));
+                        }
+                    }
+                    // Codex semantics: completed items are authoritative. The
+                    // terminal response is metadata, not another output snapshot.
+                    normalized["output"] = json!(self.done_items.values().collect::<Vec<_>>());
+                }
+                // A completed-only provider can still supply its output here.
+                self.completed = Some(
+                    completed_response(&normalized)
+                        .map_err(|error| AgentError::Model(format!("{error}; {diagnostic}")))?,
+                );
             }
-            Some("response.failed" | "response.incomplete" | "error") => {
+            ERROR => {
                 return Err(AgentError::Model(format!(
-                    "Responses stream failed: {event}"
-                )));
+                    "Responses stream error: code={}, message={}",
+                    event.code.as_deref().unwrap_or("unknown"),
+                    event.message.as_deref().unwrap_or("unknown")
+                )))
             }
-            Some(_) => {} // Lifecycle, reasoning, and duplicate done snapshots.
-            None => return Err(AgentError::Model("Responses event missing type".into())),
+            _ => {} // Unknown extensions, reasoning deltas, and lifecycle metadata.
         }
         Ok(())
     }
 
-    fn finish(self) -> Result<ModelResponse> {
-        self.completed.ok_or_else(|| {
-            AgentError::Model("Responses stream ended before response.completed".into())
-        })
+    fn item_index(&self, explicit: Option<u64>, item: &Value) -> u64 {
+        explicit
+            .or_else(|| {
+                item["id"].as_str().and_then(|id| {
+                    self.added_items
+                        .iter()
+                        .chain(self.done_items.iter())
+                        .find(|(_, existing)| existing["id"] == id)
+                        .map(|(index, _)| *index)
+                })
+            })
+            .unwrap_or_else(|| {
+                self.added_items
+                    .keys()
+                    .chain(self.done_items.keys())
+                    .max()
+                    .map_or(0, |index| index.saturating_add(1))
+            })
     }
+
+    fn finish(self) -> Result<ModelResponse> {
+        self.completed
+            .ok_or_else(|| AgentError::Model("stream closed before response.completed".into()))
+    }
+}
+
+fn check_item_identity(added: &Value, done: &Value) -> Result<()> {
+    for key in ["type", "id", "call_id", "name"] {
+        if let (Some(a), Some(b)) = (added.get(key), done.get(key)) {
+            if a != b {
+                return Err(AgentError::Model(format!(
+                    "Responses item identity conflict: {key}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Codex distinguishes provider failures before retry policy is applied. Canary
+// keeps the classification in diagnostics; it does not restart an emitted stream.
+fn classify_response_error(error: &Value) -> &'static str {
+    match error["code"].as_str() {
+        Some("context_length_exceeded" | "context_window_exceeded") => "context_window",
+        Some("insufficient_quota" | "quota_exceeded") => "quota",
+        Some("rate_limit_exceeded") => "rate_limit",
+        Some("server_overloaded" | "overloaded") => "overloaded",
+        Some("invalid_request" | "invalid_request_error") => "invalid_request",
+        _ => "stream",
+    }
+}
+
+fn response_diagnostic(response: &Value) -> Value {
+    json!({
+        "response_id": response["id"],
+        "status": response["status"],
+        "incomplete_details": response["incomplete_details"],
+        "error_code": response["error"]["code"],
+        "usage": response["usage"],
+        "max_output_tokens": response["max_output_tokens"],
+        "output_types": response["output"].as_array().map(|items|
+            items.iter().map(|item| item["type"].clone()).collect::<Vec<_>>()),
+    })
 }
 
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -268,6 +460,12 @@ fn completed_response(response: &Value) -> Result<ModelResponse> {
     let mut text = String::new();
     let mut calls = Vec::new();
     for item in output {
+        if item["status"] == "incomplete" || item["status"] == "in_progress" {
+            return Err(AgentError::Model(format!(
+                "Responses output item is not complete: id={}",
+                item["id"]
+            )));
+        }
         match item["type"].as_str() {
             Some("message") => {
                 let parts = item["content"]
@@ -291,7 +489,10 @@ fn completed_response(response: &Value) -> Result<ModelResponse> {
                     call_id: required_string(item, "call_id")?.to_owned(),
                     name: required_string(item, "name")?.to_owned(),
                     arguments: serde_json::from_str(arguments).map_err(|e| {
-                        AgentError::Model(format!("invalid Responses function arguments: {e}"))
+                        AgentError::Model(format!(
+                            "invalid Responses function arguments: call_id={}, name={}, bytes={}, category={:?}, {e}",
+                            item["call_id"], item["name"], arguments.len(), e.classify()
+                        ))
                     })?,
                 });
             }
@@ -450,8 +651,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn streaming_progress_usage_and_utf8_framing() {
+    #[tokio::test]
+    async fn streaming_progress_usage_and_utf8_framing() {
         let events = [
             json!({"type": "response.created"}),
             json!({"type": "response.output_text.delta", "delta": ""}),
@@ -467,17 +668,16 @@ mod tests {
             .iter()
             .map(|event| format!("event: ignored\r\ndata: {event}\r\n\r\n"))
             .collect::<String>();
-        let mut decoder = ResponseDecoder::default();
-        let mut buffer = Vec::new();
         let mut emitted = Vec::new();
         // Split at every byte, including inside UTF-8 and SSE delimiters.
-        for byte in stream.bytes() {
-            buffer.push(byte);
-            decoder
-                .consume(&mut buffer, &mut |e| emitted.push(e))
-                .unwrap();
-        }
-        assert!(decoder.finish().is_ok());
+        let stream = futures_util::stream::iter(
+            stream
+                .bytes()
+                .map(|byte| Ok::<_, std::io::Error>(vec![byte])),
+        );
+        read_response_stream(stream, Duration::from_secs(1), &mut |e| emitted.push(e))
+            .await
+            .unwrap();
         assert_eq!(
             emitted
                 .iter()
@@ -520,6 +720,249 @@ mod tests {
         assert!(completed_response(&completed(invalid)["response"]).is_err());
     }
 
+    fn feed(
+        decoder: &mut ResponseDecoder,
+        event: Value,
+        emitted: &mut Vec<ModelStreamEvent>,
+    ) -> Result<()> {
+        decoder.frame(&format!("data: {event}"), &mut |e| emitted.push(e))
+    }
+
+    #[test]
+    fn reconstructs_empty_terminal_output_from_completed_items_in_order() {
+        let mut decoder = ResponseDecoder::default();
+        let mut emitted = Vec::new();
+        // Arrival order does not determine output order.
+        for index in [3, 1, 0, 2] {
+            feed(
+                &mut decoder,
+                json!({
+                    "type": OUTPUT_ITEM_DONE, "output_index": index,
+                    "item": output()[index],
+                }),
+                &mut emitted,
+            )
+            .unwrap();
+        }
+        feed(&mut decoder, completed(json!([])), &mut emitted).unwrap();
+        let ModelResponse::Assistant {
+            text,
+            function_calls,
+            continuation,
+        } = decoder.finish().unwrap()
+        else {
+            panic!("assistant")
+        };
+        assert_eq!(text.as_deref(), Some("Checking."));
+        assert_eq!(function_calls.len(), 2);
+        assert_eq!(continuation.unwrap().payload, output());
+        // Snapshots must not double-count progress or replay streamed text.
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(emitted[0], ModelStreamEvent::TokenUsage { .. }));
+    }
+
+    #[test]
+    fn recovers_truncated_terminal_arguments_from_arguments_done() {
+        let mut decoder = ResponseDecoder::default();
+        let mut emitted = Vec::new();
+        let mut call = output()[2].clone();
+        call["arguments"] = json!("");
+        call["status"] = json!("in_progress");
+        feed(
+            &mut decoder,
+            json!({
+                "type": OUTPUT_ITEM_ADDED, "output_index": 0, "item": call
+            }),
+            &mut emitted,
+        )
+        .unwrap();
+        feed(
+            &mut decoder,
+            json!({
+                "type": FUNCTION_ARGUMENTS_DONE, "output_index": 0,
+                "item_id": "fc_1", "arguments": "{\"q\":1}"
+            }),
+            &mut emitted,
+        )
+        .unwrap();
+        let mut truncated = output()[2].clone();
+        truncated["arguments"] = json!("{\"q\":");
+        feed(&mut decoder, completed(json!([truncated])), &mut emitted).unwrap();
+        let ModelResponse::Assistant {
+            function_calls,
+            continuation,
+            ..
+        } = decoder.finish().unwrap()
+        else {
+            panic!("assistant")
+        };
+        assert_eq!(function_calls[0].arguments, json!({"q": 1}));
+        assert_eq!(continuation.unwrap().payload[0]["arguments"], "{\"q\":1}");
+    }
+
+    #[test]
+    fn empty_reasoning_only_and_partial_json_report_metadata_and_preserve_usage() {
+        for items in [
+            json!([]),
+            json!([output()[0].clone()]),
+            json!([{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{\"q\":"}]),
+        ] {
+            let mut decoder = ResponseDecoder::default();
+            let mut emitted = Vec::new();
+            let mut event = completed(items);
+            event["response"]["id"] = json!("resp_diagnostic");
+            let error = feed(&mut decoder, event, &mut emitted)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("resp_diagnostic"));
+            assert!(error.contains("output_types"));
+            assert!(error.contains("usage"));
+            assert!(!error.contains("opaque")); // No reasoning payload in diagnostics.
+            assert_eq!(emitted.len(), 1);
+            assert!(matches!(emitted[0], ModelStreamEvent::TokenUsage { .. }));
+        }
+    }
+
+    #[test]
+    fn incomplete_responses_fail_and_completed_items_override_terminal_snapshots() {
+        let mut decoder = ResponseDecoder::default();
+        let mut emitted = Vec::new();
+        feed(
+            &mut decoder,
+            json!({
+                "type": OUTPUT_ITEM_DONE, "output_index": 0, "item": output()[2]
+            }),
+            &mut emitted,
+        )
+        .unwrap();
+        let mut incomplete = completed(json!([]));
+        incomplete["type"] = json!(RESPONSE_INCOMPLETE);
+        incomplete["response"]["status"] = json!("incomplete");
+        incomplete["response"]["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        let error = feed(&mut decoder, incomplete, &mut emitted)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_output_tokens"));
+        assert!(decoder.completed.is_none());
+
+        for change in [
+            json!({"call_id": "other"}),
+            json!({"arguments": "{\"q\":2}"}),
+            json!({"status": "incomplete"}),
+        ] {
+            let mut terminal = output()[2].clone();
+            for (key, value) in change.as_object().unwrap() {
+                terminal[key] = value.clone();
+            }
+            feed(&mut decoder, completed(json!([terminal])), &mut emitted).unwrap();
+            assert!(
+                matches!(&decoder.completed, Some(ModelResponse::Assistant { function_calls, .. })
+                if function_calls[0].call_id == "call_1" && function_calls[0].arguments == json!({"q": 1}))
+            );
+        }
+    }
+
+    // Adapted from Codex SSE tests: completed items are independent of terminal
+    // metadata; response.completed need not contain an output array or status.
+    #[tokio::test]
+    async fn completed_items_with_metadata_only_completion() {
+        let mut frames = String::from(": heartbeat\n\n");
+        for item in output().as_array().unwrap() {
+            frames.push_str(&format!(
+                "data: {}\n\n",
+                json!({"type": OUTPUT_ITEM_DONE, "item": item})
+            ));
+        }
+        frames.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "type": RESPONSE_COMPLETED, "response": {"id": "response_1"}
+            })
+        ));
+        let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(frames.into_bytes())]);
+        let result = read_response_stream(stream, Duration::from_secs(1), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(result, ModelResponse::Assistant {
+            continuation: Some(ModelContinuation { payload, .. }), ..
+        } if payload == output()));
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_and_early_close() {
+        let pending =
+            futures_util::stream::pending::<std::result::Result<Vec<u8>, std::io::Error>>();
+        let error = read_response_stream(pending, Duration::from_millis(10), &mut |_| {})
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("idle timeout"));
+
+        for payload in [
+            "data: [DONE]\n\n".to_owned(),
+            format!(
+                "data: {}\n\n",
+                json!({"type": OUTPUT_ITEM_DONE, "item": output()[1]})
+            ),
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}".to_owned(),
+        ] {
+            let stream =
+                futures_util::stream::iter([Ok::<_, std::io::Error>(payload.into_bytes())]);
+            assert!(
+                read_response_stream(stream, Duration::from_secs(1), &mut |_| {})
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_and_transport_errors_are_not_silently_ignored() {
+        let malformed =
+            futures_util::stream::iter([Ok::<_, std::io::Error>(b"data: {\n\n".to_vec())]);
+        assert!(
+            read_response_stream(malformed, Duration::from_secs(1), &mut |_| {})
+                .await
+                .is_err()
+        );
+        let broken = futures_util::stream::iter([Err::<Vec<u8>, _>(std::io::Error::other(
+            "broken connection",
+        ))]);
+        assert!(
+            read_response_stream(broken, Duration::from_secs(1), &mut |_| {})
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("broken connection")
+        );
+    }
+
+    #[test]
+    fn unfinished_items_and_identity_mismatch_fail() {
+        let mut decoder = ResponseDecoder::default();
+        let mut events = Vec::new();
+        feed(
+            &mut decoder,
+            json!({"type": OUTPUT_ITEM_ADDED, "output_index": 0, "item": output()[2]}),
+            &mut events,
+        )
+        .unwrap();
+        let mut mismatch = output()[2].clone();
+        mismatch["call_id"] = json!("wrong");
+        assert!(feed(
+            &mut decoder,
+            json!({"type": OUTPUT_ITEM_DONE, "output_index": 0, "item": mismatch}),
+            &mut events
+        )
+        .is_err());
+        feed(
+            &mut decoder,
+            json!({"type": OUTPUT_ITEM_DONE, "output_index": 1, "item": output()[1]}),
+            &mut events,
+        )
+        .unwrap();
+        assert!(feed(&mut decoder, completed(json!([])), &mut events).is_err());
+    }
     #[tokio::test]
     async fn client_posts_responses_request_and_decodes_stream() {
         use std::io::{Read, Write};

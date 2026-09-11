@@ -1,0 +1,15 @@
+OpenAI Codex
+Copyright 2025 OpenAI
+
+Responses stream handling in src/responses.rs is adapted from:
+https://github.com/openai/codex
+Revision: fc948f8c47
+Source: codex-rs/codex-api/src/sse/responses.rs
+
+Licensed under the Apache License, Version 2.0; see LICENSE in this directory.
+
+Canary modifications: callback-based delivery, existing metrics, local
+continuation persistence, output-index ordering, completed-only provider fallback,
+arguments.done compatibility, and immediate errors on malformed or failed events.
+Codex authentication, telemetry, session routing, channels, and WebSocket support
+are not included. Stream retries are not introduced by this port.
