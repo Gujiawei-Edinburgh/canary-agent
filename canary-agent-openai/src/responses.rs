@@ -458,8 +458,12 @@ impl ResponseDecoder {
                 }
                 // A completed-only provider can still supply its output here.
                 self.completed = Some(
-                    completed_response(&normalized)
-                        .map_err(|error| AgentError::Model(format!("{error}; {diagnostic}")))?,
+                    completed_response(&normalized).map_err(|error| match error {
+                        AgentError::Model(message) => {
+                            AgentError::Model(format!("{message}; {diagnostic}"))
+                        }
+                        other => AgentError::Model(format!("{other}; {diagnostic}")),
+                    })?,
                 );
             }
             ERROR => {
@@ -926,6 +930,7 @@ mod tests {
     fn empty_reasoning_only_and_partial_json_report_metadata_and_preserve_usage() {
         for items in [
             json!([]),
+            json!([{"type": "message", "status": "completed", "content": [{"type": "output_text", "text": ""}]}]),
             json!([output()[0].clone()]),
             json!([{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{\"q\":"}]),
         ] {
@@ -937,6 +942,8 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("resp_diagnostic"));
+            assert!(error.starts_with("model error: "));
+            assert_eq!(error.matches("model error:").count(), 1);
             assert!(error.contains("output_types"));
             assert!(error.contains("usage"));
             assert!(!error.contains("opaque")); // No reasoning payload in diagnostics.
