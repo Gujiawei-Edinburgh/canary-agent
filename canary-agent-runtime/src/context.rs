@@ -129,18 +129,8 @@ impl ContextBuilder for CompactingContextBuilder {
         input: ContextBuildInput<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ContextBuildOutput>> + Send + 'a>> {
         Box::pin(async move {
-            let mut system_content = input.system_prompt.to_string();
-            if let Some(goal) = &input.projection.goal {
-                system_content.push_str(&format!(
-                    "\nCurrent thread goal: objective={}, status={:?}, notes={}",
-                    goal.objective,
-                    goal.status,
-                    goal.notes.as_deref().unwrap_or("")
-                ));
-            }
-
             let system = ChatMessage::System {
-                content: system_content,
+                content: input.system_prompt.to_string(),
             };
             let system_tokens = self.estimator.estimate(std::slice::from_ref(&system));
             if system_tokens >= self.max_context_tokens {

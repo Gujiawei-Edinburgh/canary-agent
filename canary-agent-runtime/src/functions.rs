@@ -1,10 +1,10 @@
 use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
 use crate::model::FunctionSpec;
-use canary_agent_kernel::events::{GoalState, GoalStatus, Suspension};
+use canary_agent_kernel::events::Suspension;
 use canary_agent_kernel::projection::ThreadProjection;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -86,45 +86,6 @@ pub enum SuspensionResolution {
     ExternalResult { output: Value },
 }
 
-#[derive(Debug, Clone)]
-pub enum RuntimeEffect {
-    SetGoal(GoalState),
-}
-
-#[derive(Debug, Clone)]
-pub enum RuntimeCommandExecution {
-    Completed {
-        output: Value,
-        effects: Vec<RuntimeEffect>,
-    },
-    SuspendedAfterExecution {
-        suspension: Suspension,
-        output: Value,
-        effects: Vec<RuntimeEffect>,
-    },
-    SuspendedBeforeExecution {
-        suspension: Suspension,
-        effects: Vec<RuntimeEffect>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum FunctionCallExecution {
-    Completed {
-        output: Value,
-        effects: Vec<RuntimeEffect>,
-    },
-    SuspendedAfterExecution {
-        suspension: Suspension,
-        output: Value,
-        effects: Vec<RuntimeEffect>,
-    },
-    SuspendedBeforeExecution {
-        suspension: Suspension,
-        effects: Vec<RuntimeEffect>,
-    },
-}
-
 pub trait AgentFunction: Send + Sync {
     fn spec(&self) -> FunctionSpec;
     fn output_schema(&self) -> Value;
@@ -136,19 +97,6 @@ pub trait AgentFunction: Send + Sync {
         args: Value,
         context: FunctionContext,
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>>;
-}
-
-pub trait RuntimeCommand: Send + Sync {
-    fn spec(&self) -> FunctionSpec;
-    fn output_schema(&self) -> Value;
-    fn limits(&self) -> FunctionLimits;
-    fn recovery_policy(&self) -> FunctionRecoveryPolicy;
-    fn output_resolver(&self) -> &dyn FunctionOutputResolver;
-    fn call<'a>(
-        &'a self,
-        args: Value,
-        context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>>;
 }
 
 pub struct SimpleFunction<F> {
@@ -223,13 +171,7 @@ where
 
 #[derive(Clone, Default)]
 pub struct FunctionRegistry {
-    functions: BTreeMap<String, RegisteredFunction>,
-}
-
-#[derive(Clone)]
-enum RegisteredFunction {
-    Tool(Arc<dyn AgentFunction>),
-    RuntimeCommand(Arc<dyn RuntimeCommand>),
+    functions: BTreeMap<String, Arc<dyn AgentFunction>>,
 }
 
 impl FunctionRegistry {
@@ -237,24 +179,9 @@ impl FunctionRegistry {
         Self::default()
     }
 
-    pub fn register<F>(&mut self, function: F)
-    where
-        F: AgentFunction + 'static,
-    {
-        self.functions.insert(
-            function.spec().name.clone(),
-            RegisteredFunction::Tool(Arc::new(function)),
-        );
-    }
-
-    pub fn register_runtime_command<C>(&mut self, command: C)
-    where
-        C: RuntimeCommand + 'static,
-    {
-        self.functions.insert(
-            command.spec().name.clone(),
-            RegisteredFunction::RuntimeCommand(Arc::new(command)),
-        );
+    pub fn register<F: AgentFunction + 'static>(&mut self, function: F) {
+        self.functions
+            .insert(function.spec().name.clone(), Arc::new(function));
     }
 
     pub fn unregister(&mut self, name: &str) -> bool {
@@ -264,29 +191,18 @@ impl FunctionRegistry {
     pub fn specs(&self) -> Vec<FunctionSpec> {
         self.functions
             .values()
-            .map(|function| match function {
-                RegisteredFunction::Tool(function) => function.spec(),
-                RegisteredFunction::RuntimeCommand(command) => command.spec(),
-            })
+            .map(|function| function.spec())
             .collect()
     }
 
     pub fn descriptors(&self) -> Vec<FunctionDescriptor> {
         self.functions
             .values()
-            .map(|function| match function {
-                RegisteredFunction::Tool(function) => FunctionDescriptor {
-                    spec: function.spec(),
-                    output_schema: function.output_schema(),
-                    limits: function.limits(),
-                    recovery_policy: function.recovery_policy(),
-                },
-                RegisteredFunction::RuntimeCommand(command) => FunctionDescriptor {
-                    spec: command.spec(),
-                    output_schema: command.output_schema(),
-                    limits: command.limits(),
-                    recovery_policy: command.recovery_policy(),
-                },
+            .map(|function| FunctionDescriptor {
+                spec: function.spec(),
+                output_schema: function.output_schema(),
+                limits: function.limits(),
+                recovery_policy: function.recovery_policy(),
             })
             .collect()
     }
@@ -296,10 +212,7 @@ impl FunctionRegistry {
             .functions
             .get(name)
             .ok_or_else(|| AgentError::FunctionNotFound(name.to_string()))?;
-        Ok(match function {
-            RegisteredFunction::Tool(function) => function.recovery_policy(),
-            RegisteredFunction::RuntimeCommand(command) => command.recovery_policy(),
-        })
+        Ok(function.recovery_policy())
     }
 
     pub async fn call(
@@ -307,95 +220,25 @@ impl FunctionRegistry {
         name: &str,
         args: Value,
         context: FunctionContext,
-    ) -> Result<FunctionCallExecution> {
+    ) -> Result<FunctionExecution> {
         let function = self
             .functions
             .get(name)
             .ok_or_else(|| AgentError::FunctionNotFound(name.to_string()))?;
-        match function {
-            RegisteredFunction::Tool(function) => {
-                let limits = function.limits();
-                validate_limits(name, limits)?;
-                let execution =
-                    tokio::time::timeout(limits.time_budget, function.call(args, context))
-                        .await
-                        .map_err(|_| AgentError::FunctionTimeout {
-                            name: name.to_string(),
-                            timeout_ms: limits.time_budget.as_millis(),
-                        })??;
-                let execution = enforce_output_limit(
-                    name,
-                    execution,
-                    limits.max_output_bytes,
-                    function.output_resolver(),
-                )?;
-                match execution {
-                    FunctionExecution::Completed { output } => {
-                        Ok(FunctionCallExecution::Completed {
-                            output,
-                            effects: Vec::new(),
-                        })
-                    }
-                    FunctionExecution::SuspendedAfterExecution { suspension, output } => {
-                        Ok(FunctionCallExecution::SuspendedAfterExecution {
-                            suspension,
-                            output,
-                            effects: Vec::new(),
-                        })
-                    }
-                    FunctionExecution::SuspendedBeforeExecution { suspension } => {
-                        Ok(FunctionCallExecution::SuspendedBeforeExecution {
-                            suspension,
-                            effects: Vec::new(),
-                        })
-                    }
-                }
-            }
-            RegisteredFunction::RuntimeCommand(command) => {
-                let limits = command.limits();
-                validate_limits(name, limits)?;
-                match tokio::time::timeout(limits.time_budget, command.call(args, context))
-                    .await
-                    .map_err(|_| AgentError::FunctionTimeout {
-                        name: name.to_string(),
-                        timeout_ms: limits.time_budget.as_millis(),
-                    })?? {
-                    RuntimeCommandExecution::Completed { output, effects } => {
-                        let output = resolve_output(
-                            name,
-                            output,
-                            limits.max_output_bytes,
-                            command.output_resolver(),
-                        )?;
-                        Ok(FunctionCallExecution::Completed { output, effects })
-                    }
-                    RuntimeCommandExecution::SuspendedAfterExecution {
-                        suspension,
-                        output,
-                        effects,
-                    } => {
-                        let output = resolve_output(
-                            name,
-                            output,
-                            limits.max_output_bytes,
-                            command.output_resolver(),
-                        )?;
-                        Ok(FunctionCallExecution::SuspendedAfterExecution {
-                            suspension,
-                            output,
-                            effects,
-                        })
-                    }
-                    RuntimeCommandExecution::SuspendedBeforeExecution {
-                        suspension,
-                        effects,
-                    } => Ok(FunctionCallExecution::SuspendedBeforeExecution {
-                        suspension,
-                        effects,
-                    }),
-                }
-            }
-        }
+        let limits = function.limits();
+        validate_limits(name, limits)?;
+        let execution = tokio::time::timeout(limits.time_budget, function.call(args, context))
+            .await
+            .map_err(|_| AgentError::FunctionTimeout {
+                name: name.to_string(),
+                timeout_ms: limits.time_budget.as_millis(),
+            })??;
+        enforce_output_limit(
+            name,
+            execution,
+            limits.max_output_bytes,
+            function.output_resolver(),
+        )
     }
 }
 
@@ -454,95 +297,13 @@ fn enforce_output_limit(
     }
 }
 
-pub fn builtin_registry() -> FunctionRegistry {
-    let mut registry = FunctionRegistry::new();
-    registry.register_runtime_command(UpdateGoal);
-    registry
-}
-
-struct UpdateGoal;
-
-#[derive(Debug, Deserialize)]
-struct UpdateGoalArgs {
-    objective: String,
-    status: GoalStatus,
-    notes: Option<String>,
-}
-
-impl RuntimeCommand for UpdateGoal {
-    fn spec(&self) -> FunctionSpec {
-        FunctionSpec {
-            name: "update_goal".to_string(),
-            description: "Set or update the explicit goal state for this thread.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "required": ["objective", "status"],
-                "properties": {
-                    "objective": { "type": "string" },
-                    "status": {
-                        "type": "string",
-                        "enum": ["active", "complete", "blocked"]
-                    },
-                    "notes": { "type": "string" }
-                },
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn output_schema(&self) -> Value {
-        json!({"type": "object"})
-    }
-
-    fn limits(&self) -> FunctionLimits {
-        FunctionLimits {
-            time_budget: Duration::from_secs(1),
-            max_output_bytes: 20 * 1024 * 1024,
-        }
-    }
-
-    fn recovery_policy(&self) -> FunctionRecoveryPolicy {
-        FunctionRecoveryPolicy::Idempotent
-    }
-
-    fn output_resolver(&self) -> &dyn FunctionOutputResolver {
-        &DiscardResolver
-    }
-
-    fn call<'a>(
-        &'a self,
-        args: Value,
-        _context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>> {
-        Box::pin(async move {
-            let parsed: UpdateGoalArgs = serde_json::from_value(args).map_err(|error| {
-                AgentError::InvalidFunctionArguments {
-                    name: "update_goal".to_string(),
-                    message: error.to_string(),
-                }
-            })?;
-            let current = GoalState {
-                objective: parsed.objective,
-                status: parsed.status,
-                notes: parsed.notes,
-            };
-            Ok(RuntimeCommandExecution::Completed {
-                output: json!({ "goal": current }),
-                effects: vec![RuntimeEffect::SetGoal(current)],
-            })
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use canary_agent_kernel::events::{GoalStatus, Thread};
     use canary_agent_kernel::projection::ThreadProjection;
 
     use super::{
-        builtin_registry, FunctionCallExecution, FunctionContext, FunctionExecution,
-        FunctionLimits, FunctionOutputResolver, FunctionRecoveryPolicy, FunctionRegistry,
-        FunctionSpec, SimpleFunction,
+        FunctionContext, FunctionExecution, FunctionLimits, FunctionOutputResolver,
+        FunctionRecoveryPolicy, FunctionRegistry, FunctionSpec, SimpleFunction,
     };
     use crate::AgentError;
     use serde_json::json;
@@ -559,34 +320,6 @@ mod tests {
         ) -> crate::Result<serde_json::Value> {
             Ok(json!("ok"))
         }
-    }
-
-    #[tokio::test]
-    async fn update_goal_returns_runtime_effect() {
-        let registry = builtin_registry();
-        let execution = registry
-            .call(
-                "update_goal",
-                json!({ "objective": "ship v1", "status": "active" }),
-                FunctionContext {
-                    thread_id: "t".to_string(),
-                    metadata: serde_json::Value::Null,
-                    turn_id: "turn".to_string(),
-                    call_id: "call".to_string(),
-                    projection: ThreadProjection::from_thread(&Thread::new("t")),
-                    abort_signal: crate::agent_loop::turn_abort_pair().1,
-                },
-            )
-            .await
-            .expect("call");
-
-        let FunctionCallExecution::Completed { effects, .. } = execution else {
-            panic!("expected completion");
-        };
-        assert!(matches!(
-            effects.as_slice(),
-            [super::RuntimeEffect::SetGoal(goal)] if goal.status == GoalStatus::Active
-        ));
     }
 
     #[tokio::test]
@@ -721,7 +454,7 @@ mod tests {
             .await
             .expect("resolver should handle large output");
 
-        let FunctionCallExecution::Completed { output, .. } = execution else {
+        let FunctionExecution::Completed { output, .. } = execution else {
             panic!("expected completed function call");
         };
         assert_eq!(output, json!("ok"));

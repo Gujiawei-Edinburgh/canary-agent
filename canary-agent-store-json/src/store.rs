@@ -231,8 +231,7 @@ impl ThreadStore for JsonFileThreadStore {
 #[cfg(test)]
 mod tests {
     use canary_agent_kernel::{
-        GoalState, GoalStatus, RevisionToken, Thread, Turn, TurnItem, TurnItemKind, TurnItemSource,
-        TurnStatus,
+        RevisionToken, Thread, Turn, TurnItem, TurnItemKind, TurnItemSource, TurnStatus,
     };
     use canary_agent_runtime::{AgentError, LeaseFence};
 
@@ -386,13 +385,8 @@ mod tests {
         let mut turn = Turn::new();
         turn.push_item(TurnItem::new(
             TurnItemSource::Runtime,
-            TurnItemKind::GoalUpdated {
-                previous: None,
-                current: GoalState {
-                    objective: "first".to_string(),
-                    status: GoalStatus::Active,
-                    notes: None,
-                },
+            TurnItemKind::TurnAborted {
+                reason: "test revision update".to_string(),
             },
         ));
         current.turns.push(turn);

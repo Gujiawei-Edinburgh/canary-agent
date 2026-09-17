@@ -89,7 +89,7 @@ An application can assemble the runtime from the provided adapters:
 use canary_agent_kernel::new_id;
 use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
 use canary_agent_observability::JsonlTraceCollector;
-use canary_agent_runtime::{builtin_registry, Agent, AgentConfig};
+use canary_agent_runtime::{Agent, AgentConfig, FunctionRegistry};
 use canary_agent_store_json::JsonFileThreadStore;
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ async fn main() -> canary_agent_runtime::Result<()> {
         AgentConfig::default(),
         store,
         model,
-        builtin_registry(),
+        FunctionRegistry::new(),
     )
     .with_trace_collector(trace);
 
@@ -125,6 +125,9 @@ async fn main() -> canary_agent_runtime::Result<()> {
 ## Extension Points
 
 The runtime is designed to be assembled rather than subclassed.
+
+Goal tracking is application-owned. Goals can remain implicit in conversation and
+context history; applications needing structured goal tracking can provide a custom tool.
 
 | Need | Extension point |
 | --- | --- |

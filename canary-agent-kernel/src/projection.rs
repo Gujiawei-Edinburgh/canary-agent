@@ -1,4 +1,4 @@
-use crate::events::{GoalState, Suspension, Thread, ToolResult, TurnId, TurnItemKind, TurnStatus};
+use crate::events::{Suspension, Thread, ToolResult, TurnId, TurnItemKind, TurnStatus};
 use crate::model::ModelFunctionCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,7 +41,6 @@ pub enum ChatMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ThreadProjection {
     pub conversation: Vec<ChatMessage>,
-    pub goal: Option<GoalState>,
     pub pending_suspension: Option<PendingSuspension>,
     pub completed_function_results: Vec<CompletedFunctionCall>,
     pub last_assistant_message: Option<String>,
@@ -148,9 +147,6 @@ impl ThreadProjection {
                             turn_id: turn.id.clone(),
                         });
                     }
-                    TurnItemKind::GoalUpdated { current, .. } => {
-                        projection.goal = Some(current.clone());
-                    }
                     TurnItemKind::FunctionCallStarted { .. } => {}
                     TurnItemKind::TurnFailed { .. } | TurnItemKind::TurnAborted { .. } => {}
                 }
@@ -164,37 +160,12 @@ impl ThreadProjection {
 #[cfg(test)]
 mod tests {
     use crate::events::{
-        GoalState, GoalStatus, Thread, ToolResult, Turn, TurnItem, TurnItemKind, TurnItemSource,
-        TurnStatus,
+        Thread, ToolResult, Turn, TurnItem, TurnItemKind, TurnItemSource, TurnStatus,
     };
     use crate::model::ModelFunctionCall;
     use serde_json::json;
 
     use super::{ChatMessage, ThreadProjection};
-
-    #[test]
-    fn derives_thread_goal_from_goal_update() {
-        let mut thread = Thread::new("t");
-        let mut turn = Turn::new();
-        turn.push_item(TurnItem::new(
-            TurnItemSource::Runtime,
-            TurnItemKind::GoalUpdated {
-                previous: None,
-                current: GoalState {
-                    objective: "ship".to_string(),
-                    status: GoalStatus::Active,
-                    notes: None,
-                },
-            },
-        ));
-        thread.turns.push(turn);
-
-        let projection = ThreadProjection::from_thread(&thread);
-        assert_eq!(
-            projection.goal.as_ref().map(|goal| goal.objective.as_str()),
-            Some("ship")
-        );
-    }
 
     #[test]
     fn tracks_pending_suspension() {

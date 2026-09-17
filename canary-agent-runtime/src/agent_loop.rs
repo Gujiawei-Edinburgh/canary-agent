@@ -1,8 +1,8 @@
 use crate::context::{CompactingContextBuilder, ContextBuildInput, ContextBuilder};
 use crate::error::{AgentError, Result};
 use crate::functions::{
-    FunctionCallExecution, FunctionContext, FunctionRecoveryPolicy, FunctionRegistry,
-    RuntimeEffect, SuspensionResolution,
+    FunctionContext, FunctionExecution, FunctionRecoveryPolicy, FunctionRegistry,
+    SuspensionResolution,
 };
 use crate::metrics::{
     FunctionCallOutcome, FunctionCallSkipReason, MetricStatus, MetricsRecorder,
@@ -72,7 +72,7 @@ impl Default for AgentConfig {
             turn_execution_limits: TurnExecutionLimits::default(),
             system_prompt: concat!(
                 "You are an agent runtime assistant. Use functions only when they are useful. ",
-                "Thread goal is explicit durable state. Turn items are factual append-only records. ",
+                "Turn items are factual append-only records. ",
                 "Ask the user when required information is missing."
             )
             .to_string(),
@@ -709,9 +709,8 @@ impl Agent {
                         });
                     };
                     match execution {
-                        Ok(FunctionCallExecution::Completed { output, effects }) => {
-                            let mut items = Self::apply_runtime_effects(&thread, effects);
-                            items.push(TurnItem::new(
+                        Ok(FunctionExecution::Completed { output }) => {
+                            let items = vec![TurnItem::new(
                                 TurnItemSource::Tool,
                                 TurnItemKind::ToolOutput {
                                     call_id: call.call_id.clone(),
@@ -720,7 +719,7 @@ impl Agent {
                                         output: output.clone(),
                                     },
                                 },
-                            ));
+                            )];
                             Self::push_turn_items(&mut thread, &pending.turn_id, items)?;
                             Self::set_turn_status(
                                 &mut thread,
@@ -734,12 +733,8 @@ impl Agent {
                             }));
                             true
                         }
-                        Ok(FunctionCallExecution::SuspendedBeforeExecution {
-                            suspension, ..
-                        })
-                        | Ok(FunctionCallExecution::SuspendedAfterExecution {
-                            suspension, ..
-                        }) => {
+                        Ok(FunctionExecution::SuspendedBeforeExecution { suspension, .. })
+                        | Ok(FunctionExecution::SuspendedAfterExecution { suspension, .. }) => {
                             suspended_outcome = Some(TurnOutcome::Suspended { suspension });
                             false
                         }
@@ -1170,23 +1165,19 @@ impl Agent {
                             self.record_metric(RuntimeMetric::FunctionCallFinished {
                                 name: name.clone(),
                                 outcome: match &execution {
-                                    Ok(FunctionCallExecution::Completed { .. }) => {
+                                    Ok(FunctionExecution::Completed { .. }) => {
                                         FunctionCallOutcome::Completed
                                     }
-                                    Ok(FunctionCallExecution::SuspendedBeforeExecution {
-                                        ..
-                                    })
-                                    | Ok(FunctionCallExecution::SuspendedAfterExecution {
-                                        ..
-                                    }) => FunctionCallOutcome::Suspended,
+                                    Ok(FunctionExecution::SuspendedBeforeExecution { .. })
+                                    | Ok(FunctionExecution::SuspendedAfterExecution { .. }) => {
+                                        FunctionCallOutcome::Suspended
+                                    }
                                     Err(_) => FunctionCallOutcome::Failed,
                                 },
                                 duration: function_started.elapsed(),
                             });
                             match execution {
-                                Ok(FunctionCallExecution::Completed { output, effects }) => {
-                                    let update_items =
-                                        Self::apply_runtime_effects(&thread, effects);
+                                Ok(FunctionExecution::Completed { output }) => {
                                     let hook_result = FunctionCallHookResult::Completed {
                                         output: output.clone(),
                                     };
@@ -1197,15 +1188,14 @@ impl Agent {
                                             output: output.clone(),
                                         },
                                     };
-                                    let mut func_items = update_items;
-                                    func_items.push(TurnItem::new(
+                                    let func_items = vec![TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
                                             call_id: call_id.clone(),
                                             name: name.clone(),
                                             result: ToolResult::Success { output },
                                         },
-                                    ));
+                                    )];
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     thread = self.commit_thread(thread, lease.fence()).await?;
                                     self.record_trace(
@@ -1227,12 +1217,8 @@ impl Agent {
                                         TurnStateEvent::FunctionCompleted { call_id, name },
                                     ));
                                 }
-                                Ok(FunctionCallExecution::SuspendedBeforeExecution {
-                                    suspension,
-                                    effects,
-                                }) => {
-                                    let mut func_items =
-                                        Self::apply_runtime_effects(&thread, effects);
+                                Ok(FunctionExecution::SuspendedBeforeExecution { suspension }) => {
+                                    let mut func_items = Vec::new();
                                     func_items.push(TurnItem::new(
                                         TurnItemSource::Runtime,
                                         TurnItemKind::SuspensionCreated {
@@ -1311,13 +1297,10 @@ impl Agent {
                                     }
                                     break 'turn_loop TurnOutcome::Suspended { suspension };
                                 }
-                                Ok(FunctionCallExecution::SuspendedAfterExecution {
+                                Ok(FunctionExecution::SuspendedAfterExecution {
                                     suspension,
                                     output,
-                                    effects,
                                 }) => {
-                                    let update_items =
-                                        Self::apply_runtime_effects(&thread, effects);
                                     let hook_result = FunctionCallHookResult::Suspended {
                                         suspension: suspension.clone(),
                                         output: output.clone(),
@@ -1329,7 +1312,7 @@ impl Agent {
                                             output: output.clone(),
                                         },
                                     };
-                                    let mut func_items = update_items;
+                                    let mut func_items = Vec::new();
                                     func_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
@@ -1760,11 +1743,9 @@ impl Agent {
                 name: call.name.clone(),
                 outcome: match &execution {
                     None => FunctionCallOutcome::Aborted,
-                    Some(Ok(FunctionCallExecution::Completed { .. })) => {
-                        FunctionCallOutcome::Completed
-                    }
-                    Some(Ok(FunctionCallExecution::SuspendedBeforeExecution { .. }))
-                    | Some(Ok(FunctionCallExecution::SuspendedAfterExecution { .. })) => {
+                    Some(Ok(FunctionExecution::Completed { .. })) => FunctionCallOutcome::Completed,
+                    Some(Ok(FunctionExecution::SuspendedBeforeExecution { .. }))
+                    | Some(Ok(FunctionExecution::SuspendedAfterExecution { .. })) => {
                         FunctionCallOutcome::Suspended
                     }
                     Some(Err(_)) => FunctionCallOutcome::Failed,
@@ -1795,9 +1776,8 @@ impl Agent {
             };
 
             match execution {
-                Ok(FunctionCallExecution::Completed { output, effects }) => {
-                    let mut items = Self::apply_runtime_effects(thread, effects);
-                    items.push(TurnItem::new(
+                Ok(FunctionExecution::Completed { output }) => {
+                    let items = vec![TurnItem::new(
                         TurnItemSource::Tool,
                         TurnItemKind::ToolOutput {
                             call_id: call.call_id.clone(),
@@ -1806,7 +1786,7 @@ impl Agent {
                                 output: output.clone(),
                             },
                         },
-                    ));
+                    )];
                     Self::push_turn_items(thread, turn_id, items)?;
                     *thread = self.commit_thread(thread.clone(), lease.fence()).await?;
                     self.record_trace(
@@ -1824,8 +1804,8 @@ impl Agent {
                         name: call.name.clone(),
                     }));
                 }
-                Ok(FunctionCallExecution::SuspendedBeforeExecution { suspension, .. })
-                | Ok(FunctionCallExecution::SuspendedAfterExecution { suspension, .. }) => {
+                Ok(FunctionExecution::SuspendedBeforeExecution { suspension, .. })
+                | Ok(FunctionExecution::SuspendedAfterExecution { suspension, .. }) => {
                     let mut items = vec![TurnItem::new(
                         TurnItemSource::Runtime,
                         TurnItemKind::SuspensionCreated {
@@ -2053,24 +2033,6 @@ impl Agent {
         })
     }
 
-    fn apply_runtime_effects(thread: &Thread, effects: Vec<RuntimeEffect>) -> Vec<TurnItem> {
-        effects
-            .into_iter()
-            .map(|effect| match effect {
-                RuntimeEffect::SetGoal(goal) => {
-                    let previous = ThreadProjection::from_thread(thread).goal;
-                    TurnItem::new(
-                        TurnItemSource::Runtime,
-                        TurnItemKind::GoalUpdated {
-                            previous,
-                            current: goal,
-                        },
-                    )
-                }
-            })
-            .collect()
-    }
-
     fn push_turn_items(thread: &mut Thread, turn_id: &str, items: Vec<TurnItem>) -> Result<()> {
         let turn = thread
             .turn_mut(turn_id)
@@ -2142,7 +2104,7 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use crate::functions::{builtin_registry, FunctionRegistry, SimpleFunction};
+    use crate::functions::{FunctionRegistry, SimpleFunction};
     use crate::model::{
         ModelClient, ModelDescriptor, ModelFunctionCall, ModelRequest, ModelResponse,
         ModelStreamEvent, ModelStreamHandler,
@@ -2346,7 +2308,7 @@ mod tests {
     }
 
     fn test_registry() -> FunctionRegistry {
-        let mut registry = builtin_registry();
+        let mut registry = FunctionRegistry::new();
         registry.register(SimpleFunction::new(
             FunctionSpec {
                 name: "test_function".to_string(),
@@ -2984,47 +2946,6 @@ mod tests {
 
         let thread = store.load("t").await.expect("thread");
         assert_eq!(thread.token_usage, usage);
-    }
-
-    #[tokio::test]
-    async fn update_goal_then_message() {
-        let store = Arc::new(TestStore::default());
-        let agent = agent_with(
-            store.clone(),
-            vec![
-                ModelResponse::FunctionCalls {
-                    calls: vec![ModelFunctionCall {
-                        call_id: "c1".to_string(),
-                        name: "update_goal".to_string(),
-                        arguments: json!({ "objective": "ship", "status": "active" }),
-                    }],
-                },
-                ModelResponse::AssistantMessage {
-                    text: "goal set".to_string(),
-                },
-            ],
-        );
-
-        let outcome = agent
-            .run_turn("t", "set a goal", json!({}), |_| {})
-            .await
-            .expect("turn");
-        assert_eq!(
-            outcome,
-            TurnOutcome::AssistantMessage {
-                text: "goal set".to_string()
-            }
-        );
-        let thread = store.load("t").await.expect("thread");
-        let projection = ThreadProjection::from_thread(&thread);
-        assert_eq!(
-            projection.goal.as_ref().map(|goal| goal.objective.as_str()),
-            Some("ship")
-        );
-        assert!(thread.turns[0]
-            .items
-            .iter()
-            .any(|item| matches!(item.kind, TurnItemKind::GoalUpdated { .. })));
     }
 
     #[tokio::test]

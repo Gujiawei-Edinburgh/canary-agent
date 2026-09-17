@@ -4,8 +4,8 @@ use canary_agent_revision::{
     RevisionError, RevisionFuture, RevisionId, RevisionStore, ToolChange, ToolDiff, ValueChange,
 };
 use canary_agent_runtime::{
-    builtin_registry, Agent, AgentConfig, FunctionExecution, FunctionLimits,
-    FunctionRecoveryPolicy, FunctionSpec, LocalSessionCoordinator, SimpleFunction,
+    Agent, AgentConfig, FunctionExecution, FunctionLimits, FunctionRecoveryPolicy,
+    FunctionRegistry, FunctionSpec, LocalSessionCoordinator, SimpleFunction,
 };
 use canary_agent_store_json::JsonFileThreadStore;
 use serde_json::json;
@@ -106,7 +106,7 @@ async fn main() -> canary_agent_revision::Result<()> {
         model: "example-model".to_string(),
         reasoning_effort: "medium".to_string(),
     }));
-    let mut registry = builtin_registry();
+    let mut registry = FunctionRegistry::new();
     registry.register(SimpleFunction::new(
         FunctionSpec {
             name: "search".to_string(),

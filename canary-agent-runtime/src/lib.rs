@@ -19,10 +19,9 @@ pub use context::{
 };
 pub use error::{AgentError, Result};
 pub use functions::{
-    builtin_registry, AgentFunction, DiscardResolver, FunctionCallExecution, FunctionContext,
-    FunctionDescriptor, FunctionExecution, FunctionLimits, FunctionOutputResolver,
-    FunctionRecoveryPolicy, FunctionRegistry, RuntimeCommand, RuntimeCommandExecution,
-    RuntimeEffect, SimpleFunction, SuspensionResolution,
+    AgentFunction, DiscardResolver, FunctionContext, FunctionDescriptor, FunctionExecution,
+    FunctionLimits, FunctionOutputResolver, FunctionRecoveryPolicy, FunctionRegistry,
+    SimpleFunction, SuspensionResolution,
 };
 pub use metrics::{
     FunctionCallOutcome, FunctionCallSkipReason, MetricStatus, MetricsRecorder,

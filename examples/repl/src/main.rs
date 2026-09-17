@@ -3,10 +3,9 @@ use canary_agent_kernel::ChatMessage;
 use canary_agent_observability::{init_file_logging, JsonlTraceCollector};
 use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
 use canary_agent_runtime::{
-    builtin_registry, Agent, AgentConfig, AgentError, CompactingContextBuilder, CompactionInput,
-    ContextCompactor, FunctionContext, FunctionRegistry, LocalSessionCoordinator, ModelClient,
-    Result, ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent,
-    TurnStreamEvent,
+    Agent, AgentConfig, AgentError, CompactingContextBuilder, CompactionInput, ContextCompactor,
+    FunctionContext, FunctionRegistry, LocalSessionCoordinator, ModelClient, Result, ThreadStore,
+    TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use canary_agent_store_json::JsonFileThreadStore;
 use canary_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
@@ -79,7 +78,7 @@ async fn main() -> Result<()> {
 }
 
 fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
-    let mut registry = builtin_registry();
+    let mut registry = FunctionRegistry::new();
     register_time_tools(&mut registry);
     registry.register(ExecCommandTool::new(ExecCommandConfig::new(
         command_cwd.clone(),

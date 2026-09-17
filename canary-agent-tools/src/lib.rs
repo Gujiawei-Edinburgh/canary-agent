@@ -95,7 +95,7 @@ mod tests {
     use super::{register_time_tools, GetCurrentTime};
     use canary_agent_kernel::projection::ThreadProjection;
     use canary_agent_runtime::{
-        turn_abort_pair, AgentFunction, FunctionCallExecution, FunctionContext, FunctionRegistry,
+        turn_abort_pair, AgentFunction, FunctionContext, FunctionExecution, FunctionRegistry,
     };
     use serde_json::json;
 
@@ -127,12 +127,11 @@ mod tests {
             .await
             .expect("tool call");
 
-        let FunctionCallExecution::Completed { output, effects } = execution else {
+        let FunctionExecution::Completed { output } = execution else {
             panic!("expected completed tool call");
         };
         assert!(output["utc"].is_string());
         assert!(output["local"].is_string());
         assert!(output["unix_seconds"].is_number());
-        assert!(effects.is_empty());
     }
 }

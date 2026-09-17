@@ -195,10 +195,6 @@ pub enum TurnItemKind {
     SuspensionCreated {
         suspension: Suspension,
     },
-    GoalUpdated {
-        previous: Option<GoalState>,
-        current: GoalState,
-    },
     TurnFailed {
         error: String,
     },
@@ -232,21 +228,6 @@ pub enum ToolResult {
     Success { output: Value },
     Error { error: String },
     Aborted { reason: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GoalState {
-    pub objective: String,
-    pub status: GoalStatus,
-    pub notes: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalStatus {
-    Active,
-    Complete,
-    Blocked,
 }
 
 pub fn new_id(prefix: &str) -> String {
