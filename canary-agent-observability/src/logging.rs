@@ -23,6 +23,8 @@ pub fn init_file_logging(state_dir: impl Into<PathBuf>) -> Result<LoggingGuard> 
 
     tracing_subscriber::fmt()
         .json()
+        .with_file(true)
+        .with_line_number(true)
         .with_ansi(false)
         .with_env_filter(filter)
         .with_writer(non_blocking)
