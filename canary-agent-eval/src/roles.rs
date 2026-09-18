@@ -166,6 +166,7 @@ impl EvaluatedPolicy for RuntimeAgentPolicy {
                 )
                 .await?;
             let status = match outcome {
+                TurnOutcome::CompletedWithoutMessage => AgentActionStatus::Completed,
                 TurnOutcome::AssistantMessage { text } => {
                     if assistant_text.is_empty() {
                         assistant_text = text;

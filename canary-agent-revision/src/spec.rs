@@ -136,6 +136,8 @@ impl ToolSpec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimePolicySpec {
+    #[serde(default)]
+    pub allow_empty_response: bool,
     pub context_builder: ComponentRef,
     pub hooks: Vec<ComponentRef>,
     pub turn_execution_limits: TurnExecutionLimitsSpec,

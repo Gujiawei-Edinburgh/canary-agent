@@ -124,6 +124,12 @@ async fn main() -> canary_agent_runtime::Result<()> {
 
 ## Extension Points
 
+Set `AgentConfig { allow_empty_response: true, ..AgentConfig::default() }` to
+accept a completed model response without text or tool calls. The turn returns
+`TurnOutcome::CompletedWithoutMessage`, including when the first response is empty.
+The default is `false`. Applications remain responsible for validating task completion;
+provider errors, malformed responses, and incomplete streams are still failures.
+
 The runtime is designed to be assembled rather than subclassed.
 
 Goal tracking is application-owned. Goals can remain implicit in conversation and

@@ -299,6 +299,7 @@ async fn run_repl(agent: Agent, store: Arc<JsonFileThreadStore>, thread_id: Stri
         };
 
         match outcome {
+            TurnOutcome::CompletedWithoutMessage => {}
             TurnOutcome::AssistantMessage { text } => {
                 let state = render_state.lock().expect("render state");
                 if !state.assistant_started {

@@ -35,6 +35,7 @@ fn spec() -> AgentSpec {
         },
         tools: BTreeMap::from([(String::from("search"), tool("search"))]),
         runtime: RuntimePolicySpec {
+            allow_empty_response: false,
             context_builder: ComponentRef::new("test::ContextBuilder", json!({}))
                 .expect("context builder"),
             hooks: Vec::new(),

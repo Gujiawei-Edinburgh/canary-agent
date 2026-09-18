@@ -457,14 +457,14 @@ impl ResponseDecoder {
                     normalized["output"] = json!(self.done_items.values().collect::<Vec<_>>());
                 }
                 // A completed-only provider can still supply its output here.
-                self.completed = Some(
-                    completed_response(&normalized).map_err(|error| match error {
+                self.completed = Some(completed_response(&normalized).map_err(
+                    |error| match error {
                         AgentError::Model(message) => {
                             AgentError::Model(format!("{message}; {diagnostic}"))
                         }
                         other => AgentError::Model(format!("{other}; {diagnostic}")),
-                    })?,
-                );
+                    },
+                )?);
             }
             ERROR => {
                 return Err(AgentError::Model(format!(
@@ -599,11 +599,6 @@ fn completed_response(response: &Value) -> Result<ModelResponse> {
                 ))
             }
         }
-    }
-    if text.is_empty() && calls.is_empty() {
-        return Err(AgentError::Model(
-            "Responses completion has no text or function calls".into(),
-        ));
     }
     Ok(ModelResponse::Assistant {
         text: (!text.is_empty()).then_some(text),
@@ -927,11 +922,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_reasoning_only_and_partial_json_report_metadata_and_preserve_usage() {
+    fn partial_json_reports_metadata_and_preserves_usage() {
         for items in [
-            json!([]),
-            json!([{"type": "message", "status": "completed", "content": [{"type": "output_text", "text": ""}]}]),
-            json!([output()[0].clone()]),
             json!([{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{\"q\":"}]),
         ] {
             let mut decoder = ResponseDecoder::default();
@@ -949,6 +941,34 @@ mod tests {
             assert!(!error.contains("opaque")); // No reasoning payload in diagnostics.
             assert_eq!(emitted.len(), 1);
             assert!(matches!(emitted[0], ModelStreamEvent::TokenUsage { .. }));
+        }
+    }
+
+    #[test]
+    fn empty_completed_responses_preserve_usage_and_continuation() {
+        for items in [
+            json!([]),
+            json!([output()[0].clone()]),
+            json!([{"type":"message", "status":"completed", "content":[{"type":"output_text", "text":""}]}]),
+        ] {
+            let mut decoder = ResponseDecoder::default();
+            let mut emitted = Vec::new();
+            feed(&mut decoder, completed(items.clone()), &mut emitted).unwrap();
+            let ModelResponse::Assistant {
+                text,
+                function_calls,
+                continuation,
+            } = decoder.finish().unwrap()
+            else {
+                panic!("expected assistant response");
+            };
+            assert_eq!(text, None);
+            assert!(function_calls.is_empty());
+            assert_eq!(continuation.unwrap().payload, items);
+            assert!(matches!(
+                emitted.as_slice(),
+                [ModelStreamEvent::TokenUsage { .. }]
+            ));
         }
     }
 

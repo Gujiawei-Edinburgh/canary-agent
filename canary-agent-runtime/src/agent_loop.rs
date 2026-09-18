@@ -35,6 +35,8 @@ use tokio::sync::watch;
 
 #[derive(Clone)]
 pub struct AgentConfig {
+    /// Accept a completed model response with no text or function calls as success.
+    pub allow_empty_response: bool,
     pub agent_id: String,
     pub turn_execution_limits: TurnExecutionLimits,
     pub system_prompt: String,
@@ -58,6 +60,7 @@ impl Default for TurnExecutionLimits {
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
+            .field("allow_empty_response", &self.allow_empty_response)
             .field("agent_id", &self.agent_id)
             .field("turn_execution_limits", &self.turn_execution_limits)
             .field("system_prompt", &self.system_prompt)
@@ -69,6 +72,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent_id: "agent".to_string(),
+            allow_empty_response: false,
             turn_execution_limits: TurnExecutionLimits::default(),
             system_prompt: concat!(
                 "You are an agent runtime assistant. Use functions only when they are useful. ",
@@ -82,6 +86,7 @@ impl Default for AgentConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnOutcome {
+    CompletedWithoutMessage,
     AssistantMessage { text: String },
     Suspended { suspension: Suspension },
     Failed { error: String },
@@ -383,6 +388,7 @@ impl Agent {
             },
             tools,
             runtime: RuntimePolicySpec {
+                allow_empty_response: self.config.allow_empty_response,
                 context_builder: self.context_builder.descriptor(),
                 hooks: self
                     .function_call_hooks
@@ -997,7 +1003,9 @@ impl Agent {
                         text,
                         function_calls,
                     } => {
-                        if text.is_none() && function_calls.is_empty() {
+                        let empty = text.as_ref().is_none_or(|text| text.is_empty())
+                            && function_calls.is_empty();
+                        if empty && !self.config.allow_empty_response {
                             let error = "model returned neither assistant text nor function calls"
                                 .to_string();
                             tracing::error!(error, "empty model response");
@@ -1038,7 +1046,11 @@ impl Agent {
                                 &session.active_turn_id,
                                 trace_model_response,
                             );
-                            break 'turn_loop TurnOutcome::AssistantMessage { text };
+                            break 'turn_loop if empty {
+                                TurnOutcome::CompletedWithoutMessage
+                            } else {
+                                TurnOutcome::AssistantMessage { text }
+                            };
                         }
                         let calls = function_calls;
                         if calls.is_empty() {
@@ -1557,14 +1569,18 @@ impl Agent {
         });
         self.commit_thread(thread, lease.fence()).await?;
         let trace_status = match &outcome {
-            TurnOutcome::AssistantMessage { .. } => TraceTurnStatus::Completed,
+            TurnOutcome::AssistantMessage { .. } | TurnOutcome::CompletedWithoutMessage => {
+                TraceTurnStatus::Completed
+            }
             TurnOutcome::Suspended { .. } => TraceTurnStatus::Suspended,
             TurnOutcome::Failed { .. } => TraceTurnStatus::Failed,
             TurnOutcome::Aborted { .. } => TraceTurnStatus::Aborted,
         };
         self.record_metric(RuntimeMetric::TurnFinished {
             status: match &outcome {
-                TurnOutcome::AssistantMessage { .. } => MetricStatus::Completed,
+                TurnOutcome::AssistantMessage { .. } | TurnOutcome::CompletedWithoutMessage => {
+                    MetricStatus::Completed
+                }
                 TurnOutcome::Suspended { .. } => MetricStatus::Suspended,
                 TurnOutcome::Failed { .. } => MetricStatus::Failed,
                 TurnOutcome::Aborted { .. } => MetricStatus::Aborted,
@@ -2575,6 +2591,41 @@ mod tests {
         );
         let thread = store.load("t").await.expect("thread");
         assert_eq!(thread.turns[0].status, TurnStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn empty_response_can_complete_silently_before_or_after_tools() {
+        for with_tool in [false, true] {
+            for text in [None, Some(String::new())] {
+                let store = Arc::new(TestStore::default());
+                let mut responses = Vec::new();
+                if with_tool {
+                    responses.push(ModelResponse::FunctionCalls {
+                        calls: vec![ModelFunctionCall {
+                            call_id: "c1".into(),
+                            name: "test_function".into(),
+                            arguments: json!({}),
+                        }],
+                    });
+                }
+                responses.push(ModelResponse::Assistant {
+                    continuation: None,
+                    text,
+                    function_calls: vec![],
+                });
+                let mut agent = agent_with(store.clone(), responses);
+                agent.config.allow_empty_response = true;
+                assert!(agent.spec_snapshot("build").runtime.allow_empty_response);
+                let outcome = agent.run_turn("t", "act", json!({}), |_| {}).await.unwrap();
+                assert_eq!(outcome, TurnOutcome::CompletedWithoutMessage);
+                let thread = store.load("t").await.unwrap();
+                assert_eq!(thread.turns[0].status, TurnStatus::Completed);
+                assert!(thread.turns[0].items.iter().any(|item| matches!(
+                    &item.kind, TurnItemKind::ModelResponse { text, function_calls, .. }
+                        if text.as_ref().is_none_or(|s| s.is_empty()) && function_calls.is_empty()
+                )));
+            }
+        }
     }
 
     #[tokio::test]

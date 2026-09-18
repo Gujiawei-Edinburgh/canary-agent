@@ -487,6 +487,7 @@ impl Referee for LlmReferee {
 fn require_completed_turn(outcome: TurnOutcome, role: &str) -> canary_agent_eval::Result<String> {
     match outcome {
         TurnOutcome::AssistantMessage { text } => Ok(text),
+        TurnOutcome::CompletedWithoutMessage => Ok(String::new()),
         TurnOutcome::Suspended { suspension } => Err(EvalError::Role(format!(
             "{role} suspended: {:?}: {}",
             suspension.kind, suspension.payload
