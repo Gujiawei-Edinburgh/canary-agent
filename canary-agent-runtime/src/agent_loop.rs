@@ -33,6 +33,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::watch;
 
+#[path = "full_duplex/mod.rs"]
+pub mod full_duplex;
+
 #[derive(Clone)]
 pub struct AgentConfig {
     /// Accept a completed model response with no text or function calls as success.
@@ -795,6 +798,7 @@ impl Agent {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn_internal<'a, F>(
         &self,
         thread_id: &str,
@@ -823,7 +827,29 @@ impl Agent {
             Err(error) => return Err(error),
         };
         let recovering = user_text.is_none();
+        if !ThreadProjection::from_thread(&thread)
+            .active_operations
+            .is_empty()
+            || thread.turns.iter().any(|turn| {
+                (turn.status == TurnStatus::Running || turn.status == TurnStatus::Suspended)
+                    && turn
+                        .items
+                        .iter()
+                        .any(|item| matches!(item.kind, TurnItemKind::FullDuplexOpened))
+            })
+        {
+            return Err(AgentError::FullDuplex(
+                "use recover_full_duplex_turn for an open full-duplex turn".into(),
+            ));
+        }
         let (turn_id, trace_user_text) = if let Some(user_text) = user_text {
+            if thread
+                .turns
+                .iter()
+                .any(|turn| turn.status == TurnStatus::Running)
+            {
+                return Err(AgentError::TurnAlreadyActive(thread_id.to_string()));
+            }
             if let Some(pending) = ThreadProjection::from_thread(&thread).pending_suspension {
                 return Err(AgentError::SuspendedTurn {
                     thread_id: thread_id.to_string(),

@@ -923,25 +923,22 @@ mod tests {
 
     #[test]
     fn partial_json_reports_metadata_and_preserves_usage() {
-        for items in [
-            json!([{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{\"q\":"}]),
-        ] {
-            let mut decoder = ResponseDecoder::default();
-            let mut emitted = Vec::new();
-            let mut event = completed(items);
-            event["response"]["id"] = json!("resp_diagnostic");
-            let error = feed(&mut decoder, event, &mut emitted)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("resp_diagnostic"));
-            assert!(error.starts_with("model error: "));
-            assert_eq!(error.matches("model error:").count(), 1);
-            assert!(error.contains("output_types"));
-            assert!(error.contains("usage"));
-            assert!(!error.contains("opaque")); // No reasoning payload in diagnostics.
-            assert_eq!(emitted.len(), 1);
-            assert!(matches!(emitted[0], ModelStreamEvent::TokenUsage { .. }));
-        }
+        let items = json!([{"type": "function_call", "call_id": "c", "name": "lookup", "arguments": "{\"q\":"}]);
+        let mut decoder = ResponseDecoder::default();
+        let mut emitted = Vec::new();
+        let mut event = completed(items);
+        event["response"]["id"] = json!("resp_diagnostic");
+        let error = feed(&mut decoder, event, &mut emitted)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("resp_diagnostic"));
+        assert!(error.starts_with("model error: "));
+        assert_eq!(error.matches("model error:").count(), 1);
+        assert!(error.contains("output_types"));
+        assert!(error.contains("usage"));
+        assert!(!error.contains("opaque")); // No reasoning payload in diagnostics.
+        assert_eq!(emitted.len(), 1);
+        assert!(matches!(emitted[0], ModelStreamEvent::TokenUsage { .. }));
     }
 
     #[test]

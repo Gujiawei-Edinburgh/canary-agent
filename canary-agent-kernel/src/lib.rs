@@ -11,5 +11,8 @@ pub use model::{
     FunctionSpec, ModelContinuation, ModelFunctionCall, ModelRequest, ModelResponse,
     ModelStreamEvent,
 };
-pub use projection::{ChatMessage, CompletedFunctionCall, PendingSuspension, ThreadProjection};
+pub use projection::{
+    ActiveOperation, ChatMessage, CompletedFunctionCall, OperationStatus, PendingSuspension,
+    ThreadProjection,
+};
 pub use revision::RevisionToken;

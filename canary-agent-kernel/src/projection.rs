@@ -2,6 +2,25 @@ use crate::events::{Suspension, Thread, ToolResult, TurnId, TurnItemKind, TurnSt
 use crate::model::ModelFunctionCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Running,
+    CancellationRequested,
+    Suspended,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveOperation {
+    pub call_id: String,
+    pub name: String,
+    pub operation_id: String,
+    pub status: OperationStatus,
+    pub progress: Option<Value>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingSuspension {
@@ -40,6 +59,7 @@ pub enum ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ThreadProjection {
+    pub active_operations: BTreeMap<String, ActiveOperation>,
     pub conversation: Vec<ChatMessage>,
     pub pending_suspension: Option<PendingSuspension>,
     pub completed_function_results: Vec<CompletedFunctionCall>,
@@ -64,6 +84,85 @@ impl ThreadProjection {
         for turn in &thread.turns {
             for item in &turn.items {
                 match &item.kind {
+                    TurnItemKind::ToolAccepted {
+                        call_id,
+                        name,
+                        operation_id,
+                    } => {
+                        projection.active_operations.insert(
+                            operation_id.clone(),
+                            ActiveOperation {
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                operation_id: operation_id.clone(),
+                                status: OperationStatus::Running,
+                                progress: None,
+                            },
+                        );
+                        projection.conversation.push(ChatMessage::Tool {
+                            tool_call_id: call_id.clone(), name: name.clone(),
+                            content: serde_json::json!({"status":"accepted", "operation_id":operation_id}),
+                        });
+                    }
+                    TurnItemKind::ToolProgress {
+                        operation_id,
+                        progress,
+                    } => {
+                        if let Some(operation) = projection.active_operations.get_mut(operation_id)
+                        {
+                            operation.progress = Some(progress.clone());
+                        }
+                        projection.push_runtime_event(&item.kind);
+                    }
+                    TurnItemKind::ToolCompleted {
+                        call_id,
+                        name,
+                        operation_id,
+                        result,
+                    } => {
+                        projection.active_operations.remove(operation_id);
+                        if let ToolResult::Success { output } = result {
+                            projection
+                                .completed_function_results
+                                .push(CompletedFunctionCall {
+                                    call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    output: output.clone(),
+                                });
+                        }
+                        projection.push_runtime_event(&item.kind);
+                    }
+                    TurnItemKind::ToolCancellationRequested { operation_id } => {
+                        if let Some(operation) = projection.active_operations.get_mut(operation_id)
+                        {
+                            operation.status = OperationStatus::CancellationRequested;
+                        }
+                        projection.push_runtime_event(&item.kind);
+                    }
+                    TurnItemKind::ToolIndeterminate { operation_id, .. } => {
+                        if let Some(operation) = projection.active_operations.get_mut(operation_id)
+                        {
+                            operation.status = OperationStatus::Indeterminate;
+                        }
+                        projection.push_runtime_event(&item.kind);
+                    }
+                    TurnItemKind::ToolSuspended { operation_id, .. } => {
+                        if let Some(operation) = projection.active_operations.get_mut(operation_id)
+                        {
+                            operation.status = OperationStatus::Suspended;
+                        }
+                        projection.push_runtime_event(&item.kind);
+                    }
+                    TurnItemKind::ToolResumed { operation_id } => {
+                        if let Some(operation) = projection.active_operations.get_mut(operation_id)
+                        {
+                            operation.status = OperationStatus::Running;
+                        }
+                        projection.push_runtime_event(&item.kind);
+                    }
+                    TurnItemKind::FullDuplexOpened
+                    | TurnItemKind::InferenceStarted { .. }
+                    | TurnItemKind::InferenceInterrupted { .. } => {}
                     TurnItemKind::UserInput { text, response_to } => {
                         projection.conversation.push(ChatMessage::User {
                             content: text.clone(),
@@ -154,6 +253,12 @@ impl ThreadProjection {
         }
 
         projection
+    }
+
+    fn push_runtime_event(&mut self, kind: &TurnItemKind) {
+        self.conversation.push(ChatMessage::User {
+            content: serde_json::json!({"source":"runtime", "event":kind}).to_string(),
+        });
     }
 }
 

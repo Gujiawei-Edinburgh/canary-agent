@@ -10,9 +10,10 @@ Canary keeps the ReAct model: the model interprets new information and chooses
 responses or tool calls. The runtime records events, coordinates inference,
 tracks tool operations, and streams output. Tools own their operational behavior.
 
-This is a proposed general-purpose execution model, not a description of an
-already implemented API. Audio interaction, robotics, coding, and remote jobs
-are applications of the same model.
+Audio interaction, robotics, coding, and remote jobs are applications of the
+same execution model. The SDK exposes this profile through
+`Agent::open_full_duplex_turn`; the existing `run_turn` API keeps its sequential
+behavior.
 
 ## From Sequential To Full Duplex
 
@@ -216,3 +217,11 @@ The first implementation should demonstrate four cases: superseded inference
 cannot dispatch late calls; new input can control a running operation; completion
 appends without changing acceptance; and concurrent input prevents stale closure.
 Detailed persistence, recovery, and provider contracts follow from those cases.
+
+The initial implementation also exposes `recover_full_duplex_turn`. Recovery
+reconstructs operations from acceptance and terminal events, retries only
+idempotent unfinished executions automatically, and leaves other outcomes
+indeterminate for explicit host reconciliation. Tool suspensions are tracked
+per operation and resolved through the live interaction handle. Cancellation
+and execution timeouts preserve unknown external outcomes when the executor
+cannot confirm completion.

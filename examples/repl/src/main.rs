@@ -19,8 +19,11 @@ use std::io::{self as std_io, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+mod full_duplex;
+
 #[derive(Debug)]
 struct ReplArgs {
+    full_duplex: bool,
     thread: Option<String>,
     state_dir: PathBuf,
     model: String,
@@ -72,7 +75,11 @@ async fn main() -> Result<()> {
     .with_shared_trace_collector(trace_collector.clone())
     .with_context_builder(context_builder);
 
-    let result = run_repl(agent, store, thread_id).await;
+    let result = if args.full_duplex {
+        full_duplex::run(agent, store, thread_id).await
+    } else {
+        run_repl(agent, store, thread_id).await
+    };
     trace_collector.flush().await;
     result
 }
@@ -195,6 +202,7 @@ fn parse_args() -> Result<Command> {
     }
 
     let mut parsed = ReplArgs {
+        full_duplex: false,
         thread: None,
         state_dir: PathBuf::from(".canary-agent"),
         model: env::var("CANARY_AGENT_MODEL").unwrap_or_default(),
@@ -208,6 +216,7 @@ fn parse_args() -> Result<Command> {
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--full-duplex" => parsed.full_duplex = true,
             "--thread" => parsed.thread = args.next(),
             "--state-dir" => parsed.state_dir = PathBuf::from(args.next().unwrap_or_default()),
             "--model" => parsed.model = args.next().unwrap_or_default(),
@@ -245,7 +254,7 @@ fn help_text() -> String {
     concat!(
         "usage: canary-agent-repl repl [--thread ID] [--state-dir PATH] ",
         "[--model NAME] [--base-url URL] [--api-key KEY] ",
-        "[--reasoning-effort VALUE] [--command-cwd PATH]"
+        "[--reasoning-effort VALUE] [--command-cwd PATH] [--full-duplex]"
     )
     .to_string()
 }

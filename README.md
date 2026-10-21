@@ -70,6 +70,7 @@ Useful options include:
 --state-dir PATH         Change the local state directory
 --command-cwd PATH       Working directory for the example command function
 --reasoning-effort VALUE Model reasoning-effort setting
+--full-duplex            Accept input during inference and tool execution
 ```
 
 The example also writes logs and per-thread traces to the state directory:
@@ -80,6 +81,34 @@ The example also writes logs and per-thread traces to the state directory:
   traces/<thread_id>.jsonl
   canary-agent.log
 ```
+
+## Full-Duplex Interactions
+
+To try an interaction that accepts new messages while the agent is working:
+
+```bash
+cargo run -p canary-agent-repl -- repl --model your-model --full-duplex
+```
+
+For library integrations, `Agent::open_full_duplex_turn` returns a live
+`FullDuplexTurn`. Its cloneable `handle()` accepts `append_input`,
+`cancel_operation`, optional `report_progress`, and `resolve_operation` calls.
+Use `next_event()` to receive streaming model output and committed history items,
+then `wait()` to obtain the terminal outcome. Dropping the turn owner requests
+abort; cloned handles alone do not keep an abandoned turn running.
+
+New input supersedes inference while existing tools keep running. Tool acceptance
+and completion are separate immutable records. A text response leaves the turn
+open; the model closes it using the runtime-provided `end_turn` command once no
+operations or unseen inputs remain. `cancel_operation` is also available to the
+model and does not compete for ordinary tool capacity.
+
+After a crash, use `Agent::recover_full_duplex_turn`. Started idempotent operations
+can retry automatically; other unfinished operations require host reconciliation
+through `resolve_operation`. A tool that suspends stays tracked and can be
+resolved through the same handle. The REPL does not provide an approval service.
+See the [runtime design](doc/full-duplex-react-agent-runtime.md) for lifecycle
+and model-protocol details.
 
 ## Library Usage
 

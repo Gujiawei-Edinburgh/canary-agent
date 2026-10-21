@@ -8,6 +8,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tool(name: &str) -> ToolSpec {
@@ -51,13 +52,15 @@ fn spec() -> AgentSpec {
 }
 
 fn repository_path() -> PathBuf {
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "canary-agent-revision-{}-{timestamp}",
-        std::process::id()
+        "canary-agent-revision-{}-{timestamp}-{}",
+        std::process::id(),
+        NEXT_PATH.fetch_add(1, Ordering::Relaxed)
     ))
 }
 

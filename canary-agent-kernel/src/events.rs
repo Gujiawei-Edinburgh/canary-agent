@@ -172,6 +172,46 @@ pub enum TurnItemSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnItemKind {
+    FullDuplexOpened,
+    InferenceStarted {
+        inference_id: String,
+        history_position: usize,
+    },
+    InferenceInterrupted {
+        inference_id: String,
+        reason: String,
+    },
+    ToolAccepted {
+        call_id: String,
+        name: String,
+        operation_id: String,
+    },
+    ToolProgress {
+        operation_id: String,
+        progress: Value,
+    },
+    ToolCompleted {
+        call_id: String,
+        name: String,
+        operation_id: String,
+        result: ToolResult,
+    },
+    ToolCancellationRequested {
+        operation_id: String,
+    },
+    ToolIndeterminate {
+        operation_id: String,
+        reason: String,
+    },
+    ToolSuspended {
+        operation_id: String,
+        suspension: Suspension,
+        before_execution: bool,
+        output: Option<Value>,
+    },
+    ToolResumed {
+        operation_id: String,
+    },
     UserInput {
         text: String,
         response_to: Option<String>,

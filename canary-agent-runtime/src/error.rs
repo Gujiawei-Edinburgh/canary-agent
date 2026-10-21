@@ -5,6 +5,8 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("full-duplex interaction error: {0}")]
+    FullDuplex(String),
     #[error("thread not found: {0}")]
     ThreadNotFound(String),
 

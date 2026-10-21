@@ -7,6 +7,8 @@ pub mod model;
 pub mod session;
 pub mod store;
 pub mod trace;
+pub use agent_loop::full_duplex;
+pub use full_duplex::{FullDuplexConfig, FullDuplexEvent, FullDuplexHandle, FullDuplexTurn};
 
 pub use agent_loop::{
     turn_abort_pair, Agent, AgentConfig, FunctionCallHook, FunctionCallHookContext,
