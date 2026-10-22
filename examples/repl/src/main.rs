@@ -4,26 +4,22 @@ use canary_agent_observability::{init_file_logging, JsonlTraceCollector};
 use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
 use canary_agent_runtime::{
     Agent, AgentConfig, AgentError, CompactingContextBuilder, CompactionInput, ContextCompactor,
-    FunctionContext, FunctionRegistry, LocalSessionCoordinator, ModelClient, Result, ThreadStore,
-    TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    FunctionContext, FunctionRegistry, LocalSessionCoordinator, ModelClient, Result,
+    TraceCollector,
 };
 use canary_agent_store_json::JsonFileThreadStore;
 use canary_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
 use canary_agent_tools::{
     register_time_tools, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
 };
-use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
 use std::env;
-use std::io::{self as std_io, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-mod full_duplex;
+mod repl;
 
 #[derive(Debug)]
 struct ReplArgs {
-    full_duplex: bool,
     thread: Option<String>,
     state_dir: PathBuf,
     model: String,
@@ -75,11 +71,7 @@ async fn main() -> Result<()> {
     .with_shared_trace_collector(trace_collector.clone())
     .with_context_builder(context_builder);
 
-    let result = if args.full_duplex {
-        full_duplex::run(agent, store, thread_id).await
-    } else {
-        run_repl(agent, store, thread_id).await
-    };
+    let result = repl::run(agent, store, thread_id).await;
     trace_collector.flush().await;
     result
 }
@@ -202,7 +194,6 @@ fn parse_args() -> Result<Command> {
     }
 
     let mut parsed = ReplArgs {
-        full_duplex: false,
         thread: None,
         state_dir: PathBuf::from(".canary-agent"),
         model: env::var("CANARY_AGENT_MODEL").unwrap_or_default(),
@@ -216,7 +207,6 @@ fn parse_args() -> Result<Command> {
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--full-duplex" => parsed.full_duplex = true,
             "--thread" => parsed.thread = args.next(),
             "--state-dir" => parsed.state_dir = PathBuf::from(args.next().unwrap_or_default()),
             "--model" => parsed.model = args.next().unwrap_or_default(),
@@ -254,204 +244,7 @@ fn help_text() -> String {
     concat!(
         "usage: canary-agent-repl repl [--thread ID] [--state-dir PATH] ",
         "[--model NAME] [--base-url URL] [--api-key KEY] ",
-        "[--reasoning-effort VALUE] [--command-cwd PATH] [--full-duplex]"
+        "[--reasoning-effort VALUE] [--command-cwd PATH]"
     )
     .to_string()
-}
-
-async fn run_repl(agent: Agent, store: Arc<JsonFileThreadStore>, thread_id: String) -> Result<()> {
-    let mut editor = DefaultEditor::new()
-        .map_err(|error| AgentError::Model(format!("failed to initialize REPL: {error}")))?;
-
-    println!("thread: {thread_id}");
-
-    loop {
-        let line = match editor.readline("> ") {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => break,
-            Err(ReadlineError::Eof) => break,
-            Err(error) => {
-                return Err(AgentError::Model(format!("failed to read input: {error}")));
-            }
-        };
-        let input = line.trim();
-        if input.eq_ignore_ascii_case("/exit") || input.eq_ignore_ascii_case("/quit") {
-            break;
-        }
-        if input.is_empty() {
-            continue;
-        }
-        let _ = editor.add_history_entry(input);
-
-        let render_state = Arc::new(Mutex::new(StreamRenderState::default()));
-        let render_state_for_events = render_state.clone();
-        let turn = agent.run_turn(
-            &thread_id,
-            input.to_string(),
-            serde_json::json!({}),
-            move |event| {
-                if let Ok(mut state) = render_state_for_events.lock() {
-                    print_stream_event(event, &mut state);
-                }
-            },
-        );
-        tokio::pin!(turn);
-        let outcome = tokio::select! {
-            result = &mut turn => result?,
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(AgentError::Io)?;
-                agent.abort(&thread_id)?;
-                let outcome = turn.await?;
-                println!();
-                outcome
-            }
-        };
-
-        match outcome {
-            TurnOutcome::CompletedWithoutMessage => {}
-            TurnOutcome::AssistantMessage { text } => {
-                let state = render_state.lock().expect("render state");
-                if !state.assistant_started {
-                    drop(state);
-                    println!("{text}");
-                } else if state.line_open {
-                    drop(state);
-                    println!();
-                }
-            }
-            TurnOutcome::Suspended { suspension } => {
-                println!("suspended ({:?}): {}", suspension.kind, suspension.payload);
-            }
-            TurnOutcome::Failed { error } => {
-                println!("turn failed: {error}");
-            }
-            TurnOutcome::Aborted { reason: _ } => {
-                continue;
-            }
-        }
-    }
-
-    print_thread_token_usage(store, &thread_id).await?;
-    Ok(())
-}
-
-async fn print_thread_token_usage(store: Arc<JsonFileThreadStore>, thread_id: &str) -> Result<()> {
-    match store.load(thread_id).await {
-        Ok(thread) => {
-            println!("[thread tokens] {}", thread.token_usage);
-        }
-        Err(AgentError::ThreadNotFound(_)) => {
-            println!("[thread tokens] input=0, cached_input=0, output=0, total=0");
-        }
-        Err(error) => return Err(error),
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct StreamRenderState {
-    assistant_started: bool,
-    line_open: bool,
-}
-
-fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
-    match event {
-        TurnStreamEvent::State(TurnStateEvent::TurnStarted { turn_id, .. }) => {
-            print_process_line(state, &format!("[turn started] {turn_id}"));
-        }
-        TurnStreamEvent::Model(TurnModelEvent::RequestStarted { iteration }) => {
-            print_process_line(state, &format!("[model] iteration {iteration}"));
-        }
-        TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested { calls }) => {
-            for call in calls {
-                print_process_line(
-                    state,
-                    &format!("[function requested] {} {}", call.name, call.arguments),
-                );
-            }
-        }
-        TurnStreamEvent::State(TurnStateEvent::FunctionStarted { call_id, name }) => {
-            print_process_line(state, &format!("[function started] {name} ({call_id})"));
-        }
-        TurnStreamEvent::State(TurnStateEvent::FunctionCompleted { call_id, name }) => {
-            print_process_line(state, &format!("[function completed] {name} ({call_id})"));
-        }
-        TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
-            call_id,
-            name,
-            error,
-        }) => {
-            print_process_line(
-                state,
-                &format!("[function failed] {name} ({call_id}): {error}"),
-            );
-        }
-        TurnStreamEvent::State(TurnStateEvent::Suspended { suspension }) => {
-            print_process_line(
-                state,
-                &format!("[suspended {:?}] {}", suspension.kind, suspension.payload),
-            );
-        }
-        TurnStreamEvent::State(TurnStateEvent::TurnFailed { error }) => {
-            print_process_line(state, &format!("[turn failed] {error}"));
-        }
-        TurnStreamEvent::State(TurnStateEvent::TurnAborted { reason }) => {
-            print_process_line(state, &format!("[turn aborted] {reason}"));
-        }
-        TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { text }) => {
-            if !text.is_empty() {
-                state.assistant_started = true;
-                state.line_open = !text.ends_with('\n');
-                print!("{text}");
-                let _ = std_io::stdout().flush();
-            }
-        }
-        TurnStreamEvent::FunctionHook(event) => {
-            print_process_line(
-                state,
-                &format!("[function hook:{}] {}", event.hook_fqn, event.message),
-            );
-        }
-        TurnStreamEvent::Model(TurnModelEvent::AssistantResponse { .. })
-        | TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { .. })
-        | TurnStreamEvent::State(TurnStateEvent::TurnFinished { .. }) => {}
-    }
-}
-
-fn print_process_line(state: &mut StreamRenderState, line: &str) {
-    if state.line_open {
-        println!();
-        state.line_open = false;
-    }
-    println!("{line}");
-    let _ = std_io::stdout().flush();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{print_stream_event, StreamRenderState};
-    use canary_agent_runtime::{TurnModelEvent, TurnStreamEvent};
-
-    #[test]
-    fn assistant_delta_marks_line_open_until_newline() {
-        let mut state = StreamRenderState::default();
-
-        print_stream_event(
-            TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
-                text: "你好".to_string(),
-            }),
-            &mut state,
-        );
-        assert!(state.assistant_started);
-        assert!(state.line_open);
-
-        print_stream_event(
-            TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
-                text: "\n".to_string(),
-            }),
-            &mut state,
-        );
-        assert!(state.assistant_started);
-        assert!(!state.line_open);
-    }
 }

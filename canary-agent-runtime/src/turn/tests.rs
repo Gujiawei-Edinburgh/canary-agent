@@ -1,13 +1,89 @@
 use super::*;
 use crate::model::ModelStreamHandler;
 use crate::store::ThreadContextCache;
-use crate::{FunctionLimits, LocalSessionCoordinator, ModelDescriptor, SimpleFunction};
-use canary_agent_kernel::{ChatMessage, RevisionToken};
+use crate::trace::{TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus};
+use crate::{
+    AgentConfig, FunctionCallHook, FunctionCallHookContext, FunctionCallHookResult,
+    FunctionContext, FunctionExecution, FunctionHookEventHandler, FunctionLimits,
+    FunctionRecoveryPolicy, FunctionRegistry, LocalSessionCoordinator, ModelClient,
+    ModelDescriptor, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
+    SimpleFunction, ThreadStore,
+};
+use canary_agent_kernel::{
+    new_id, ChatMessage, RevisionToken, Suspension, SuspensionKind, TokenUsage, ToolResult,
+    TurnItemKind,
+};
+use canary_agent_revision::AgentBuildRef;
 use serde_json::json;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Default)]
 struct MemoryStore(Mutex<HashMap<String, Thread>>);
+
+#[derive(Default)]
+struct RecordedTrace(Mutex<Vec<TraceEvent>>);
+
+impl TraceCollector for RecordedTrace {
+    fn record(&self, event: TraceEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+struct TestHook {
+    name: &'static str,
+    calls: Arc<Mutex<Vec<String>>>,
+    fail_before: bool,
+    fail_after: bool,
+    store: Arc<MemoryStore>,
+}
+
+impl FunctionCallHook for TestHook {
+    fn descriptor(&self) -> canary_agent_revision::ComponentRef {
+        canary_agent_revision::ComponentRef::new(self.name, json!({})).unwrap()
+    }
+
+    fn before_call<'a>(
+        &'a self,
+        _: FunctionCallHookContext,
+        _: &'a mut FunctionHookEventHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("before:{}", self.name));
+            if self.fail_before {
+                return Err(AgentError::Model("blocked by hook".into()));
+            }
+            Ok(())
+        })
+    }
+
+    fn after_call<'a>(
+        &'a self,
+        context: FunctionCallHookContext,
+        _: FunctionCallHookResult,
+        _: &'a mut FunctionHookEventHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            assert!(self.store.0.lock().unwrap()["thread"].turns[0].items.iter().any(|item| {
+                matches!(&item.kind, TurnItemKind::ToolCompleted { call_id, .. } if call_id == &context.call_id)
+            }), "post-hook must observe a durable outcome");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("after:{}", self.name));
+            if self.fail_after {
+                return Err(AgentError::Model("post-hook failed".into()));
+            }
+            Ok(())
+        })
+    }
+}
 
 impl ThreadStore for MemoryStore {
     fn load<'a>(
@@ -169,9 +245,9 @@ impl Harness {
         }
     }
 
-    async fn open(&self) -> FullDuplexTurn {
+    async fn open(&self) -> RunningTurn {
         self.agent
-            .open_full_duplex_turn(
+            .open_turn(
                 "thread",
                 "original request",
                 json!({"owner":"test"}),
@@ -205,10 +281,10 @@ impl Harness {
     }
 }
 
-fn config() -> FullDuplexConfig {
-    FullDuplexConfig {
+fn config() -> TurnConfig {
+    TurnConfig {
         cancellation_grace: Duration::from_millis(20),
-        ..FullDuplexConfig::default()
+        ..TurnConfig::default()
     }
 }
 fn call(id: &str, name: &str) -> ModelFunctionCall {
@@ -241,10 +317,7 @@ fn done(invocation: Invocation) {
         .unwrap();
 }
 
-async fn event(
-    turn: &mut FullDuplexTurn,
-    predicate: impl Fn(&FullDuplexEvent) -> bool,
-) -> FullDuplexEvent {
+async fn event(turn: &mut RunningTurn, predicate: impl Fn(&TurnEvent) -> bool) -> TurnEvent {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let event = turn.next_event().await.unwrap();
@@ -257,10 +330,10 @@ async fn event(
     .expect("expected runtime event")
 }
 
-async fn idle(turn: &mut FullDuplexTurn) {
-    event(turn, |event| matches!(event, FullDuplexEvent::Idle)).await;
+async fn idle(turn: &mut RunningTurn) {
+    event(turn, |event| matches!(event, TurnEvent::Idle)).await;
 }
-async fn finish(turn: FullDuplexTurn) -> TurnOutcome {
+async fn finish(turn: RunningTurn) -> TurnOutcome {
     tokio::time::timeout(Duration::from_secs(2), turn.wait())
         .await
         .expect("turn terminates")
@@ -285,9 +358,190 @@ async fn input_supersedes_inference_and_drops_its_future() {
         })
         .is_err());
     respond(current, vec![call("close", "end_turn")]);
-    assert_eq!(finish(turn).await, TurnOutcome::CompletedWithoutMessage);
+    assert_eq!(finish(turn).await, TurnOutcome::Completed);
     assert!(!h.items().iter().any(|item| matches!(&item.kind, TurnItemKind::ModelResponse { function_calls, .. } if function_calls.iter().any(|call| call.call_id == "stale"))));
     assert!(h.invocations.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn explicit_closure_preserves_final_text_and_emits_committed_completion() {
+    let mut h = Harness::new();
+    let mut turn = h.open().await;
+    h.request()
+        .await
+        .reply
+        .send(ModelResponse::Assistant {
+            continuation: None,
+            text: Some("final answer".into()),
+            function_calls: vec![call("close", "end_turn")],
+        })
+        .unwrap();
+    let finished = event(&mut turn, |event| {
+        matches!(event, TurnEvent::Finished { .. })
+    })
+    .await;
+    assert_eq!(
+        finished,
+        TurnEvent::Finished {
+            outcome: TurnOutcome::Completed
+        }
+    );
+    assert_eq!(
+        h.store.0.lock().unwrap()["thread"].turns[0].status,
+        TurnStatus::Completed
+    );
+    assert!(h.items().iter().any(|item| matches!(&item.kind, TurnItemKind::ModelResponse { text: Some(text), function_calls, .. } if text == "final answer" && function_calls[0].name == "end_turn")));
+    assert_eq!(finish(turn).await, TurnOutcome::Completed);
+
+    let next = h
+        .agent
+        .open_turn(
+            "thread",
+            "another question",
+            json!({"owner":"replacement"}),
+            config(),
+        )
+        .await
+        .unwrap();
+    respond(h.request().await, vec![call("close-next", "end_turn")]);
+    assert_eq!(finish(next).await, TurnOutcome::Completed);
+    let threads = h.store.0.lock().unwrap();
+    assert_eq!(threads["thread"].metadata, json!({"owner":"test"}));
+    assert_eq!(threads["thread"].turns.len(), 2);
+}
+
+#[tokio::test]
+async fn empty_response_is_either_failed_or_idle_but_never_successful_closure() {
+    for allowed in [false, true] {
+        let mut h = Harness::new();
+        h.agent.config.allow_empty_response = allowed;
+        let mut turn = h.open().await;
+        respond(h.request().await, vec![]);
+        if allowed {
+            idle(&mut turn).await;
+            assert_eq!(
+                h.store.0.lock().unwrap()["thread"].turns[0].status,
+                TurnStatus::Running
+            );
+            assert!(h.requests.try_recv().is_err());
+            turn.handle().append_input("finish now").await.unwrap();
+            respond(h.request().await, vec![call("close", "end_turn")]);
+            assert_eq!(finish(turn).await, TurnOutcome::Completed);
+        } else {
+            assert!(matches!(finish(turn).await, TurnOutcome::Failed { .. }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn token_usage_and_trajectory_remain_durable_after_explicit_closure() {
+    let mut h = Harness::new();
+    let traces = Arc::new(RecordedTrace::default());
+    h.agent = h.agent.with_shared_trace_collector(traces.clone());
+    let mut turn = h.open().await;
+    let request = h.request().await;
+    let usage = TokenUsage {
+        input_tokens: 10,
+        cached_input_tokens: 5,
+        output_tokens: 3,
+        total_tokens: 13,
+    };
+    request
+        .deltas
+        .send(ModelStreamEvent::TokenUsage { usage })
+        .await
+        .unwrap();
+    event(&mut turn, |event| {
+        matches!(
+            event,
+            TurnEvent::Model {
+                event: ModelStreamEvent::TokenUsage { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    respond(request, vec![call("close", "end_turn")]);
+    assert_eq!(finish(turn).await, TurnOutcome::Completed);
+    assert_eq!(h.store.0.lock().unwrap()["thread"].token_usage, usage);
+    let trace = traces.0.lock().unwrap();
+    assert!(trace.iter().any(|event| matches!(
+        event.kind,
+        TraceEventKind::TurnFinished {
+            status: TraceTurnStatus::Completed
+        }
+    )));
+    assert!(trace.iter().any(|event| matches!(&event.kind, TraceEventKind::InteractionItem { item } if matches!(item.kind, TurnItemKind::UserInput { .. }))));
+    assert!(trace
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence));
+}
+
+#[tokio::test]
+async fn hooks_unwind_only_entered_hooks_and_post_failures_do_not_fail_the_turn() {
+    for blocked in [false, true] {
+        let mut h = Harness::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        for (name, fail_before) in [("first", false), ("second", blocked), ("third", false)] {
+            h.agent = h.agent.with_function_call_hook(TestHook {
+                name,
+                calls: calls.clone(),
+                fail_before,
+                fail_after: name == "first",
+                store: h.store.clone(),
+            });
+        }
+        let mut turn = h.open().await;
+        respond(h.request().await, vec![call("tool", "slow")]);
+        if !blocked {
+            done(h.invocation().await);
+        }
+        let request = h.request().await;
+        event(&mut turn, |event| matches!(event, TurnEvent::Hook { event } if event.message == "post-hook failed")).await;
+        respond(request, vec![call("close", "end_turn")]);
+        assert_eq!(finish(turn).await, TurnOutcome::Completed);
+        let expected = if blocked {
+            vec!["before:first", "before:second", "after:first"]
+        } else {
+            vec![
+                "before:first",
+                "before:second",
+                "before:third",
+                "after:third",
+                "after:second",
+                "after:first",
+            ]
+        };
+        assert_eq!(*calls.lock().unwrap(), expected);
+        let result = h
+            .items()
+            .into_iter()
+            .find_map(|item| match item.kind {
+                TurnItemKind::ToolCompleted {
+                    call_id, result, ..
+                } if call_id == "tool" => Some(result),
+                _ => None,
+            })
+            .expect("durable tool result");
+        assert_eq!(matches!(result, ToolResult::Error { .. }), blocked);
+        assert!(h.invocations.try_recv().is_err());
+    }
+}
+
+#[test]
+fn spec_snapshot_still_describes_the_live_agent() {
+    let h = Harness::new();
+    let snapshot = h.agent.spec_snapshot(AgentBuildRef {
+        id: "application-build".into(),
+    });
+    assert_eq!(snapshot.build.id, "application-build");
+    assert_eq!(snapshot.model.fqn, "test/controlled");
+    assert_eq!(snapshot.prompts.system, h.agent.config.system_prompt);
+    assert!(snapshot.tools.contains_key("slow"));
+    assert_eq!(
+        snapshot.tools["slow"].interface.parameters,
+        json!({"type":"object"})
+    );
 }
 
 #[tokio::test]
@@ -305,7 +559,7 @@ async fn streaming_is_interruptible_and_text_only_leaves_turn_open() {
     event(&mut turn, |event| {
         matches!(
             event,
-            FullDuplexEvent::Model {
+            TurnEvent::Model {
                 event: ModelStreamEvent::AssistantDelta { .. },
                 ..
             }
@@ -313,7 +567,7 @@ async fn streaming_is_interruptible_and_text_only_leaves_turn_open() {
     })
     .await;
     turn.handle().append_input("interrupt").await.unwrap();
-    event(&mut turn, |event| matches!(event, FullDuplexEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::InferenceInterrupted { .. }))).await;
+    event(&mut turn, |event| matches!(event, TurnEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::InferenceInterrupted { .. }))).await;
     text(h.request().await);
     idle(&mut turn).await;
     assert_eq!(
@@ -393,7 +647,7 @@ async fn unseen_completion_prevents_stale_closure() {
     turn.handle().append_input("are we done?").await.unwrap();
     let old_view = h.request().await;
     done(invocation);
-    event(&mut turn, |event| matches!(event, FullDuplexEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolCompleted { .. }))).await;
+    event(&mut turn, |event| matches!(event, TurnEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolCompleted { .. }))).await;
     respond(old_view, vec![call("stale_close", "end_turn")]);
     let fresh = h.request().await;
     assert!(fresh.request.messages.iter().any(|message| matches!(message, ChatMessage::Tool { tool_call_id, content, .. } if tool_call_id == "stale_close" && content.as_str().is_some_and(|text| text.contains("cannot close")))));
@@ -458,7 +712,7 @@ async fn uncooperative_cancellation_requires_reconciliation() {
         })
         .unwrap();
     turn.handle().cancel_operation(&accepted).await.unwrap();
-    event(&mut turn, |event| matches!(event, FullDuplexEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolIndeterminate { .. }))).await;
+    event(&mut turn, |event| matches!(event, TurnEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolIndeterminate { .. }))).await;
     assert!(invocation.reply.is_closed());
     text(h.request().await);
     idle(&mut turn).await;
@@ -524,7 +778,7 @@ async fn recovery_retries_only_idempotent_started_operations() {
     let mut turn = Turn::new();
     turn.push_item(TurnItem::new(
         TurnItemSource::Runtime,
-        TurnItemKind::FullDuplexOpened,
+        TurnItemKind::TurnOpened,
     ));
     let calls = vec![call("read", "slow"), call("write", "write")];
     turn.push_item(TurnItem::new(
@@ -555,11 +809,7 @@ async fn recovery_retries_only_idempotent_started_operations() {
     }
     thread.turns.push(turn);
     h.store.0.lock().unwrap().insert("thread".into(), thread);
-    let mut turn = h
-        .agent
-        .recover_full_duplex_turn("thread", config())
-        .await
-        .unwrap();
+    let mut turn = h.agent.recover_turn("thread", config()).await.unwrap();
     let invocation = h.invocation().await;
     assert_eq!(invocation.context.call_id, "read");
     text(h.request().await);
@@ -618,7 +868,7 @@ async fn progress_is_optional_and_does_not_schedule_inference() {
         .report_progress(&id, json!({"step":2}))
         .await
         .unwrap();
-    event(&mut turn, |event| matches!(event, FullDuplexEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolProgress { .. }))).await;
+    event(&mut turn, |event| matches!(event, TurnEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolProgress { .. }))).await;
     assert!(h.requests.try_recv().is_err());
     turn.handle().append_input("status?").await.unwrap();
     let request = h.request().await;
@@ -667,7 +917,7 @@ async fn operation_panic_is_indeterminate_and_does_not_strand_the_interaction() 
     ));
     let mut turn = h.open().await;
     respond(h.request().await, vec![call("a", "panic")]);
-    event(&mut turn, |event| matches!(event, FullDuplexEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolIndeterminate { .. }))).await;
+    event(&mut turn, |event| matches!(event, TurnEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::ToolIndeterminate { .. }))).await;
     text(h.request().await);
     idle(&mut turn).await;
     turn.handle().abort();

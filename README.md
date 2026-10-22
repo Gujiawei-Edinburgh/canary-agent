@@ -70,7 +70,6 @@ Useful options include:
 --state-dir PATH         Change the local state directory
 --command-cwd PATH       Working directory for the example command function
 --reasoning-effort VALUE Model reasoning-effort setting
---full-duplex            Accept input during inference and tool execution
 ```
 
 The example also writes logs and per-thread traces to the state directory:
@@ -82,16 +81,16 @@ The example also writes logs and per-thread traces to the state directory:
   canary-agent.log
 ```
 
-## Full-Duplex Interactions
+## Turn Execution
 
 To try an interaction that accepts new messages while the agent is working:
 
 ```bash
-cargo run -p canary-agent-repl -- repl --model your-model --full-duplex
+cargo run -p canary-agent-repl -- repl --model your-model
 ```
 
-For library integrations, `Agent::open_full_duplex_turn` returns a live
-`FullDuplexTurn`. Its cloneable `handle()` accepts `append_input`,
+For library integrations, `Agent::open_turn` returns a live
+`RunningTurn`. Its cloneable `handle()` accepts `append_input`,
 `cancel_operation`, optional `report_progress`, and `resolve_operation` calls.
 Use `next_event()` to receive streaming model output and committed history items,
 then `wait()` to obtain the terminal outcome. Dropping the turn owner requests
@@ -103,11 +102,11 @@ open; the model closes it using the runtime-provided `end_turn` command once no
 operations or unseen inputs remain. `cancel_operation` is also available to the
 model and does not compete for ordinary tool capacity.
 
-After a crash, use `Agent::recover_full_duplex_turn`. Started idempotent operations
+After a crash, use `Agent::recover_turn`. Started idempotent operations
 can retry automatically; other unfinished operations require host reconciliation
 through `resolve_operation`. A tool that suspends stays tracked and can be
 resolved through the same handle. The REPL does not provide an approval service.
-See the [runtime design](doc/full-duplex-react-agent-runtime.md) for lifecycle
+See the [runtime design](doc/agent-runtime.md) for lifecycle
 and model-protocol details.
 
 ## Library Usage
@@ -118,7 +117,7 @@ An application can assemble the runtime from the provided adapters:
 use canary_agent_kernel::new_id;
 use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
 use canary_agent_observability::JsonlTraceCollector;
-use canary_agent_runtime::{Agent, AgentConfig, FunctionRegistry};
+use canary_agent_runtime::{Agent, AgentConfig, TurnConfig, FunctionRegistry, LocalSessionCoordinator};
 use canary_agent_store_json::JsonFileThreadStore;
 use std::sync::Arc;
 
@@ -140,12 +139,20 @@ async fn main() -> canary_agent_runtime::Result<()> {
         store,
         model,
         FunctionRegistry::new(),
+        Arc::new(LocalSessionCoordinator::default()),
     )
     .with_trace_collector(trace);
 
-    let outcome = agent
-        .run_turn(&thread_id, "Hello", serde_json::json!({}), |_| {})
+    let mut turn = agent
+        .open_turn(&thread_id, "Hello", serde_json::json!({}), TurnConfig::default())
         .await?;
+    // The host can append input through turn.handle() while work is running.
+    while let Ok(event) = turn.next_event().await {
+        let finished = matches!(&event, canary_agent_runtime::TurnEvent::Finished { .. });
+        println!("{event:?}");
+        if finished { break; }
+    }
+    let outcome = turn.wait().await?;
     println!("{outcome:?}");
     Ok(())
 }
@@ -154,8 +161,9 @@ async fn main() -> canary_agent_runtime::Result<()> {
 ## Extension Points
 
 Set `AgentConfig { allow_empty_response: true, ..AgentConfig::default() }` to
-accept a completed model response without text or tool calls. The turn returns
-`TurnOutcome::CompletedWithoutMessage`, including when the first response is empty.
+accept a completed model response without text or tool calls and leave the turn idle.
+Only an accepted `end_turn()` call successfully completes the turn and emits
+`TurnEvent::Finished { outcome: TurnOutcome::Completed }`.
 The default is `false`. Applications remain responsible for validating task completion;
 provider errors, malformed responses, and incomplete streams are still failures.
 
@@ -172,7 +180,7 @@ context history; applications needing structured goal tracking can provide a cus
 | Store threads elsewhere | Implement `ThreadStore` |
 | Change context selection or compaction | Implement `ContextBuilder` and `ContextCompactor` |
 | Collect trajectory data | Implement `TraceCollector` |
-| Change UI or streaming presentation | Map `TurnStreamEvent` in the host |
+| Change UI or streaming presentation | Map `TurnEvent` in the host |
 
 The built-in functions are deliberately small and scoped to the runtime. Applications add domain behavior through registered functions rather than through skills or hidden business logic in the loop.
 

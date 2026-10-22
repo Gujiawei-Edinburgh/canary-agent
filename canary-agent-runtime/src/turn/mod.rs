@@ -2,13 +2,19 @@
 mod runner;
 mod worker;
 
-use super::*;
+use crate::functions::SuspensionResolution;
+use crate::model::ModelStreamEvent;
+use crate::{Agent, AgentError, FunctionHookEvent, Result, TurnAbortHandle, TurnOutcome};
+use canary_agent_kernel::{Thread, ThreadProjection, TurnStatus};
+use canary_agent_kernel::{Turn, TurnItem, TurnItemKind, TurnItemSource};
+use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
-pub struct FullDuplexConfig {
+/// Queue capacity, operation concurrency, and cancellation settings for a turn.
+pub struct TurnConfig {
     pub input_capacity: usize,
     pub event_capacity: usize,
     pub max_concurrent_operations: usize,
@@ -17,7 +23,7 @@ pub struct FullDuplexConfig {
     pub cancellation_grace: Duration,
 }
 
-impl Default for FullDuplexConfig {
+impl Default for TurnConfig {
     fn default() -> Self {
         Self {
             input_capacity: 64,
@@ -29,7 +35,8 @@ impl Default for FullDuplexConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum FullDuplexEvent {
+/// Live model output, committed history, and lifecycle notifications.
+pub enum TurnEvent {
     ItemCommitted {
         item: TurnItem,
     },
@@ -38,7 +45,7 @@ pub enum FullDuplexEvent {
         event: ModelStreamEvent,
     },
     Hook {
-        event: TurnStreamEvent,
+        event: FunctionHookEvent,
     },
     Idle,
     Finished {
@@ -48,12 +55,12 @@ pub enum FullDuplexEvent {
 
 /// Cloneable ingress. Acknowledgments mean that the event has been persisted.
 #[derive(Clone)]
-pub struct FullDuplexHandle {
+pub struct TurnHandle {
     sender: mpsc::Sender<Command>,
     abort: TurnAbortHandle,
 }
 
-impl FullDuplexHandle {
+impl TurnHandle {
     pub async fn append_input(&self, text: impl Into<String>) -> Result<String> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Input {
@@ -116,28 +123,29 @@ impl FullDuplexHandle {
     }
 }
 
-/// Dropping this owner aborts the interaction. Cloned ingress handles do not own it.
-pub struct FullDuplexTurn {
+/// Live execution owner, distinct from the durable `canary_agent_kernel::Turn`.
+/// Dropping it aborts the interaction. Cloned ingress handles do not own it.
+pub struct RunningTurn {
     pub thread_id: String,
     pub turn_id: String,
-    handle: FullDuplexHandle,
-    events: broadcast::Receiver<FullDuplexEvent>,
+    handle: TurnHandle,
+    events: broadcast::Receiver<TurnEvent>,
     task: Option<JoinHandle<Result<TurnOutcome>>>,
 }
 
-impl FullDuplexTurn {
-    pub fn handle(&self) -> FullDuplexHandle {
+impl RunningTurn {
+    pub fn handle(&self) -> TurnHandle {
         self.handle.clone()
     }
 
     /// A slow subscriber gets `Lagged`; durable items can be reloaded from storage.
     pub async fn next_event(
         &mut self,
-    ) -> std::result::Result<FullDuplexEvent, broadcast::error::RecvError> {
+    ) -> std::result::Result<TurnEvent, broadcast::error::RecvError> {
         self.events.recv().await
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<FullDuplexEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<TurnEvent> {
         self.events.resubscribe()
     }
 
@@ -146,12 +154,12 @@ impl FullDuplexTurn {
         // Keep ownership while awaiting so cancellation of wait also aborts.
         let result = (&mut task)
             .await
-            .map_err(|error| AgentError::FullDuplex(error.to_string()))?;
+            .map_err(|error| AgentError::TurnExecution(error.to_string()))?;
         result
     }
 }
 
-impl Drop for FullDuplexTurn {
+impl Drop for RunningTurn {
     fn drop(&mut self) {
         self.handle.abort();
     }
@@ -179,42 +187,41 @@ enum Command {
 }
 
 fn closed() -> AgentError {
-    AgentError::FullDuplex("interaction is closed".into())
+    AgentError::TurnExecution("interaction is closed".into())
 }
 
 impl Agent {
-    pub async fn open_full_duplex_turn(
+    /// Opens an interaction and starts inference. Only an accepted end_turn call
+    /// successfully completes it; a text-only response leaves it open for input.
+    /// Metadata initializes a new thread and does not replace existing metadata.
+    pub async fn open_turn(
         &self,
         thread_id: &str,
         user_text: impl Into<String>,
         metadata: Value,
-        config: FullDuplexConfig,
-    ) -> Result<FullDuplexTurn> {
-        self.start_full_duplex(thread_id, Some((user_text.into(), metadata)), config)
+        config: TurnConfig,
+    ) -> Result<RunningTurn> {
+        self.start_turn(thread_id, Some((user_text.into(), metadata)), config)
             .await
     }
 
     /// Reconstruct an open interaction. Only idempotent started operations retry
     /// automatically; other unfinished operations require explicit reconciliation.
-    pub async fn recover_full_duplex_turn(
-        &self,
-        thread_id: &str,
-        config: FullDuplexConfig,
-    ) -> Result<FullDuplexTurn> {
-        self.start_full_duplex(thread_id, None, config).await
+    pub async fn recover_turn(&self, thread_id: &str, config: TurnConfig) -> Result<RunningTurn> {
+        self.start_turn(thread_id, None, config).await
     }
 
-    async fn start_full_duplex(
+    async fn start_turn(
         &self,
         thread_id: &str,
         input: Option<(String, Value)>,
-        config: FullDuplexConfig,
-    ) -> Result<FullDuplexTurn> {
+        config: TurnConfig,
+    ) -> Result<RunningTurn> {
         if config.input_capacity == 0
             || config.event_capacity == 0
             || config.max_concurrent_operations == 0
         {
-            return Err(AgentError::FullDuplex(
+            return Err(AgentError::TurnExecution(
                 "channel capacities and operation capacity must be positive".into(),
             ));
         }
@@ -224,7 +231,7 @@ impl Agent {
             .iter()
             .any(|spec| matches!(spec.name.as_str(), "end_turn" | "cancel_operation"))
         {
-            return Err(AgentError::FullDuplex(
+            return Err(AgentError::TurnExecution(
                 "end_turn and cancel_operation are reserved runtime commands".into(),
             ));
         }
@@ -255,7 +262,7 @@ impl Agent {
             turn_id = turn.id.clone();
             turn.push_item(TurnItem::new(
                 TurnItemSource::Runtime,
-                TurnItemKind::FullDuplexOpened,
+                TurnItemKind::TurnOpened,
             ));
             turn.push_item(TurnItem::new(
                 TurnItemSource::User,
@@ -274,11 +281,9 @@ impl Agent {
                 || !turn
                     .items
                     .iter()
-                    .any(|item| matches!(item.kind, TurnItemKind::FullDuplexOpened))
+                    .any(|item| matches!(item.kind, TurnItemKind::TurnOpened))
             {
-                return Err(AgentError::FullDuplex(
-                    "no recoverable full-duplex turn".into(),
-                ));
+                return Err(AgentError::TurnExecution("no recoverable turn".into()));
             }
             turn_id = turn.id.clone();
             turn.set_status(TurnStatus::Running);
@@ -286,16 +291,9 @@ impl Agent {
         thread = self.commit_thread(thread, lease.fence()).await?;
         let (sender, receiver) = mpsc::channel(config.input_capacity);
         let (events, event_receiver) = broadcast::channel(config.event_capacity);
-        let handle = FullDuplexHandle {
+        let handle = TurnHandle {
             sender,
-            abort: self
-                .active_turns
-                .lock()
-                .map_err(|_| closed())?
-                .get(thread_id)
-                .ok_or_else(closed)?
-                .handle
-                .clone(),
+            abort: guard.handle.clone(),
         };
         let runner = runner::Runner::new(
             self.clone(),
@@ -308,7 +306,7 @@ impl Agent {
             lease,
         );
         let task = tokio::spawn(runner.run(recovering));
-        Ok(FullDuplexTurn {
+        Ok(RunningTurn {
             thread_id: thread_id.into(),
             turn_id,
             handle,

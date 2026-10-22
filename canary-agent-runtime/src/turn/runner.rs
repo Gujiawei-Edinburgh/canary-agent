@@ -1,7 +1,22 @@
 use super::worker::{self, OperationResult, WorkerEvent};
-use super::*;
+use super::{Command, TurnConfig, TurnEvent};
+use crate::agent::ActiveTurnGuard;
+use crate::metrics::{MetricStatus, RuntimeMetric};
+use crate::trace::{TraceEventKind, TraceTurnStatus};
+use crate::{
+    turn_abort_pair, Agent, AgentError, FunctionCallHookResult, FunctionContext, FunctionExecution,
+    FunctionRecoveryPolicy, ModelFunctionCall, ModelResponse, ModelStreamEvent, Result,
+    SessionLease, SuspensionResolution, TurnAbortHandle, TurnOutcome,
+};
 use canary_agent_kernel::projection::OperationStatus;
-use std::collections::HashSet;
+use canary_agent_kernel::{
+    new_id, Suspension, Thread, ThreadProjection, TokenUsage, ToolResult, Turn, TurnItem,
+    TurnItemKind, TurnItemSource, TurnStatus,
+};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::{AbortHandle, Id, JoinSet};
 
 struct Inference {
@@ -11,10 +26,55 @@ struct Inference {
     started: Instant,
 }
 
+struct ModelIteration {
+    continuation: Option<crate::ModelContinuation>,
+    text: Option<String>,
+    calls: Vec<ModelFunctionCall>,
+}
+
+impl From<ModelResponse> for ModelIteration {
+    fn from(response: ModelResponse) -> Self {
+        match response {
+            ModelResponse::Assistant {
+                continuation,
+                text,
+                function_calls,
+            } => Self {
+                continuation,
+                text,
+                calls: function_calls,
+            },
+            ModelResponse::AssistantMessage { text } => Self {
+                continuation: None,
+                text: Some(text),
+                calls: Vec::new(),
+            },
+            ModelResponse::FunctionCalls { calls } => Self {
+                continuation: None,
+                text: None,
+                calls,
+            },
+        }
+    }
+}
+
+struct OperationStart {
+    operation_id: String,
+    call: ModelFunctionCall,
+    attempt: u32,
+}
+
+#[derive(Clone)]
+struct OperationSuspension {
+    suspension: Suspension,
+    before_execution: bool,
+    output: Option<Value>,
+}
+
 struct Operation {
     call: ModelFunctionCall,
     abort: Option<TurnAbortHandle>,
-    suspension: Option<(Suspension, bool, Option<Value>)>,
+    suspension: Option<OperationSuspension>,
     attempt: u32,
 }
 
@@ -28,9 +88,9 @@ pub(super) struct Runner {
     agent: Agent,
     thread: Thread,
     turn_id: String,
-    config: FullDuplexConfig,
+    config: TurnConfig,
     input: mpsc::Receiver<Command>,
-    output: broadcast::Sender<FullDuplexEvent>,
+    output: broadcast::Sender<TurnEvent>,
     guard: ActiveTurnGuard,
     lease: SessionLease,
     jobs: JoinSet<()>,
@@ -55,9 +115,9 @@ impl Runner {
         agent: Agent,
         thread: Thread,
         turn_id: String,
-        config: FullDuplexConfig,
+        config: TurnConfig,
         input: mpsc::Receiver<Command>,
-        output: broadcast::Sender<FullDuplexEvent>,
+        output: broadcast::Sender<TurnEvent>,
         guard: ActiveTurnGuard,
         lease: SessionLease,
     ) -> Self {
@@ -126,7 +186,7 @@ impl Runner {
             function_calls: self.function_calls,
         });
         if let Ok(outcome) = &result {
-            self.emit(FullDuplexEvent::Finished {
+            self.emit(TurnEvent::Finished {
                 outcome: outcome.clone(),
             });
         }
@@ -191,7 +251,7 @@ impl Runner {
                                     Some(Job::Model(id)) if self.inference.as_ref().is_some_and(|current| current.id == id) => {
                                         self.begin_stop(TurnOutcome::Failed { error: format!("model worker failed: {error}") }).await?;
                                     }
-                                    _ => tracing::warn!(%error, "full-duplex auxiliary worker failed"),
+                                    _ => tracing::warn!(%error, "turn auxiliary worker failed"),
                                 }
                             }
                         }
@@ -210,7 +270,7 @@ impl Runner {
             .expect("owned turn")
     }
 
-    fn emit(&self, event: FullDuplexEvent) {
+    fn emit(&self, event: TurnEvent) {
         let _ = self.output.send(event);
     }
 
@@ -221,7 +281,7 @@ impl Runner {
             &self.turn_id,
             TraceEventKind::InteractionItem { item: item.clone() },
         );
-        self.emit(FullDuplexEvent::ItemCommitted { item });
+        self.emit(TurnEvent::ItemCommitted { item });
     }
 
     async fn append(&mut self, items: Vec<TurnItem>) -> Result<()> {
@@ -298,7 +358,7 @@ impl Runner {
                     )])
                     .await
                 } else {
-                    Err(AgentError::FullDuplex("operation is not running".into()))
+                    Err(AgentError::TurnExecution("operation is not running".into()))
                 };
                 let _ = reply.send(result);
             }
@@ -360,7 +420,7 @@ impl Runner {
                         .as_ref()
                         .is_some_and(|inference| inference.id == id)
                 {
-                    self.emit(FullDuplexEvent::Model {
+                    self.emit(TurnEvent::Model {
                         inference_id: id,
                         event,
                     });
@@ -492,21 +552,17 @@ impl Runner {
                     self.job_ids.insert(task.id(), Job::Hook);
                 }
             }
-            WorkerEvent::Hook(event) => self.emit(FullDuplexEvent::Hook { event }),
+            WorkerEvent::Hook(event) => self.emit(TurnEvent::Hook { event }),
         }
         Ok(())
     }
 
     async fn model_response(&mut self, response: ModelResponse, generation: u64) -> Result<()> {
-        let (continuation, text, calls) = match response {
-            ModelResponse::Assistant {
-                continuation,
-                text,
-                function_calls,
-            } => (continuation, text, function_calls),
-            ModelResponse::AssistantMessage { text } => (None, Some(text), Vec::new()),
-            ModelResponse::FunctionCalls { calls } => (None, None, calls),
-        };
+        let ModelIteration {
+            continuation,
+            text,
+            calls,
+        } = response.into();
         if text.as_ref().is_none_or(String::is_empty)
             && calls.is_empty()
             && !self.agent.config.allow_empty_response
@@ -619,7 +675,11 @@ impl Runner {
                         name: call.name.clone(),
                         attempt: 1,
                     }));
-                    starts.push((operation_id, call.clone()));
+                    starts.push(OperationStart {
+                        operation_id,
+                        call: call.clone(),
+                        attempt: 1,
+                    });
                 }
             }
         }
@@ -646,11 +706,11 @@ impl Runner {
                 abort.abort();
             }
         }
-        for (id, call) in starts {
-            self.launch(id, call, 1);
+        for start in starts {
+            self.launch(start);
         }
         if closing {
-            self.stopping = Some(TurnOutcome::CompletedWithoutMessage);
+            self.stopping = Some(TurnOutcome::Completed);
         } else if limit_exceeded {
             // Calls admitted within budget still finish. Excess calls already
             // have durable error receipts in this same batch.
@@ -661,12 +721,17 @@ impl Runner {
         } else if continue_after_receipts {
             self.changed();
         } else if !self.dirty {
-            self.emit(FullDuplexEvent::Idle);
+            self.emit(TurnEvent::Idle);
         }
         Ok(())
     }
 
-    fn launch(&mut self, id: String, call: ModelFunctionCall, attempt: u32) {
+    fn launch(&mut self, start: OperationStart) {
+        let OperationStart {
+            operation_id: id,
+            call,
+            attempt,
+        } = start;
         let (abort, signal) = turn_abort_pair();
         let context = FunctionContext {
             thread_id: self.thread.id.clone(),
@@ -700,7 +765,7 @@ impl Runner {
         let op = self
             .operations
             .get(id)
-            .ok_or_else(|| AgentError::FullDuplex("unknown operation".into()))?;
+            .ok_or_else(|| AgentError::TurnExecution("unknown operation".into()))?;
         self.append(vec![TurnItem::new(
             TurnItemSource::Tool,
             TurnItemKind::ToolCompleted {
@@ -721,7 +786,7 @@ impl Runner {
             .operations
             .get(id)
             .and_then(|op| op.abort.clone())
-            .ok_or_else(|| AgentError::FullDuplex("operation is not running".into()))?;
+            .ok_or_else(|| AgentError::TurnExecution("operation is not running".into()))?;
         self.append(vec![runtime(TurnItemKind::ToolCancellationRequested {
             operation_id: id.into(),
         })])
@@ -759,7 +824,11 @@ impl Runner {
         .await?;
         if let Some(operation) = self.operations.get_mut(id) {
             operation.abort = None;
-            operation.suspension = Some((suspension, before, output));
+            operation.suspension = Some(OperationSuspension {
+                suspension,
+                before_execution: before,
+                output,
+            });
         }
         self.changed();
         Ok(())
@@ -769,9 +838,9 @@ impl Runner {
         let op = self
             .operations
             .get(id)
-            .ok_or_else(|| AgentError::FullDuplex("unknown operation".into()))?;
+            .ok_or_else(|| AgentError::TurnExecution("unknown operation".into()))?;
         if op.abort.is_some() {
-            return Err(AgentError::FullDuplex(
+            return Err(AgentError::TurnExecution(
                 "cannot reconcile a running operation".into(),
             ));
         }
@@ -783,12 +852,15 @@ impl Runner {
                 self.complete(id, ToolResult::Error { error: reason }).await
             }
             SuspensionResolution::UserInput { text } => {
-                let (suspension, before, output) = op
-                    .suspension
-                    .clone()
-                    .ok_or_else(|| AgentError::FullDuplex("operation is not suspended".into()))?;
-                if before {
-                    return Err(AgentError::FullDuplex(
+                let OperationSuspension {
+                    suspension,
+                    before_execution,
+                    output,
+                } = op.suspension.clone().ok_or_else(|| {
+                    AgentError::TurnExecution("operation is not suspended".into())
+                })?;
+                if before_execution {
+                    return Err(AgentError::TurnExecution(
                         "pre-execution suspension requires approval or denial".into(),
                     ));
                 }
@@ -813,9 +885,9 @@ impl Runner {
                 if op
                     .suspension
                     .as_ref()
-                    .is_some_and(|(_, before, _)| !*before)
+                    .is_some_and(|state| !state.before_execution)
                 {
-                    return Err(AgentError::FullDuplex(
+                    return Err(AgentError::TurnExecution(
                         "post-execution suspension requires external result or user input".into(),
                     ));
                 }
@@ -832,7 +904,11 @@ impl Runner {
                     }),
                 ])
                 .await?;
-                self.launch(id.into(), call, attempt);
+                self.launch(OperationStart {
+                    operation_id: id.into(),
+                    call,
+                    attempt,
+                });
                 Ok(())
             }
         }
@@ -888,7 +964,7 @@ impl Runner {
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    AgentError::FullDuplex("operation has no originating call".into())
+                    AgentError::TurnExecution("operation has no originating call".into())
                 })?;
             let attempt = self
                 .turn()
@@ -913,9 +989,11 @@ impl Runner {
                         suspension,
                         before_execution,
                         output,
-                    } if *operation_id == id => {
-                        Some((suspension.clone(), *before_execution, output.clone()))
-                    }
+                    } if *operation_id == id => Some(OperationSuspension {
+                        suspension: suspension.clone(),
+                        before_execution: *before_execution,
+                        output: output.clone(),
+                    }),
                     _ => None,
                 });
             let retry = operation.status == OperationStatus::Running
@@ -950,7 +1028,11 @@ impl Runner {
                     }),
                 ])
                 .await?;
-                self.launch(id, call, attempt + 1);
+                self.launch(OperationStart {
+                    operation_id: id,
+                    call,
+                    attempt: attempt + 1,
+                });
             } else if operation.status != OperationStatus::Suspended {
                 self.indeterminate(
                     &id,

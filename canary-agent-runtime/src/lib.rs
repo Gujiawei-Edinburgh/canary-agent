@@ -1,4 +1,4 @@
-pub mod agent_loop;
+pub mod agent;
 pub mod context;
 pub mod error;
 pub mod functions;
@@ -7,13 +7,13 @@ pub mod model;
 pub mod session;
 pub mod store;
 pub mod trace;
-pub use agent_loop::full_duplex;
-pub use full_duplex::{FullDuplexConfig, FullDuplexEvent, FullDuplexHandle, FullDuplexTurn};
+pub mod turn;
+pub use turn::{RunningTurn, TurnConfig, TurnEvent, TurnHandle};
 
-pub use agent_loop::{
+pub use agent::{
     turn_abort_pair, Agent, AgentConfig, FunctionCallHook, FunctionCallHookContext,
-    FunctionCallHookResult, FunctionHookEvent, FunctionHookPhase, TurnAbortHandle, TurnAbortSignal,
-    TurnExecutionLimits, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    FunctionCallHookResult, FunctionHookEvent, FunctionHookEventHandler, FunctionHookPhase,
+    TurnAbortHandle, TurnAbortSignal, TurnExecutionLimits, TurnOutcome,
 };
 pub use context::{
     ApproximateTokenEstimator, CompactingContextBuilder, CompactionInput, ContextBuildInput,

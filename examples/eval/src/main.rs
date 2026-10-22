@@ -8,9 +8,7 @@ use canary_agent_eval::{
     TaskTransition, TransitionId, TransitionKind,
 };
 use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
-use canary_agent_runtime::{
-    Agent, AgentConfig, FunctionRegistry, LocalSessionCoordinator, TurnOutcome,
-};
+use canary_agent_runtime::{Agent, AgentConfig, FunctionRegistry, LocalSessionCoordinator};
 use canary_agent_store_json::JsonFileThreadStore;
 use canary_agent_tools::{register_web_search_tools, ExaWebSearchConfig};
 use serde_json::{json, Value};
@@ -390,13 +388,8 @@ impl EnvironmentController for LlmEnvironmentController {
                 serde_json::to_string_pretty(&input)?
             );
             require_completed_turn(
-                self.agent
-                    .run_turn(
-                        &self.thread_id,
-                        prompt,
-                        json!({"role": "environment_controller"}),
-                        |_| {},
-                    )
+                RuntimeAgentPolicy::new(self.agent.clone(), &self.thread_id)
+                    .act_text(prompt, json!({"role": "environment_controller"}))
                     .await?,
                 "simulated user",
             )?;
@@ -428,8 +421,8 @@ impl Referee for LlmReferee {
                 serde_json::to_string_pretty(&input)?
             );
             let assessment = require_completed_turn(
-                self.agent
-                    .run_turn(&self.thread_id, prompt, json!({"role": "referee"}), |_| {})
+                RuntimeAgentPolicy::new(self.agent.clone(), &self.thread_id)
+                    .act_text(prompt, json!({"role": "referee"}))
                     .await?,
                 "referee",
             )?;
@@ -484,20 +477,15 @@ impl Referee for LlmReferee {
     }
 }
 
-fn require_completed_turn(outcome: TurnOutcome, role: &str) -> canary_agent_eval::Result<String> {
-    match outcome {
-        TurnOutcome::AssistantMessage { text } => Ok(text),
-        TurnOutcome::CompletedWithoutMessage => Ok(String::new()),
-        TurnOutcome::Suspended { suspension } => Err(EvalError::Role(format!(
-            "{role} suspended: {:?}: {}",
-            suspension.kind, suspension.payload
+fn require_completed_turn(
+    action: canary_agent_eval::AgentAction,
+    role: &str,
+) -> canary_agent_eval::Result<String> {
+    match action.status {
+        AgentActionStatus::Completed => Ok(action.assistant_text),
+        status => Err(EvalError::Role(format!(
+            "{role} did not complete: {status:?}"
         ))),
-        TurnOutcome::Failed { error } => {
-            Err(EvalError::Role(format!("{role} turn failed: {error}")))
-        }
-        TurnOutcome::Aborted { reason } => {
-            Err(EvalError::Role(format!("{role} turn aborted: {reason}")))
-        }
     }
 }
 

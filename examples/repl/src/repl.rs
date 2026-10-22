@@ -1,7 +1,6 @@
 use canary_agent_kernel::{TurnItemKind, TurnStatus};
 use canary_agent_runtime::{
-    Agent, AgentError, FullDuplexConfig, FullDuplexEvent, ModelStreamEvent, Result, ThreadStore,
-    TurnOutcome,
+    Agent, AgentError, ModelStreamEvent, Result, ThreadStore, TurnConfig, TurnEvent, TurnOutcome,
 };
 use canary_agent_store_json::JsonFileThreadStore;
 use std::io::{self, BufRead, Write};
@@ -9,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub async fn run(agent: Agent, store: Arc<JsonFileThreadStore>, thread_id: String) -> Result<()> {
-    println!("thread: {thread_id} (full duplex)");
+    println!("thread: {thread_id}");
     println!("Enter messages while the agent is working. /quit exits; Ctrl+C aborts an open turn.");
     // A dedicated OS thread avoids Tokio stdin's uncancellable blocking read
     // keeping runtime shutdown alive after Ctrl+C.
@@ -40,16 +39,14 @@ async fn run_interactions(
                 && turn
                     .items
                     .iter()
-                    .any(|item| matches!(item.kind, TurnItemKind::FullDuplexOpened))
+                    .any(|item| matches!(item.kind, TurnItemKind::TurnOpened))
         })
     });
     let mut pending_input = None;
     loop {
         let mut turn = if recovery {
             recovery = false;
-            agent
-                .recover_full_duplex_turn(thread_id, FullDuplexConfig::default())
-                .await?
+            agent.recover_turn(thread_id, TurnConfig::default()).await?
         } else {
             print!("> ");
             io::stdout().flush()?;
@@ -68,11 +65,11 @@ async fn run_interactions(
                 continue;
             }
             agent
-                .open_full_duplex_turn(
+                .open_turn(
                     thread_id,
                     line,
                     serde_json::json!({}),
-                    FullDuplexConfig::default(),
+                    TurnConfig::default(),
                 )
                 .await?
         };
@@ -95,10 +92,10 @@ async fn run_interactions(
                     None => { exit = true; handle.abort(); break; }
                 },
                 event = turn.next_event() => match event {
-                    Ok(FullDuplexEvent::Model { event: ModelStreamEvent::AssistantDelta { text }, .. }) => {
+                    Ok(TurnEvent::Model { event: ModelStreamEvent::AssistantDelta { text }, .. }) => {
                         streamed = true; print!("{text}"); io::stdout().flush()?;
                     }
-                    Ok(FullDuplexEvent::ItemCommitted { item }) => match item.kind {
+                    Ok(TurnEvent::ItemCommitted { item }) => match item.kind {
                         TurnItemKind::InferenceStarted { .. } => streamed = false,
                         TurnItemKind::InferenceInterrupted { .. } => println!("\n[response interrupted]"),
                         TurnItemKind::ModelResponse { text: Some(text), .. } if !streamed => println!("{text}"),
@@ -108,8 +105,8 @@ async fn run_interactions(
                         TurnItemKind::ToolIndeterminate { operation_id, reason } => println!("\n[indeterminate] {operation_id}: {reason}"),
                         _ => {}
                     },
-                    Ok(FullDuplexEvent::Idle) => { print!("\n> "); io::stdout().flush()?; }
-                    Ok(FullDuplexEvent::Finished { .. }) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(TurnEvent::Idle) => { print!("\n> "); io::stdout().flush()?; }
+                    Ok(TurnEvent::Finished { .. }) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => println!("\n[missed {count} events; durable history is in the thread store]"),
                     _ => {}
                 }
@@ -129,7 +126,7 @@ async fn run_interactions(
                 .active_operations
                 .is_empty()
         }) {
-            return Err(AgentError::FullDuplex(
+            return Err(AgentError::TurnExecution(
                 "unfinished operations require recovery and host reconciliation".into(),
             ));
         }

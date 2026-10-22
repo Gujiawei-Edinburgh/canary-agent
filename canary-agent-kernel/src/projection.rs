@@ -160,7 +160,7 @@ impl ThreadProjection {
                         }
                         projection.push_runtime_event(&item.kind);
                     }
-                    TurnItemKind::FullDuplexOpened
+                    TurnItemKind::TurnOpened
                     | TurnItemKind::InferenceStarted { .. }
                     | TurnItemKind::InferenceInterrupted { .. } => {}
                     TurnItemKind::UserInput { text, response_to } => {

@@ -1,6 +1,7 @@
 use crate::environment::{EnvironmentEvent, EnvironmentObservation, EnvironmentSnapshot};
 use crate::error::Result;
-use canary_agent_runtime::{Agent, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent};
+use canary_agent_kernel::{TokenUsage, ToolResult, TurnItemKind};
+use canary_agent_runtime::{Agent, ModelStreamEvent, TurnConfig, TurnEvent, TurnOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -62,7 +63,7 @@ pub struct AgentAction {
 }
 
 pub trait EvaluatedPolicy: Send + Sync {
-    fn act<'a>(&'a self, observation: EnvironmentObservation) -> ActionFuture<'a, AgentAction>;
+    fn act(&'_ self, observation: EnvironmentObservation) -> ActionFuture<'_, AgentAction>;
 }
 
 /// Adapts a runtime `Agent` to the evaluated-policy contract.
@@ -85,103 +86,130 @@ impl RuntimeAgentPolicy {
     }
 }
 
+impl RuntimeAgentPolicy {
+    /// Runs one evaluation interaction until the model explicitly calls end_turn.
+    pub async fn act_text(&self, input: String, metadata: Value) -> Result<AgentAction> {
+        let mut turn = self
+            .agent
+            .open_turn(&self.thread_id, input, metadata, TurnConfig::default())
+            .await?;
+        let mut assistant_text = String::new();
+        let mut events = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut suspended = false;
+        loop {
+            match turn.next_event().await {
+                Ok(TurnEvent::ItemCommitted { item }) => match item.kind {
+                    TurnItemKind::ModelResponse {
+                        text,
+                        function_calls,
+                        ..
+                    } => {
+                        if let Some(text) = text.filter(|text| !text.is_empty()) {
+                            assistant_text = text.clone();
+                            events.push(AgentActionEvent::AssistantText { text });
+                        }
+                        if !function_calls.is_empty() {
+                            events.push(AgentActionEvent::FunctionCallsRequested {
+                                calls: serde_json::to_value(function_calls)?,
+                            });
+                        }
+                    }
+                    TurnItemKind::FunctionCallStarted { call_id, name, .. } => {
+                        events.push(AgentActionEvent::FunctionStarted { call_id, name })
+                    }
+                    TurnItemKind::ToolCompleted {
+                        call_id,
+                        name,
+                        result,
+                        ..
+                    }
+                    | TurnItemKind::ToolOutput {
+                        call_id,
+                        name,
+                        result,
+                    } => match result {
+                        ToolResult::Success { .. } => {
+                            events.push(AgentActionEvent::FunctionCompleted { call_id, name })
+                        }
+                        ToolResult::Error { error } => {
+                            events.push(AgentActionEvent::FunctionFailed {
+                                call_id,
+                                name,
+                                error,
+                            })
+                        }
+                        ToolResult::Aborted { reason } => {
+                            events.push(AgentActionEvent::FunctionFailed {
+                                call_id,
+                                name,
+                                error: reason,
+                            })
+                        }
+                    },
+                    TurnItemKind::ToolSuspended { .. } | TurnItemKind::ToolIndeterminate { .. } => {
+                        suspended = true;
+                        turn.handle().abort();
+                    }
+                    _ => {}
+                },
+                Ok(TurnEvent::Model {
+                    event: ModelStreamEvent::TokenUsage { usage: delta },
+                    ..
+                }) => usage.add_assign(delta),
+                Ok(TurnEvent::Hook { event: hook }) => {
+                    events.push(AgentActionEvent::FunctionHook {
+                        phase: match hook.phase {
+                            canary_agent_runtime::FunctionHookPhase::BeforeCall => "before_call",
+                            canary_agent_runtime::FunctionHookPhase::AfterCall => "after_call",
+                        }
+                        .into(),
+                        call_id: hook.call_id,
+                        name: hook.name,
+                        hook_fqn: hook.hook_fqn,
+                        message: hook.message,
+                        metadata: hook.metadata,
+                    });
+                }
+                Ok(TurnEvent::Finished { .. }) => break,
+                Err(error) => {
+                    return Err(crate::error::EvalError::Role(format!(
+                        "evaluation event stream failed: {error}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let outcome = turn.wait().await?;
+        let status = if suspended {
+            AgentActionStatus::Suspended
+        } else {
+            match outcome {
+                TurnOutcome::Completed => AgentActionStatus::Completed,
+                TurnOutcome::Failed { .. } => AgentActionStatus::Failed,
+                TurnOutcome::Aborted { .. } => AgentActionStatus::Aborted,
+            }
+        };
+        events.push(AgentActionEvent::TokenUsage {
+            usage: serde_json::to_value(usage)?,
+        });
+        Ok(AgentAction {
+            status,
+            assistant_text,
+            events,
+        })
+    }
+}
+
 impl EvaluatedPolicy for RuntimeAgentPolicy {
     fn act(&self, observation: EnvironmentObservation) -> ActionFuture<'_, AgentAction> {
         Box::pin(async move {
-            let mut assistant_text = String::new();
-            let mut events = Vec::new();
-            let policy_input = render_policy_input(&observation)?;
+            let input = render_policy_input(&observation)?;
             let metadata = serde_json::json!({
                 "environment": observation.metadata,
                 "visible_state": observation.visible_state,
             });
-            let outcome = self
-                .agent
-                .run_turn(
-                    &self.thread_id,
-                    policy_input,
-                    metadata,
-                    |event| match event {
-                        TurnStreamEvent::Model(TurnModelEvent::AssistantResponse {
-                            text: Some(text),
-                            ..
-                        }) => {
-                            assistant_text = text.clone();
-                            events.push(AgentActionEvent::AssistantText { text });
-                        }
-                        TurnStreamEvent::Model(TurnModelEvent::AssistantResponse {
-                            text: None,
-                            ..
-                        }) => {}
-                        TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { .. }) => {}
-                        TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested {
-                            calls,
-                        }) => {
-                            events.push(AgentActionEvent::FunctionCallsRequested {
-                                calls: serde_json::to_value(calls).unwrap_or(Value::Null),
-                            });
-                        }
-                        TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
-                            call_id,
-                            name,
-                        }) => events.push(AgentActionEvent::FunctionStarted { call_id, name }),
-                        TurnStreamEvent::State(TurnStateEvent::FunctionCompleted {
-                            call_id,
-                            name,
-                        }) => events.push(AgentActionEvent::FunctionCompleted { call_id, name }),
-                        TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
-                            call_id,
-                            name,
-                            error,
-                        }) => events.push(AgentActionEvent::FunctionFailed {
-                            call_id,
-                            name,
-                            error,
-                        }),
-                        TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => {
-                            events.push(AgentActionEvent::TokenUsage {
-                                usage: serde_json::to_value(usage).unwrap_or(Value::Null),
-                            });
-                        }
-                        TurnStreamEvent::FunctionHook(hook) => {
-                            events.push(AgentActionEvent::FunctionHook {
-                                phase: match hook.phase {
-                                    canary_agent_runtime::FunctionHookPhase::BeforeCall => {
-                                        "before_call"
-                                    }
-                                    canary_agent_runtime::FunctionHookPhase::AfterCall => {
-                                        "after_call"
-                                    }
-                                }
-                                .to_string(),
-                                call_id: hook.call_id,
-                                name: hook.name,
-                                hook_fqn: hook.hook_fqn,
-                                message: hook.message,
-                                metadata: hook.metadata,
-                            });
-                        }
-                        TurnStreamEvent::State(_) | TurnStreamEvent::Model(_) => {}
-                    },
-                )
-                .await?;
-            let status = match outcome {
-                TurnOutcome::CompletedWithoutMessage => AgentActionStatus::Completed,
-                TurnOutcome::AssistantMessage { text } => {
-                    if assistant_text.is_empty() {
-                        assistant_text = text;
-                    }
-                    AgentActionStatus::Completed
-                }
-                TurnOutcome::Suspended { .. } => AgentActionStatus::Suspended,
-                TurnOutcome::Failed { .. } => AgentActionStatus::Failed,
-                TurnOutcome::Aborted { .. } => AgentActionStatus::Aborted,
-            };
-            Ok(AgentAction {
-                status,
-                assistant_text,
-                events,
-            })
+            self.act_text(input, metadata).await
         })
     }
 }

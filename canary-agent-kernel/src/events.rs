@@ -172,7 +172,7 @@ pub enum TurnItemSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnItemKind {
-    FullDuplexOpened,
+    TurnOpened,
     InferenceStarted {
         inference_id: String,
         history_position: usize,

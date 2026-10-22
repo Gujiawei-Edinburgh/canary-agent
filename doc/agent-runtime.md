@@ -1,4 +1,4 @@
-# Full-Duplex ReAct Agent Runtime
+# Canary ReAct Agent Runtime
 
 ## Core Idea
 
@@ -11,13 +11,13 @@ responses or tool calls. The runtime records events, coordinates inference,
 tracks tool operations, and streams output. Tools own their operational behavior.
 
 Audio interaction, robotics, coding, and remote jobs are applications of the
-same execution model. The SDK exposes this profile through
-`Agent::open_full_duplex_turn`; the existing `run_turn` API keeps its sequential
-behavior.
+same execution model. The SDK exposes its single execution engine through
+`Agent::open_turn`. Successful completion requires `end_turn()`;
+the host observes the committed completion event and decides what happens next.
 
 ## From Sequential To Full Duplex
 
-The current loop runs consecutive iterations within a turn. Each iteration
+The former sequential loop ran consecutive iterations within a turn. Each iteration
 infers a response or actions, executes the selected tools, and records results
 before the next iteration starts:
 
@@ -180,7 +180,7 @@ queues a continuation using the updated history. Progress is recorded when
 provided, but does not trigger inference by default. Several pending triggers
 may be served by one inference that observes them all.
 
-The proposed first-party `end_turn()` command explicitly closes the turn.
+The first-party `end_turn()` command explicitly closes the turn.
 Although model-visible as a tool, it is runtime-owned because it changes the
 interaction lifecycle.
 
@@ -208,17 +208,18 @@ Audio capture, endpoint detection, playback, and hard real-time safety remain
 outside the loop. A slow reasoning model can be exposed as a tool; this does not
 require the runtime to classify task complexity.
 
-The current agent remains a sequential profile: input is processed between
-turns, inference waits for tool results, and a text-only response closes the
-turn. The full-duplex profile accepts input throughout an open turn, permits
-inference alongside active tools, and requires explicit closure.
+Full duplex is the only runtime engine. A host can submit a single input and
+wait for completion or keep submitting input while work is running. Both use
+the same explicit closure, cancellation, operation, and recovery semantics.
+A text-only response never closes a turn; the model can include final answer
+text and an end_turn call in the same response.
 
 The first implementation should demonstrate four cases: superseded inference
 cannot dispatch late calls; new input can control a running operation; completion
 appends without changing acceptance; and concurrent input prevents stale closure.
 Detailed persistence, recovery, and provider contracts follow from those cases.
 
-The initial implementation also exposes `recover_full_duplex_turn`. Recovery
+The initial implementation also exposes `recover_turn`. Recovery
 reconstructs operations from acceptance and terminal events, retries only
 idempotent unfinished executions automatically, and leaves other outcomes
 indeterminate for explicit host reconciliation. Tool suspensions are tracked
