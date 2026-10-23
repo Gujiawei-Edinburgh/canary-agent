@@ -1,28 +1,16 @@
-use super::*;
-use crate::model::ModelStreamHandler;
-use crate::store::ThreadContextCache;
-use crate::trace::{TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus};
-use crate::{
-    AgentConfig, FunctionCallHook, FunctionCallHookContext, FunctionCallHookResult,
-    FunctionContext, FunctionExecution, FunctionHookEventHandler, FunctionLimits,
-    FunctionRecoveryPolicy, FunctionRegistry, LocalSessionCoordinator, ModelClient,
-    ModelDescriptor, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
-    SimpleFunction, ThreadStore,
-};
+mod common;
 use canary_agent_kernel::{
-    new_id, ChatMessage, RevisionToken, Suspension, SuspensionKind, TokenUsage, ToolResult,
-    TurnItemKind,
+    ChatMessage, Suspension, SuspensionKind, Thread, TokenUsage, ToolResult, Turn, TurnItem,
+    TurnItemKind, TurnItemSource, TurnStatus,
 };
 use canary_agent_revision::AgentBuildRef;
-use serde_json::json;
-use std::collections::HashMap;
+use canary_agent_runtime::*;
+use common::*;
+use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
-
-#[derive(Default)]
-struct MemoryStore(Mutex<HashMap<String, Thread>>);
+use std::time::Duration;
 
 #[derive(Default)]
 struct RecordedTrace(Mutex<Vec<TraceEvent>>);
@@ -83,261 +71,6 @@ impl FunctionCallHook for TestHook {
             Ok(())
         })
     }
-}
-
-impl ThreadStore for MemoryStore {
-    fn load<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move {
-            self.0
-                .lock()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| AgentError::ThreadNotFound(id.into()))
-        })
-    }
-    fn delete<'a>(&'a self, id: &'a str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            self.0.lock().unwrap().remove(id);
-            Ok(())
-        })
-    }
-    fn compare_and_commit<'a>(
-        &'a self,
-        mut thread: Thread,
-        _: &'a crate::LeaseFence,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut threads = self.0.lock().unwrap();
-            let current = threads
-                .get(&thread.id)
-                .map(|thread| thread.revision.clone())
-                .unwrap_or_default();
-            if current != thread.revision {
-                return Err(AgentError::RevisionConflict {
-                    thread_id: thread.id,
-                    expected: thread.revision,
-                    actual: current,
-                });
-            }
-            thread.revision = RevisionToken::from_bytes(new_id("revision").into_bytes());
-            threads.insert(thread.id.clone(), thread.clone());
-            Ok(thread)
-        })
-    }
-    fn load_context_cache<'a>(
-        &'a self,
-        _: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ThreadContextCache>>> + Send + 'a>> {
-        Box::pin(async { Ok(None) })
-    }
-    fn save_context_cache<'a>(
-        &'a self,
-        cache: ThreadContextCache,
-    ) -> Pin<Box<dyn Future<Output = Result<ThreadContextCache>> + Send + 'a>> {
-        Box::pin(async move { Ok(cache) })
-    }
-}
-
-struct Request {
-    request: ModelRequest,
-    reply: oneshot::Sender<ModelResponse>,
-    deltas: mpsc::Sender<ModelStreamEvent>,
-}
-
-struct Model(mpsc::UnboundedSender<Request>);
-
-impl ModelClient for Model {
-    fn model_descriptor(&self) -> ModelDescriptor {
-        ModelDescriptor {
-            fqn: "test/controlled".into(),
-            settings: json!({}),
-        }
-    }
-    fn stream_complete<'a>(
-        &'a self,
-        request: ModelRequest,
-        on_event: &'a mut ModelStreamHandler<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            let (reply, mut response) = oneshot::channel();
-            let (deltas, mut events) = mpsc::channel(16);
-            self.0
-                .send(Request {
-                    request,
-                    reply,
-                    deltas,
-                })
-                .unwrap();
-            loop {
-                tokio::select! {
-                    event = events.recv() => if let Some(event) = event { on_event(event); },
-                    response = &mut response => return response.map_err(|_| AgentError::Model("test response dropped".into())),
-                }
-            }
-        })
-    }
-}
-
-struct Invocation {
-    context: FunctionContext,
-    reply: oneshot::Sender<FunctionExecution>,
-}
-
-struct Harness {
-    agent: Agent,
-    store: Arc<MemoryStore>,
-    requests: mpsc::UnboundedReceiver<Request>,
-    invocations: mpsc::UnboundedReceiver<Invocation>,
-}
-
-impl Harness {
-    fn new() -> Self {
-        let store = Arc::new(MemoryStore::default());
-        let (model, requests) = mpsc::unbounded_channel();
-        let (calls, invocations) = mpsc::unbounded_channel();
-        let mut registry = FunctionRegistry::new();
-        for (name, policy) in [
-            ("slow", FunctionRecoveryPolicy::Idempotent),
-            ("write", FunctionRecoveryPolicy::NonIdempotent),
-        ] {
-            let calls = calls.clone();
-            registry.register(SimpleFunction::new(
-                crate::FunctionSpec {
-                    name: name.into(),
-                    description: name.into(),
-                    parameters: json!({"type":"object"}),
-                },
-                json!({}),
-                FunctionLimits {
-                    time_budget: Duration::from_secs(10),
-                    max_output_bytes: 4096,
-                },
-                policy,
-                move |_args, context| {
-                    let calls = calls.clone();
-                    async move {
-                        let (reply, response) = oneshot::channel();
-                        calls.send(Invocation { context, reply }).unwrap();
-                        response.await.map_err(|_| AgentError::Function {
-                            name: name.into(),
-                            message: "test execution disconnected".into(),
-                        })
-                    }
-                },
-            ));
-        }
-        let agent = Agent::new(
-            AgentConfig::default(),
-            store.clone(),
-            Arc::new(Model(model)),
-            registry,
-            Arc::new(LocalSessionCoordinator::default()),
-        );
-        Self {
-            agent,
-            store,
-            requests,
-            invocations,
-        }
-    }
-
-    async fn open(&self) -> RunningTurn {
-        self.agent
-            .open_turn(
-                "thread",
-                "original request",
-                json!({"owner":"test"}),
-                config(),
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn request(&mut self) -> Request {
-        tokio::time::timeout(Duration::from_secs(2), self.requests.recv())
-            .await
-            .expect("model scheduled")
-            .expect("model request")
-    }
-
-    async fn invocation(&mut self) -> Invocation {
-        tokio::time::timeout(Duration::from_secs(2), self.invocations.recv())
-            .await
-            .expect("function scheduled")
-            .expect("function invocation")
-    }
-
-    fn items(&self) -> Vec<TurnItem> {
-        self.store.0.lock().unwrap()["thread"]
-            .turns
-            .last()
-            .unwrap()
-            .items
-            .clone()
-    }
-}
-
-fn config() -> TurnConfig {
-    TurnConfig {
-        cancellation_grace: Duration::from_millis(20),
-        ..TurnConfig::default()
-    }
-}
-fn call(id: &str, name: &str) -> ModelFunctionCall {
-    ModelFunctionCall {
-        call_id: id.into(),
-        name: name.into(),
-        arguments: json!({}),
-    }
-}
-fn respond(request: Request, calls: Vec<ModelFunctionCall>) {
-    request
-        .reply
-        .send(ModelResponse::FunctionCalls { calls })
-        .unwrap();
-}
-fn text(request: Request) {
-    request
-        .reply
-        .send(ModelResponse::AssistantMessage {
-            text: "acknowledged".into(),
-        })
-        .unwrap();
-}
-fn done(invocation: Invocation) {
-    invocation
-        .reply
-        .send(FunctionExecution::Completed {
-            output: json!({"actual":"finished"}),
-        })
-        .unwrap();
-}
-
-async fn event(turn: &mut RunningTurn, predicate: impl Fn(&TurnEvent) -> bool) -> TurnEvent {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let event = turn.next_event().await.unwrap();
-            if predicate(&event) {
-                return event;
-            }
-        }
-    })
-    .await
-    .expect("expected runtime event")
-}
-
-async fn idle(turn: &mut RunningTurn) {
-    event(turn, |event| matches!(event, TurnEvent::Idle)).await;
-}
-async fn finish(turn: RunningTurn) -> TurnOutcome {
-    tokio::time::timeout(Duration::from_secs(2), turn.wait())
-        .await
-        .expect("turn terminates")
-        .unwrap()
 }
 
 #[tokio::test]
@@ -413,8 +146,10 @@ async fn explicit_closure_preserves_final_text_and_emits_committed_completion() 
 #[tokio::test]
 async fn empty_response_is_either_failed_or_idle_but_never_successful_closure() {
     for allowed in [false, true] {
-        let mut h = Harness::new();
-        h.agent.config.allow_empty_response = allowed;
+        let mut h = Harness::with_config(AgentConfig {
+            allow_empty_response: allowed,
+            ..AgentConfig::default()
+        });
         let mut turn = h.open().await;
         respond(h.request().await, vec![]);
         if allowed {
@@ -536,7 +271,10 @@ fn spec_snapshot_still_describes_the_live_agent() {
     });
     assert_eq!(snapshot.build.id, "application-build");
     assert_eq!(snapshot.model.fqn, "test/controlled");
-    assert_eq!(snapshot.prompts.system, h.agent.config.system_prompt);
+    assert_eq!(
+        snapshot.prompts.system,
+        AgentConfig::default().system_prompt
+    );
     assert!(snapshot.tools.contains_key("slow"));
     assert_eq!(
         snapshot.tools["slow"].interface.parameters,
@@ -834,8 +572,13 @@ async fn recovery_retries_only_idempotent_started_operations() {
 
 #[tokio::test]
 async fn function_limit_executes_permitted_call_and_records_all_excess_calls() {
-    let mut h = Harness::new();
-    h.agent.config.turn_execution_limits.max_function_calls = 1;
+    let mut h = Harness::with_config(AgentConfig {
+        turn_execution_limits: TurnExecutionLimits {
+            max_function_calls: 1,
+            ..TurnExecutionLimits::default()
+        },
+        ..AgentConfig::default()
+    });
     let turn = h.open().await;
     respond(
         h.request().await,
@@ -882,8 +625,13 @@ async fn progress_is_optional_and_does_not_schedule_inference() {
 
 #[tokio::test]
 async fn iteration_limit_also_applies_to_restarted_inferences() {
-    let mut h = Harness::new();
-    h.agent.config.turn_execution_limits.max_model_iterations = 1;
+    let mut h = Harness::with_config(AgentConfig {
+        turn_execution_limits: TurnExecutionLimits {
+            max_model_iterations: 1,
+            ..TurnExecutionLimits::default()
+        },
+        ..AgentConfig::default()
+    });
     let turn = h.open().await;
     let pending = h.request().await;
     turn.handle().append_input("restart").await.unwrap();
@@ -896,7 +644,7 @@ async fn iteration_limit_also_applies_to_restarted_inferences() {
 async fn operation_panic_is_indeterminate_and_does_not_strand_the_interaction() {
     let mut h = Harness::new();
     h.agent = h.agent.with_function(SimpleFunction::new(
-        crate::FunctionSpec {
+        canary_agent_runtime::FunctionSpec {
             name: "panic".into(),
             description: "test panic".into(),
             parameters: json!({}),

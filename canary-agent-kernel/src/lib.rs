@@ -4,8 +4,9 @@ pub mod projection;
 pub mod revision;
 
 pub use events::{
-    new_id, now_timestamp, Suspension, SuspensionKind, Thread, ThreadId, TokenUsage, ToolResult,
-    Turn, TurnId, TurnItem, TurnItemId, TurnItemKind, TurnItemSource, TurnStatus,
+    new_id, now_timestamp, ModelResponseStatus, Suspension, SuspensionKind, Thread, ThreadId,
+    TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemId, TurnItemKind, TurnItemSource,
+    TurnStatus,
 };
 pub use model::{
     FunctionSpec, ModelContinuation, ModelFunctionCall, ModelRequest, ModelResponse,

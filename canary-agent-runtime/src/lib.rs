@@ -4,6 +4,7 @@ pub mod error;
 pub mod functions;
 pub mod metrics;
 pub mod model;
+pub mod model_session;
 pub mod session;
 pub mod store;
 pub mod trace;
@@ -32,6 +33,11 @@ pub use metrics::{
 pub use model::{
     FunctionSpec, ModelClient, ModelContinuation, ModelDescriptor, ModelFunctionCall, ModelRequest,
     ModelResponse, ModelStreamEvent,
+};
+pub use model_session::{
+    AudioChunk, AudioEncoding, AudioFormat, ModelInput, ModelInteraction, ModelResponseStatus,
+    ModelSession, ModelSessionCommand, ModelSessionConfig, ModelSessionEvent, ModelSessionFuture,
+    ModelSessionReceiver, ModelSessionSender,
 };
 pub use session::{LeaseFence, LocalSessionCoordinator, SessionCoordinator, SessionLease};
 pub use store::{ThreadContextCache, ThreadStore};

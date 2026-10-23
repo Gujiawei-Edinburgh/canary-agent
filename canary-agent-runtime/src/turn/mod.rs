@@ -5,9 +5,12 @@ mod worker;
 use crate::functions::SuspensionResolution;
 use crate::model::ModelStreamEvent;
 use crate::{Agent, AgentError, FunctionHookEvent, Result, TurnAbortHandle, TurnOutcome};
+use crate::{ModelInput, ModelInteraction, ModelSessionCommand, ModelSessionEvent};
+use canary_agent_kernel::Suspension;
 use canary_agent_kernel::{Thread, ThreadProjection, TurnStatus};
 use canary_agent_kernel::{Turn, TurnItem, TurnItemKind, TurnItemSource};
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -37,6 +40,16 @@ impl Default for TurnConfig {
 #[derive(Debug, Clone, PartialEq)]
 /// Live model output, committed history, and lifecycle notifications.
 pub enum TurnEvent {
+    SessionReady {
+        connection_id: String,
+    },
+    Session {
+        connection_id: String,
+        event: ModelSessionEvent,
+    },
+    Suspended {
+        suspension: Suspension,
+    },
     ItemCommitted {
         item: TurnItem,
     },
@@ -53,14 +66,81 @@ pub enum TurnEvent {
     },
 }
 
-/// Cloneable ingress. Acknowledgments mean that the event has been persisted.
+/// Cloneable ingress. Journal commands acknowledge persistence; transport input
+/// acknowledges local queueing. Neither means a tool or model has finished.
 #[derive(Clone)]
 pub struct TurnHandle {
     sender: mpsc::Sender<Command>,
     abort: TurnAbortHandle,
+    model_input: ModelIngress,
+    bidirectional: bool,
+}
+
+type ModelIngress = Arc<Mutex<Option<mpsc::Sender<ModelSessionCommand>>>>;
+
+struct InitialInput {
+    text: Option<String>,
+    metadata: Value,
 }
 
 impl TurnHandle {
+    /// Requests provider-side cancellation without cancelling tool operations.
+    /// Completion is reported by a later ResponseFinished event.
+    pub async fn cancel_response(&self, response_id: impl Into<String>) -> Result<()> {
+        self.send_model_command(ModelSessionCommand::CancelResponse {
+            response_id: response_id.into(),
+        })
+        .await
+    }
+
+    async fn send_model_command(&self, command: ModelSessionCommand) -> Result<()> {
+        let sender = self
+            .model_input
+            .lock()
+            .map_err(|_| closed())?
+            .clone()
+            .ok_or_else(|| {
+                AgentError::Model("model connection is not ready or is suspended".into())
+            })?;
+        let permit = sender.reserve().await.map_err(|_| closed())?;
+        let current = self.model_input.lock().map_err(|_| closed())?;
+        if !current
+            .as_ref()
+            .is_some_and(|active| active.same_channel(&sender))
+        {
+            return Err(closed());
+        }
+        // Seal/reconnect and local admission share this brief critical section.
+        // A sender waiting for capacity cannot enqueue into an obsolete session.
+        permit.send(command);
+        Ok(())
+    }
+    /// Submits transport input. Success means queued locally, not acknowledged
+    /// by the provider. Audio bytes are never appended to the thread journal.
+    /// Request-based clients accept Text through the ordinary journal ingress.
+    pub async fn send_input(&self, input: ModelInput) -> Result<()> {
+        if !self.bidirectional {
+            return match input {
+                ModelInput::Text { text } => self.append_input(text).await.map(|_| ()),
+                _ => Err(AgentError::Model(
+                    "request-based models accept text input only".into(),
+                )),
+            };
+        }
+        self.send_model_command(ModelSessionCommand::Input(input))
+            .await
+    }
+
+    /// Reopens a suspended model connection from durable history. It does not
+    /// replay media or retry tools; the caller explicitly controls this decision.
+    pub async fn reconnect_model(&self) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.send(Command::Reconnect { reply }).await?;
+        result.await.map_err(|_| closed())?
+    }
+    /// Appends factual text. Request-based inference observes the updated journal;
+    /// a bidirectional connection does not resubmit this text. Use send_input to
+    /// deliver new transport input to a bidirectional model.
     pub async fn append_input(&self, text: impl Into<String>) -> Result<String> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Input {
@@ -166,6 +246,9 @@ impl Drop for RunningTurn {
 }
 
 enum Command {
+    Reconnect {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Input {
         text: String,
         reply: oneshot::Sender<Result<String>>,
@@ -191,6 +274,28 @@ fn closed() -> AgentError {
 }
 
 impl Agent {
+    /// Opens a bidirectional interaction before any audio or text arrives.
+    pub async fn open_stream_turn(
+        &self,
+        thread_id: &str,
+        metadata: Value,
+        config: TurnConfig,
+    ) -> Result<RunningTurn> {
+        if self.model_client.interaction() != ModelInteraction::Bidirectional {
+            return Err(AgentError::Model(
+                "model does not support streaming input".into(),
+            ));
+        }
+        self.start_turn(
+            thread_id,
+            Some(InitialInput {
+                text: None,
+                metadata,
+            }),
+            config,
+        )
+        .await
+    }
     /// Opens an interaction and starts inference. Only an accepted end_turn call
     /// successfully completes it; a text-only response leaves it open for input.
     /// Metadata initializes a new thread and does not replace existing metadata.
@@ -201,8 +306,15 @@ impl Agent {
         metadata: Value,
         config: TurnConfig,
     ) -> Result<RunningTurn> {
-        self.start_turn(thread_id, Some((user_text.into(), metadata)), config)
-            .await
+        self.start_turn(
+            thread_id,
+            Some(InitialInput {
+                text: Some(user_text.into()),
+                metadata,
+            }),
+            config,
+        )
+        .await
     }
 
     /// Reconstruct an open interaction. Only idempotent started operations retry
@@ -214,7 +326,7 @@ impl Agent {
     async fn start_turn(
         &self,
         thread_id: &str,
-        input: Option<(String, Value)>,
+        input: Option<InitialInput>,
         config: TurnConfig,
     ) -> Result<RunningTurn> {
         if config.input_capacity == 0
@@ -244,7 +356,7 @@ impl Agent {
         };
         let turn_id;
         let recovering = input.is_none();
-        if let Some((text, metadata)) = input {
+        if let Some(InitialInput { text, metadata }) = input {
             if thread
                 .turns
                 .iter()
@@ -264,13 +376,15 @@ impl Agent {
                 TurnItemSource::Runtime,
                 TurnItemKind::TurnOpened,
             ));
-            turn.push_item(TurnItem::new(
-                TurnItemSource::User,
-                TurnItemKind::UserInput {
-                    text,
-                    response_to: None,
-                },
-            ));
+            if let Some(text) = text {
+                turn.push_item(TurnItem::new(
+                    TurnItemSource::User,
+                    TurnItemKind::UserInput {
+                        text,
+                        response_to: None,
+                    },
+                ));
+            }
             thread.turns.push(turn);
         } else {
             let turn = thread
@@ -291,9 +405,12 @@ impl Agent {
         thread = self.commit_thread(thread, lease.fence()).await?;
         let (sender, receiver) = mpsc::channel(config.input_capacity);
         let (events, event_receiver) = broadcast::channel(config.event_capacity);
+        let model_input = Arc::new(Mutex::new(None));
         let handle = TurnHandle {
             sender,
             abort: guard.handle.clone(),
+            model_input: model_input.clone(),
+            bidirectional: self.model_client.interaction() == ModelInteraction::Bidirectional,
         };
         let runner = runner::Runner::new(
             self.clone(),
@@ -304,6 +421,7 @@ impl Agent {
             events,
             guard,
             lease,
+            model_input,
         );
         let task = tokio::spawn(runner.run(recovering));
         Ok(RunningTurn {
@@ -315,6 +433,3 @@ impl Agent {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;

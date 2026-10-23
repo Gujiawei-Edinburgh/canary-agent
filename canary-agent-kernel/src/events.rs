@@ -170,9 +170,61 @@ pub enum TurnItemSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ModelResponseStatus {
+    Completed,
+    Interrupted { reason: String },
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnItemKind {
     TurnOpened,
+    ModelSessionOpened {
+        connection_id: String,
+    },
+    ModelSessionSuspended {
+        connection_id: String,
+        suspension: Suspension,
+    },
+    ModelInputStarted {
+        connection_id: String,
+        item_id: String,
+    },
+    ModelInputEnded {
+        connection_id: String,
+        item_id: String,
+    },
+    ModelInputCommitted {
+        connection_id: String,
+        item_id: String,
+    },
+    InputTranscript {
+        connection_id: String,
+        item_id: String,
+        text: String,
+    },
+    ModelResponseStarted {
+        connection_id: String,
+        response_id: String,
+    },
+    ModelResponseFinished {
+        connection_id: String,
+        response_id: String,
+        status: ModelResponseStatus,
+    },
+    ModelItemReceived {
+        connection_id: String,
+        response_id: String,
+        item_id: String,
+    },
+    ModelUsageReported {
+        connection_id: String,
+        event_id: String,
+        response_id: String,
+        usage: TokenUsage,
+    },
     InferenceStarted {
         inference_id: String,
         history_position: usize,
@@ -246,6 +298,7 @@ pub enum TurnItemKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SuspensionKind {
+    ModelConnection,
     UserInput,
     FunctionRecovery,
     HumanApproval,

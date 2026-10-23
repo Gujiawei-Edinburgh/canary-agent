@@ -109,6 +109,12 @@ resolved through the same handle. The REPL does not provide an approval service.
 See the [runtime design](doc/agent-runtime.md) for lifecycle
 and model-protocol details.
 
+Bidirectional adapters implement `ModelClient::connect` and select
+`ModelInteraction::Bidirectional`. Use `open_stream_turn`, feed audio/text through
+`TurnHandle::send_input`, and consume `TurnEvent::Session` output. Capture and
+playback stay in the host. See [bidirectional sessions](doc/bidirectional-model-sessions.md)
+for adapter contracts and reconnect behavior.
+
 ## Library Usage
 
 An application can assemble the runtime from the provided adapters:

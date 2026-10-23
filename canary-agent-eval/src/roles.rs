@@ -171,6 +171,10 @@ impl RuntimeAgentPolicy {
                         metadata: hook.metadata,
                     });
                 }
+                Ok(TurnEvent::Suspended { .. }) => {
+                    suspended = true;
+                    turn.handle().abort();
+                }
                 Ok(TurnEvent::Finished { .. }) => break,
                 Err(error) => {
                     return Err(crate::error::EvalError::Role(format!(

@@ -84,6 +84,29 @@ impl ThreadProjection {
         for turn in &thread.turns {
             for item in &turn.items {
                 match &item.kind {
+                    TurnItemKind::InputTranscript { text, .. } => {
+                        projection.conversation.push(ChatMessage::User {
+                            content: text.clone(),
+                        });
+                    }
+                    TurnItemKind::ModelSessionSuspended { suspension, .. } => {
+                        projection.pending_suspension = Some(PendingSuspension {
+                            suspension: suspension.clone(),
+                            turn_id: turn.id.clone(),
+                        });
+                    }
+                    TurnItemKind::ModelSessionOpened { .. } => {
+                        if projection
+                            .pending_suspension
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.suspension.kind
+                                    == crate::events::SuspensionKind::ModelConnection
+                            })
+                        {
+                            projection.pending_suspension = None;
+                        }
+                    }
                     TurnItemKind::ToolAccepted {
                         call_id,
                         name,
@@ -161,6 +184,13 @@ impl ThreadProjection {
                         projection.push_runtime_event(&item.kind);
                     }
                     TurnItemKind::TurnOpened
+                    | TurnItemKind::ModelInputStarted { .. }
+                    | TurnItemKind::ModelInputEnded { .. }
+                    | TurnItemKind::ModelInputCommitted { .. }
+                    | TurnItemKind::ModelResponseStarted { .. }
+                    | TurnItemKind::ModelResponseFinished { .. }
+                    | TurnItemKind::ModelItemReceived { .. }
+                    | TurnItemKind::ModelUsageReported { .. }
                     | TurnItemKind::InferenceStarted { .. }
                     | TurnItemKind::InferenceInterrupted { .. } => {}
                     TurnItemKind::UserInput { text, response_to } => {
@@ -175,7 +205,14 @@ impl ThreadProjection {
                             {
                                 projection.pending_suspension = None;
                             }
-                        } else {
+                        } else if projection
+                            .pending_suspension
+                            .as_ref()
+                            .is_none_or(|pending| {
+                                pending.suspension.kind
+                                    != crate::events::SuspensionKind::ModelConnection
+                            })
+                        {
                             projection.pending_suspension = None;
                         }
                     }

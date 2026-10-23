@@ -1,4 +1,5 @@
 use super::worker::{self, OperationResult, WorkerEvent};
+use super::ModelIngress;
 use super::{Command, TurnConfig, TurnEvent};
 use crate::agent::ActiveTurnGuard;
 use crate::metrics::{MetricStatus, RuntimeMetric};
@@ -8,7 +9,10 @@ use crate::{
     FunctionRecoveryPolicy, ModelFunctionCall, ModelResponse, ModelStreamEvent, Result,
     SessionLease, SuspensionResolution, TurnAbortHandle, TurnOutcome,
 };
+use crate::{ModelInteraction, ModelSessionCommand};
+use crate::{ModelResponseStatus, ModelSession, ModelSessionConfig, ModelSessionEvent};
 use canary_agent_kernel::projection::OperationStatus;
+use canary_agent_kernel::SuspensionKind;
 use canary_agent_kernel::{
     new_id, Suspension, Thread, ThreadProjection, TokenUsage, ToolResult, Turn, TurnItem,
     TurnItemKind, TurnItemSource, TurnStatus,
@@ -16,8 +20,29 @@ use canary_agent_kernel::{
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::{AbortHandle, Id, JoinSet};
+
+struct Connection {
+    id: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    responses: HashMap<String, Response>,
+    active_inputs: HashSet<String>,
+    known_inputs: HashSet<String>,
+    committed_inputs: HashSet<String>,
+    transcripts: HashSet<String>,
+    completed_items: HashSet<String>,
+    usage_events: HashSet<String>,
+    ready: bool,
+    history_position: usize,
+}
+
+struct Response {
+    generation: u64,
+    finished: bool,
+    interrupted: bool,
+}
 
 struct Inference {
     id: String,
@@ -79,6 +104,7 @@ struct Operation {
 }
 
 enum Job {
+    Connection(String),
     Model(String),
     Operation(String),
     Hook,
@@ -107,6 +133,10 @@ pub(super) struct Runner {
     usage: TokenUsage,
     stopping: Option<TurnOutcome>,
     abort_observed: bool,
+    model_input: ModelIngress,
+    connection: Option<Connection>,
+    connection_error: Option<String>,
+    ending_response: Option<String>,
 }
 
 impl Runner {
@@ -120,6 +150,7 @@ impl Runner {
         output: broadcast::Sender<TurnEvent>,
         guard: ActiveTurnGuard,
         lease: SessionLease,
+        model_input: ModelIngress,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(256);
         Self {
@@ -145,6 +176,10 @@ impl Runner {
             usage: TokenUsage::default(),
             stopping: None,
             abort_observed: false,
+            model_input,
+            connection: None,
+            connection_error: None,
+            ending_response: None,
         }
     }
 
@@ -174,6 +209,7 @@ impl Runner {
             let _ = tokio::time::timeout(grace, cleanup).await;
         }
         self.jobs.abort_all();
+        *self.model_input.lock().expect("model ingress") = None;
         while self.jobs.join_next().await.is_some() {}
         let status = match &result {
             Ok(TurnOutcome::Aborted { .. }) => MetricStatus::Aborted,
@@ -203,7 +239,15 @@ impl Runner {
                 self.publish_item(item);
             }
         }
+        if self.bidirectional() {
+            self.connect_model().await?;
+        }
         loop {
+            if let Some(reason) = self.connection_error.take() {
+                if let Some(id) = self.connection.as_ref().map(|c| c.id.clone()) {
+                    self.connection_lost(&id, reason).await?;
+                }
+            }
             if self.guard.signal.is_cancelled() && !self.abort_observed {
                 self.abort_observed = true;
                 self.begin_stop(TurnOutcome::Aborted {
@@ -223,7 +267,7 @@ impl Runner {
                     self.command(command).await?;
                     continue;
                 }
-                if self.inference.is_none() && self.dirty {
+                if !self.bidirectional() && self.inference.is_none() && self.dirty {
                     self.start_inference().await?;
                 }
             }
@@ -247,6 +291,7 @@ impl Runner {
                             let job = self.job_ids.remove(&error.id());
                             if !error.is_cancelled() {
                                 match job {
+                                    Some(Job::Connection(id)) => self.connection_lost(&id, format!("connection worker failed: {error}")).await?,
                                     Some(Job::Operation(operation_id)) => self.indeterminate(&operation_id, format!("worker failed: {error}")).await?,
                                     Some(Job::Model(id)) if self.inference.as_ref().is_some_and(|current| current.id == id) => {
                                         self.begin_stop(TurnOutcome::Failed { error: format!("model worker failed: {error}") }).await?;
@@ -260,6 +305,347 @@ impl Runner {
                 }
             }
         }
+    }
+
+    fn bidirectional(&self) -> bool {
+        self.agent.model_client.interaction() == ModelInteraction::Bidirectional
+    }
+
+    async fn connect_model(&mut self) -> Result<()> {
+        let id = new_id("connection");
+        let (sender, receiver) = mpsc::channel(self.config.input_capacity);
+        // Input is admitted only after the connection-open fact has committed.
+        *self.model_input.lock().expect("model ingress") = None;
+        let (shutdown, stop) = oneshot::channel();
+        self.connection = Some(Connection {
+            id: id.clone(),
+            shutdown: Some(shutdown),
+            responses: HashMap::new(),
+            active_inputs: HashSet::new(),
+            known_inputs: HashSet::new(),
+            committed_inputs: HashSet::new(),
+            transcripts: HashSet::new(),
+            completed_items: HashSet::new(),
+            usage_events: HashSet::new(),
+            ready: false,
+            history_position: self.turn().items.len(),
+        });
+        let task = self.jobs.spawn(drive_session(
+            self.agent.clone(),
+            self.thread.clone(),
+            self.turn_id.clone(),
+            id.clone(),
+            receiver,
+            sender,
+            stop,
+            self.config.cancellation_grace,
+            self.sender.clone(),
+        ));
+        self.job_ids.insert(task.id(), Job::Connection(id));
+        Ok(())
+    }
+
+    async fn connection_opened(
+        &mut self,
+        id: &str,
+        ingress: mpsc::Sender<ModelSessionCommand>,
+    ) -> Result<()> {
+        if !self.is_current_connection(id) || self.stopping.is_some() {
+            return Ok(());
+        }
+        Agent::set_turn_status(&mut self.thread, &self.turn_id, TurnStatus::Running)?;
+        self.append(vec![runtime(TurnItemKind::ModelSessionOpened {
+            connection_id: id.into(),
+        })])
+        .await?;
+        self.connection.as_mut().expect("connection").ready = true;
+        *self.model_input.lock().expect("model ingress") = Some(ingress);
+        let position = self
+            .connection
+            .as_ref()
+            .expect("connection")
+            .history_position;
+        let catch_up = self.turn().items[position..].to_vec();
+        self.notify_model(&catch_up);
+        self.emit(TurnEvent::SessionReady {
+            connection_id: id.into(),
+        });
+        Ok(())
+    }
+
+    fn is_current_connection(&self, id: &str) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.id == id)
+    }
+
+    fn shutdown_connection(&mut self) {
+        *self.model_input.lock().expect("model ingress") = None;
+        if let Some(mut connection) = self.connection.take() {
+            if let Some(shutdown) = connection.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    async fn connection_lost(&mut self, id: &str, reason: String) -> Result<()> {
+        if !self.is_current_connection(id) || self.stopping.is_some() {
+            return Ok(());
+        }
+        self.shutdown_connection();
+        let suspension = Suspension {
+            id: new_id("suspension"),
+            kind: SuspensionKind::ModelConnection,
+            payload: serde_json::json!({"connection_id":id,"reason":reason}),
+        };
+        Agent::set_turn_status(&mut self.thread, &self.turn_id, TurnStatus::Suspended)?;
+        self.append(vec![runtime(TurnItemKind::ModelSessionSuspended {
+            connection_id: id.into(),
+            suspension: suspension.clone(),
+        })])
+        .await?;
+        self.emit(TurnEvent::Suspended { suspension });
+        Ok(())
+    }
+
+    fn notify_model(&mut self, items: &[TurnItem]) {
+        if !self.bidirectional() {
+            return;
+        }
+        let items: Vec<_> = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    TurnItemKind::ToolAccepted { .. }
+                        | TurnItemKind::ToolCompleted { .. }
+                        | TurnItemKind::ToolOutput { .. }
+                        | TurnItemKind::ToolProgress { .. }
+                        | TurnItemKind::ToolSuspended { .. }
+                        | TurnItemKind::ToolIndeterminate { .. }
+                        | TurnItemKind::ToolCancellationRequested { .. }
+                        | TurnItemKind::ToolResumed { .. }
+                        | TurnItemKind::UserInput {
+                            response_to: Some(_),
+                            ..
+                        }
+                )
+            })
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        if let Some(sender) = self.model_input.lock().expect("model ingress").as_ref() {
+            if let Err(error) = sender.try_send(ModelSessionCommand::Observe { items }) {
+                self.connection_error = Some(format!("model observation delivery failed: {error}"));
+            }
+        }
+    }
+
+    fn session_can_close(&self) -> bool {
+        !self.bidirectional()
+            || self
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.ready && connection.active_inputs.is_empty())
+    }
+
+    async fn session_event(&mut self, id: &str, event: ModelSessionEvent) -> Result<()> {
+        if !self.is_current_connection(id) {
+            return Ok(());
+        }
+        if self.stopping.is_some() {
+            let draining = self
+                .ending_response
+                .as_ref()
+                .is_some_and(|ending| match &event {
+                    ModelSessionEvent::TextDelta { response_id, .. }
+                    | ModelSessionEvent::AudioDelta { response_id, .. }
+                    | ModelSessionEvent::ResponseFinished { response_id, .. } => {
+                        response_id == ending
+                    }
+                    ModelSessionEvent::Usage { .. } => true,
+                    ModelSessionEvent::TranscriptFinalized { .. } => true,
+                    _ => false,
+                });
+            if !draining {
+                return Ok(());
+            }
+        }
+        let connection = self.connection.as_mut().expect("connection");
+        let mut facts = Vec::new();
+        match &event {
+            ModelSessionEvent::InputStarted { item_id } => {
+                if !connection.known_inputs.insert(item_id.clone()) {
+                    return Ok(());
+                }
+                connection.active_inputs.insert(item_id.clone());
+                facts.push(runtime(TurnItemKind::ModelInputStarted {
+                    connection_id: id.into(),
+                    item_id: item_id.clone(),
+                }));
+                self.changed();
+            }
+            ModelSessionEvent::InputEnded { item_id } => {
+                facts.push(runtime(TurnItemKind::ModelInputEnded {
+                    connection_id: id.into(),
+                    item_id: item_id.clone(),
+                }));
+            }
+            ModelSessionEvent::InputCommitted { item_id } => {
+                if !connection.committed_inputs.insert(item_id.clone()) {
+                    return Ok(());
+                }
+                connection.active_inputs.remove(item_id);
+                let new = connection.known_inputs.insert(item_id.clone());
+                facts.push(runtime(TurnItemKind::ModelInputCommitted {
+                    connection_id: id.into(),
+                    item_id: item_id.clone(),
+                }));
+                if new {
+                    self.changed();
+                }
+            }
+            ModelSessionEvent::TranscriptFinalized { item_id, text } => {
+                if !connection.transcripts.insert(item_id.clone()) {
+                    return Ok(());
+                }
+                facts.push(TurnItem::new(
+                    TurnItemSource::User,
+                    TurnItemKind::InputTranscript {
+                        connection_id: id.into(),
+                        item_id: item_id.clone(),
+                        text: text.clone(),
+                    },
+                ));
+            }
+            ModelSessionEvent::ResponseStarted { response_id } => {
+                if connection.responses.contains_key(response_id) {
+                    return Ok(());
+                }
+                if self.model_iterations
+                    >= self.agent.config.turn_execution_limits.max_model_iterations
+                {
+                    self.begin_stop(TurnOutcome::Failed {
+                        error: AgentError::MaxIterations(self.model_iterations).to_string(),
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                connection.responses.insert(
+                    response_id.clone(),
+                    Response {
+                        generation: self.generation,
+                        finished: false,
+                        interrupted: false,
+                    },
+                );
+                self.model_iterations += 1;
+                facts.push(runtime(TurnItemKind::ModelResponseStarted {
+                    connection_id: id.into(),
+                    response_id: response_id.clone(),
+                }));
+            }
+            ModelSessionEvent::TextDelta { response_id, .. }
+            | ModelSessionEvent::AudioDelta { response_id, .. } => {
+                if connection
+                    .responses
+                    .get(response_id)
+                    .is_none_or(|r| r.finished)
+                {
+                    return Ok(());
+                }
+            }
+            ModelSessionEvent::ItemCompleted {
+                response_id,
+                item_id,
+                text,
+                function_calls,
+            } => {
+                let Some(response) = connection.responses.get(response_id) else {
+                    self.connection_lost(id, "output item has no response-start event".into())
+                        .await?;
+                    return Ok(());
+                };
+                if response.finished
+                    || response.interrupted
+                    || !connection.completed_items.insert(item_id.clone())
+                {
+                    return Ok(());
+                }
+                let generation = response.generation;
+                let origin = runtime(TurnItemKind::ModelItemReceived {
+                    connection_id: id.into(),
+                    response_id: response_id.clone(),
+                    item_id: item_id.clone(),
+                });
+                self.model_response(
+                    ModelResponse::Assistant {
+                        continuation: None,
+                        text: text.clone(),
+                        function_calls: function_calls.clone(),
+                    },
+                    generation,
+                    Some(origin),
+                )
+                .await?;
+            }
+            ModelSessionEvent::ResponseFinished {
+                response_id,
+                status,
+            } => {
+                let Some(response) = connection.responses.get_mut(response_id) else {
+                    return Ok(());
+                };
+                if response.finished {
+                    return Ok(());
+                }
+                response.finished = true;
+                response.interrupted = matches!(status, ModelResponseStatus::Interrupted { .. });
+                facts.push(runtime(TurnItemKind::ModelResponseFinished {
+                    connection_id: id.into(),
+                    response_id: response_id.clone(),
+                    status: status.clone(),
+                }));
+                if let ModelResponseStatus::Failed { error } = status {
+                    self.append(facts).await?;
+                    self.begin_stop(TurnOutcome::Failed {
+                        error: error.clone(),
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                if self.ending_response.as_deref() == Some(response_id) {
+                    self.shutdown_connection();
+                }
+            }
+            ModelSessionEvent::Usage {
+                event_id,
+                response_id,
+                usage,
+            } => {
+                if !connection.usage_events.insert(event_id.clone()) {
+                    return Ok(());
+                }
+                self.usage.add_assign(*usage);
+                Agent::apply_turn_token_usage(&mut self.thread, *usage);
+                facts.push(runtime(TurnItemKind::ModelUsageReported {
+                    connection_id: id.into(),
+                    event_id: event_id.clone(),
+                    response_id: response_id.clone(),
+                    usage: *usage,
+                }));
+            }
+        }
+        if !facts.is_empty() {
+            self.append(facts).await?;
+        }
+        self.emit(TurnEvent::Session {
+            connection_id: id.into(),
+            event,
+        });
+        Ok(())
     }
 
     fn turn(&self) -> &Turn {
@@ -288,6 +674,7 @@ impl Runner {
         let mut thread = self.thread.clone();
         Agent::push_turn_items(&mut thread, &self.turn_id, items.clone())?;
         self.thread = self.agent.commit_thread(thread, self.lease.fence()).await?;
+        self.notify_model(&items);
         for item in items {
             self.publish_item(item);
         }
@@ -318,6 +705,20 @@ impl Runner {
 
     async fn command(&mut self, command: Command) -> Result<()> {
         match command {
+            Command::Reconnect { reply } => {
+                let result = if !self.bidirectional() {
+                    Err(AgentError::Model(
+                        "request-based model has no persistent connection".into(),
+                    ))
+                } else if self.connection.is_some() {
+                    Err(AgentError::Model(
+                        "model connection is already active or connecting".into(),
+                    ))
+                } else {
+                    self.connect_model().await
+                };
+                let _ = reply.send(result);
+            }
             Command::Input { text, reply } => {
                 let item = TurnItem::new(
                     TurnItemSource::User,
@@ -409,6 +810,18 @@ impl Runner {
 
     async fn worker_event(&mut self, event: WorkerEvent) -> Result<()> {
         match event {
+            WorkerEvent::SessionOpened {
+                connection_id,
+                ingress,
+            } => self.connection_opened(&connection_id, ingress).await?,
+            WorkerEvent::SessionEvent {
+                connection_id,
+                event,
+            } => self.session_event(&connection_id, event).await?,
+            WorkerEvent::SessionDisconnected {
+                connection_id,
+                reason,
+            } => self.connection_lost(&connection_id, reason).await?,
             WorkerEvent::ModelDelta { id, event } => {
                 if let ModelStreamEvent::TokenUsage { usage } = &event {
                     self.usage.add_assign(*usage);
@@ -447,7 +860,7 @@ impl Runner {
                         duration: inference.started.elapsed(),
                     });
                 match response {
-                    Ok(response) => self.model_response(response, generation).await?,
+                    Ok(response) => self.model_response(response, generation, None).await?,
                     Err(error) => {
                         self.begin_stop(TurnOutcome::Failed {
                             error: error.to_string(),
@@ -557,15 +970,31 @@ impl Runner {
         Ok(())
     }
 
-    async fn model_response(&mut self, response: ModelResponse, generation: u64) -> Result<()> {
+    async fn model_response(
+        &mut self,
+        response: ModelResponse,
+        generation: u64,
+        origin: Option<TurnItem>,
+    ) -> Result<()> {
+        let response_id = origin.as_ref().and_then(|item| match &item.kind {
+            TurnItemKind::ModelItemReceived { response_id, .. } => Some(response_id.clone()),
+            _ => None,
+        });
         let ModelIteration {
             continuation,
             text,
             calls,
         } = response.into();
+        if self.bidirectional() && text.as_ref().is_none_or(String::is_empty) && calls.is_empty() {
+            // An audio-only item is still a fact, but it is not an empty text
+            // assistant message in a future Chat Completions projection.
+            self.append(origin.into_iter().collect()).await?;
+            return Ok(());
+        }
         if text.as_ref().is_none_or(String::is_empty)
             && calls.is_empty()
             && !self.agent.config.allow_empty_response
+            && !self.bidirectional()
         {
             self.begin_stop(TurnOutcome::Failed {
                 error: "model returned neither text nor function calls".into(),
@@ -578,14 +1007,15 @@ impl Runner {
             self.begin_stop(TurnOutcome::Failed { error: "duplicate model tool-call ID".into() }).await?;
             return Ok(());
         }
-        let mut items = vec![TurnItem::new(
+        let mut items: Vec<_> = origin.into_iter().collect();
+        items.push(TurnItem::new(
             TurnItemSource::Model,
             TurnItemKind::ModelResponse {
                 continuation,
                 text,
                 function_calls: calls.clone(),
             },
-        )];
+        ));
         let mut starts = Vec::new();
         let mut closing = false;
         let mut limit_exceeded = false;
@@ -607,6 +1037,7 @@ impl Runner {
                         && self.operations.is_empty()
                         && generation == self.generation
                         && self.input.is_empty();
+                    let can_close = can_close && self.session_can_close();
                     let result = if can_close
                         && call
                             .arguments
@@ -711,6 +1142,11 @@ impl Runner {
         }
         if closing {
             self.stopping = Some(TurnOutcome::Completed);
+            self.ending_response = response_id;
+            *self.model_input.lock().expect("model ingress") = None;
+            if self.ending_response.is_none() {
+                self.shutdown_connection();
+            }
         } else if limit_exceeded {
             // Calls admitted within budget still finish. Excess calls already
             // have durable error receipts in this same batch.
@@ -718,9 +1154,10 @@ impl Runner {
                 error: AgentError::MaxFunctionCalls(self.function_calls).to_string(),
             });
             self.dirty = false;
+            self.shutdown_connection();
         } else if continue_after_receipts {
             self.changed();
-        } else if !self.dirty {
+        } else if !self.dirty && !self.bidirectional() {
             self.emit(TurnEvent::Idle);
         }
         Ok(())
@@ -939,8 +1376,26 @@ impl Runner {
             .turn()
             .items
             .iter()
-            .filter(|item| matches!(item.kind, TurnItemKind::InferenceStarted { .. }))
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    TurnItemKind::InferenceStarted { .. }
+                        | TurnItemKind::ModelResponseStarted { .. }
+                )
+            })
             .count();
+        let recovered_usage: Vec<_> = self
+            .turn()
+            .items
+            .iter()
+            .filter_map(|item| match item.kind {
+                TurnItemKind::ModelUsageReported { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        for usage in recovered_usage {
+            self.usage.add_assign(usage);
+        }
         self.function_calls = self
             .turn()
             .items
@@ -1045,6 +1500,7 @@ impl Runner {
     }
 
     async fn begin_stop(&mut self, outcome: TurnOutcome) -> Result<()> {
+        self.shutdown_connection();
         self.interrupt("interaction stopping").await?;
         self.stopping = Some(outcome);
         self.dirty = false;
@@ -1119,4 +1575,99 @@ fn tool_output(call: &ModelFunctionCall, result: std::result::Result<Value, Stri
             },
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_session(
+    agent: Agent,
+    history: Thread,
+    turn_id: String,
+    connection_id: String,
+    mut commands: mpsc::Receiver<ModelSessionCommand>,
+    ingress: mpsc::Sender<ModelSessionCommand>,
+    mut stop: oneshot::Receiver<()>,
+    grace: Duration,
+    events: mpsc::Sender<WorkerEvent>,
+) {
+    let connect = async {
+        let request = worker::prepare_request(&agent, &history).await?;
+        agent
+            .model_client
+            .connect(ModelSessionConfig {
+                connection_id: connection_id.clone(),
+                turn_id,
+                request,
+                history,
+                model: agent.model_client.model_descriptor(),
+            })
+            .await
+    };
+    let connected = tokio::select! {
+        biased;
+        _ = &mut stop => return,
+        result = connect => result
+    };
+    let result = match connected {
+        Ok(ModelSession {
+            mut sender,
+            mut receiver,
+        }) => {
+            // Sealing public ingress must not close the writer before the final
+            // response's audio/usage has drained.
+            let _input_owner = ingress.clone();
+            // Reader and writer run independently, including while send awaits IO.
+            if events
+                .send(WorkerEvent::SessionOpened {
+                    connection_id: connection_id.clone(),
+                    ingress,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let result = {
+                let read = async {
+                    loop {
+                        match receiver.receive().await? {
+                            Some(event) => events
+                                .send(WorkerEvent::SessionEvent {
+                                    connection_id: connection_id.clone(),
+                                    event,
+                                })
+                                .await
+                                .map_err(|_| AgentError::Model("runtime closed".into()))?,
+                            None => {
+                                return Err::<(), _>(AgentError::Model(
+                                    "model connection closed".into(),
+                                ))
+                            }
+                        }
+                    }
+                };
+                let write = async {
+                    while let Some(command) = commands.recv().await {
+                        sender.send(command).await?;
+                    }
+                    Err::<(), _>(AgentError::Model("model input closed".into()))
+                };
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => Ok(()),
+                    result = async { tokio::try_join!(read, write).map(|_| ()) } => result
+                }
+            };
+            let _ = tokio::time::timeout(grace, sender.send(ModelSessionCommand::Close)).await;
+            result
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        let _ = events
+            .send(WorkerEvent::SessionDisconnected {
+                connection_id,
+                reason: error.to_string(),
+            })
+            .await;
+    }
 }
