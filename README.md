@@ -115,6 +115,13 @@ Bidirectional adapters implement `ModelClient::connect` and select
 playback stay in the host. See [bidirectional sessions](doc/bidirectional-model-sessions.md)
 for adapter contracts and reconnect behavior.
 
+The [voice example](examples/voice/README.md) connects `RealtimeClient` to a live
+microphone and speaker, with the official Qwen Python SDK over IPC and sandboxed tools:
+
+```bash
+cargo run -p voice
+```
+
 ## Library Usage
 
 An application can assemble the runtime from the provided adapters:

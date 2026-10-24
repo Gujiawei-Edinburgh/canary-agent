@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install audio build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -20,6 +22,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run non-sandbox tests
         run: cargo test --workspace -- --skip 'sandbox::linux::tests::'
+      - name: Test voice SDK bridge (offline)
+        run: python3 -m unittest discover -s examples/voice/python -v
 
   linux-sandbox:
     needs: rust

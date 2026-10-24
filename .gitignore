@@ -2,4 +2,8 @@
 /.idea/
 /.canary-agent/
 /.canary-agent-eval/
+/.canary-agent-voice/
+/examples/voice/.env
+/examples/voice/.venv/
+__pycache__/
 misc/

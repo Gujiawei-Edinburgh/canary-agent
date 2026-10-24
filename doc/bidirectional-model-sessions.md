@@ -40,9 +40,11 @@ native results or observations. `ToolAccepted` means admission, not successful
 completion; an adapter may wait for `ToolCompleted` to answer a native function
 call. The bidirectional transport does not require Chat Completions envelopes.
 
-The core supplies the contracts and execution engine, tested with a controlled
-bidirectional adapter. A provider WebSocket/WebRTC adapter and microphone/playback
-application remain separate integrations.
+The core supplies the contracts and execution engine. `canary-agent-openai`
+provides a `RealtimeClient` WebSocket adapter for the OpenAI Realtime protocol.
+`examples/voice` owns the Qwen-specific adapter and official Python SDK worker,
+along with microphone capture, resampling, and playback. Qwen protocol details
+are not part of `canary-agent-openai`.
 
 ## Application Contract
 
@@ -106,3 +108,14 @@ opening. The adapter receives durable history, and tool results produced during
 connection establishment are forwarded afterward. No microphone replay or
 uncertain external-effect retry is automatic. After process loss,
 `recover_turn()` applies existing tool recovery rules and opens a new session.
+
+Restoration is provider-specific. The voice example's Python worker restores
+selected messages as historical context, without replaying old native call IDs
+or requesting inference before fresh speech. In-flight tools continue. The
+journal itself is not rewritten.
+
+The realtime adapter buffers function items until `response.done` confirms a
+completed response. Argument-completion events and deltas can supply complete
+JSON when terminal snapshots are truncated. Cancelled, failed, and incomplete
+responses never dispatch their buffered calls. Truly malformed completed calls
+are rejected with response/item/call identifiers, without guessing arguments.

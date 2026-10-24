@@ -11,5 +11,6 @@ members = [
     "examples/repl",
     "examples/eval",
     "examples/revision",
+    "examples/voice",
 ]
 resolver = "2"
