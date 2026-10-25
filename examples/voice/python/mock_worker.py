@@ -24,5 +24,9 @@ for line in sys.stdin:
         emit("response_started", response_id="r2")
         emit("audio_delta", response_id="r2", item_id="a", audio="AAA=")
         emit("response_finished", response_id="r2", status="completed")
+    elif command["type"] == "text":
+        assert command["text"] == "typed input"
+        emit("response_started", response_id="text-response")
+        emit("response_finished", response_id="text-response", status="completed")
     elif command["type"] == "close":
         break

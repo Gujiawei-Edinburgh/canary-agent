@@ -141,7 +141,7 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
                             "/unmute" => { muted = false; let _ = enabled.send(if ready { MicrophoneMode::Live } else { MicrophoneMode::Off }); println!("\n[listening]"); }
                             "/reconnect" => match handle.reconnect_model().await { Ok(()) => println!("\n[reconnecting]"), Err(error) => eprintln!("{error}") },
                             "" => {},
-                            text => if let Err(error) = handle.send_input(ModelInput::Text { text:text.into() }).await { eprintln!("{error}"); },
+                            text => if let Err(error) = handle.append_input(text).await { eprintln!("{error}"); },
                         },
                         Some(Err(error)) => return Err(error.into()),
                         None => stdin_open = false,

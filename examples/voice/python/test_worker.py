@@ -62,6 +62,43 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("response", self.sdk.calls)
         self.assertIn("Historical conversation", self.sdk.calls[1]["update"]["instructions"])
 
+    def test_text_starts_response_without_audio_or_duplicate_transcript(self):
+        self.worker.command({"type": "text", "text": "hello"})
+        self.assertEqual(self.sdk.calls[-2:], [
+            {"item": {"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": "hello"}]}},
+            "response",
+        ])
+        self.assertEqual(self.events, [{"type": "ready"}])
+
+    def test_text_during_response_is_delivered_without_cancellation(self):
+        self.response()
+        self.worker.command({"type": "text", "text": "also check the time"})
+        self.assertEqual(self.sdk.calls[-1]["item"]["content"][0]["text"], "also check the time")
+        self.assertNotIn("cancel", self.sdk.calls)
+        self.assertNotIn("response", self.sdk.calls)
+        self.event("response.done", response={"id": "response", "status": "completed"})
+        self.assertEqual(self.sdk.calls.count("response"), 1)
+
+    def test_text_during_tool_wait_is_delivered_and_result_continues(self):
+        self.worker.waiting.add("call")
+        self.worker.command({"type": "text", "text": "new requirement"})
+        self.assertIn("item", self.sdk.calls[-1])
+        self.assertNotIn("response", self.sdk.calls)
+        self.worker.command({"type": "tool_result", "call_id": "call", "name": "test",
+                             "result": {"output": {}}})
+        self.assertEqual(self.sdk.calls.count("response"), 1)
+
+    def test_text_during_speech_leaves_response_to_vad(self):
+        self.event("input_audio_buffer.speech_started", item_id="speech")
+        self.worker.command({"type": "text", "text": "context"})
+        self.assertIn("item", self.sdk.calls[-1])
+        self.assertNotIn("response", self.sdk.calls)
+        self.event("input_audio_buffer.committed", item_id="speech")
+        self.event("response.created", response={"id": "r"})
+        self.event("response.done", response={"id": "r", "status": "completed"})
+        self.assertNotIn("response", self.sdk.calls)
+
     def test_tools_wait_for_response_done_and_result_continues_once(self):
         self.response()
         self.event("response.function_call_arguments.done", response_id="response", item_id="tool",

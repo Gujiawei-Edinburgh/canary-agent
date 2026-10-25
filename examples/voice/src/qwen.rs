@@ -184,10 +184,8 @@ impl ModelSessionSender for Sender {
                     self.write(json!({"type":"audio","audio":STANDARD.encode(chunk.data)}))
                         .await?;
                 }
-                ModelSessionCommand::Input(ModelInput::Text { .. }) => {
-                    return Err(AgentError::Model(
-                        "the Qwen voice demo accepts speech, not typed prompts".into(),
-                    ));
+                ModelSessionCommand::Input(ModelInput::Text { text }) => {
+                    self.write(json!({"type":"text","text":text})).await?;
                 }
                 ModelSessionCommand::Input(ModelInput::EndAudio) => {} // Server VAD commits speech.
                 ModelSessionCommand::CancelResponse { response_id } => {
@@ -457,6 +455,19 @@ mod tests {
         assert!(
             matches!(session.receiver.receive().await.unwrap(), Some(ModelSessionEvent::AudioDelta { chunk, .. }) if chunk.data == [0, 0])
         );
+        assert!(matches!(
+            session.receiver.receive().await.unwrap(),
+            Some(ModelSessionEvent::ResponseFinished { .. })
+        ));
+        session
+            .sender
+            .send(ModelSessionCommand::Input(ModelInput::Text {
+                text: "typed input".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(session.receiver.receive().await.unwrap(),
+            Some(ModelSessionEvent::ResponseStarted { response_id }) if response_id == "text-response"));
         assert!(matches!(
             session.receiver.receive().await.unwrap(),
             Some(ModelSessionEvent::ResponseFinished { .. })

@@ -53,7 +53,13 @@ AEC3 uses actual speaker output as an echo reference, processing 10 ms frames at
 48 kHz. Input is resampled to Qwen's mono 16 kHz PCM16; output is 24 kHz PCM16.
 High volume can still leave residual echo; reduce volume or use headphones.
 
-Local commands (typed prompts are not supported by this demo):
+Type a message and press Enter to send text into the same session as the
+microphone. Text is journaled before delivery and does not automatically cancel
+speech or tools. It is delivered immediately; response requests wait for the
+current response/tool cycle and speech detection to settle. Provider text support
+depends on the selected model. Text is not echoed as a second input transcript.
+
+Local commands:
 
 - `/mute`, `/unmute`: microphone forwarding.
 - `/reconnect`: open a new SDK session after a failure.
@@ -61,7 +67,7 @@ Local commands (typed prompts are not supported by this demo):
 
 The model calls `end_turn()` when the conversation ends. Final playback drains
 before exit. Reconnection restores selected textual history as labeled context,
-but waits for fresh speech instead of issuing inference against an empty audio
+but waits for fresh speech or text instead of issuing inference against an empty audio
 session. Audio is never replayed and completed tools are never re-executed.
 Late results from an old session update context rather than using old call IDs.
 

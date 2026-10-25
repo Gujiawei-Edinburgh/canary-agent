@@ -185,6 +185,15 @@ class Worker:
             kind = command["type"]
             if kind == "audio":
                 self.conversation.append_audio(command["audio"])
+            elif kind == "text":
+                # Already journaled by Canary. Do not echo it as a transcript.
+                self.conversation.create_item({
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": command["text"]}],
+                })
+                self.has_input = True
+                self.needs_response = True
+                self.continue_if_idle()
             elif kind == "cancel":
                 if command["response_id"] in self.active:
                     self.conversation.cancel_response()
