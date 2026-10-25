@@ -720,17 +720,44 @@ impl Runner {
                 let _ = reply.send(result);
             }
             Command::Input { text, reply } => {
+                let ingress = if self.bidirectional() {
+                    let sender = self.model_input.lock().expect("model ingress").clone();
+                    let Some(sender) = sender else {
+                        let _ = reply.send(Err(AgentError::Model(
+                            "model connection is not ready or is suspended; input was not appended"
+                                .into(),
+                        )));
+                        return Ok(());
+                    };
+                    Some(sender)
+                } else {
+                    None
+                };
                 let item = TurnItem::new(
                     TurnItemSource::User,
                     TurnItemKind::UserInput {
-                        text,
+                        text: text.clone(),
                         response_to: None,
                     },
                 );
                 let id = item.id.clone();
                 self.append(vec![item]).await?;
                 self.changed();
-                self.interrupt("superseded by new user input").await?;
+                if let Some(sender) = ingress {
+                    // Never await a blocked transport queue on the runner: it
+                    // must remain able to process cancellation and model output.
+                    if let Err(error) = sender
+                        .try_send(ModelSessionCommand::Input(crate::ModelInput::Text { text }))
+                    {
+                        let reason =
+                            format!("input {id} persisted but model delivery failed: {error}");
+                        self.connection_error = Some(reason.clone());
+                        let _ = reply.send(Err(AgentError::Model(reason)));
+                        return Ok(());
+                    }
+                } else {
+                    self.interrupt("superseded by new user input").await?;
+                }
                 let _ = reply.send(Ok(id));
             }
             Command::Cancel {

@@ -115,17 +115,17 @@ impl TurnHandle {
         permit.send(command);
         Ok(())
     }
-    /// Submits transport input. Success means queued locally, not acknowledged
-    /// by the provider. Audio bytes are never appended to the thread journal.
-    /// Request-based clients accept Text through the ordinary journal ingress.
+    /// Text uses journal-first ingress in both model modes. Media is queued
+    /// directly; audio bytes are never appended to the thread journal.
+    /// Success does not mean the provider has acknowledged delivery.
     pub async fn send_input(&self, input: ModelInput) -> Result<()> {
+        if let ModelInput::Text { text } = input {
+            return self.append_input(text).await.map(|_| ());
+        }
         if !self.bidirectional {
-            return match input {
-                ModelInput::Text { text } => self.append_input(text).await.map(|_| ()),
-                _ => Err(AgentError::Model(
-                    "request-based models accept text input only".into(),
-                )),
-            };
+            return Err(AgentError::Model(
+                "request-based models accept text input only".into(),
+            ));
         }
         self.send_model_command(ModelSessionCommand::Input(input))
             .await
@@ -138,9 +138,10 @@ impl TurnHandle {
         self.send(Command::Reconnect { reply }).await?;
         result.await.map_err(|_| closed())?
     }
-    /// Appends factual text. Request-based inference observes the updated journal;
-    /// a bidirectional connection does not resubmit this text. Use send_input to
-    /// deliver new transport input to a bidirectional model.
+    /// Persists text, then updates request-based inference or queues it into the
+    /// live bidirectional session without cancelling the provider response.
+    /// Bidirectional input requires a ready connection. A delivery error after
+    /// persistence does not roll back the journal; recovery uses durable history.
     pub async fn append_input(&self, text: impl Into<String>) -> Result<String> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Input {

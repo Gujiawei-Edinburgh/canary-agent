@@ -182,6 +182,73 @@ fn audio() -> AudioChunk {
 }
 
 #[tokio::test]
+async fn text_ingress_is_durable_and_does_not_cancel_live_response() {
+    let mut h = LiveHarness::new();
+    let OpenedInteraction {
+        mut turn,
+        mut connection,
+    } = h.open().await;
+    connection.start("speaking").await;
+    event(&mut turn, |e| {
+        matches!(
+            e,
+            TurnEvent::Session {
+                event: ModelSessionEvent::ResponseStarted { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    turn.handle()
+        .send_input(ModelInput::Text {
+            text: "door opened".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        connection.command().await,
+        ModelSessionCommand::Input(ModelInput::Text {
+            text: "door opened".into()
+        })
+    );
+    assert_eq!(
+        h.h.items()
+            .iter()
+            .filter(|item| matches!(
+                &item.kind, TurnItemKind::UserInput { text, .. } if text == "door opened"
+            ))
+            .count(),
+        1
+    );
+    assert!(connection.commands.try_recv().is_err());
+    connection.end_response("speaking").await;
+    connection.close_turn().await;
+    assert_eq!(finish(turn).await, TurnOutcome::Completed);
+}
+
+#[tokio::test]
+async fn text_delivery_failure_suspends_and_preserves_input() {
+    let mut h = LiveHarness::new();
+    let OpenedInteraction {
+        mut turn,
+        mut connection,
+    } = h.open().await;
+    connection.commands.close();
+    // Local admission may succeed before the transport reports its failure.
+    let _ = turn.handle().append_input("durable observation").await;
+    event(&mut turn, |e| matches!(e, TurnEvent::Suspended { .. })).await;
+    assert!(h.h.items().iter().any(|item| matches!(
+        &item.kind, TurnItemKind::UserInput { text, .. } if text == "durable observation"
+    )));
+    assert!(turn.handle().append_input("not admitted").await.is_err());
+    assert!(!h.h.items().iter().any(|item| matches!(
+        &item.kind, TurnItemKind::UserInput { text, .. } if text == "not admitted"
+    )));
+    turn.handle().abort();
+    assert!(matches!(finish(turn).await, TurnOutcome::Aborted { .. }));
+}
+
+#[tokio::test]
 async fn continuous_input_and_transcripts_share_one_connection_without_reinference() {
     let mut h = LiveHarness::new();
     let OpenedInteraction {
@@ -222,8 +289,18 @@ async fn continuous_input_and_transcripts_share_one_connection_without_reinferen
             .await;
     }
     event(&mut turn, |e| matches!(e, TurnEvent::ItemCommitted { item } if matches!(item.kind, TurnItemKind::InputTranscript { .. }))).await;
-    turn.handle().append_input("journal only").await.unwrap();
-    assert!(connection.commands.try_recv().is_err());
+    let id = turn
+        .handle()
+        .append_input("external observation")
+        .await
+        .unwrap();
+    assert!(h.h.items().iter().any(|item| item.id == id));
+    assert_eq!(
+        connection.command().await,
+        ModelSessionCommand::Input(ModelInput::Text {
+            text: "external observation".into()
+        })
+    );
     assert!(h.connections.try_recv().is_err());
     assert!(h.h.requests.try_recv().is_err());
     connection.close_turn().await;
