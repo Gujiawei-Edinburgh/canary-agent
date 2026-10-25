@@ -49,6 +49,12 @@ Grant microphone access to your terminal on macOS. Speak after `[listening]`.
 The microphone stays active during speech and tools. Server VAD detects speech
 boundaries; new speech clears buffered playback. Tools continue unless cancelled.
 
+Playback uses a latest-audio-response-wins policy: the first audio chunk from a
+new response clears the previous response's queued audio and resampler state.
+Late audio and completion events from superseded responses are ignored. Text-only
+or tool-only responses do not replace playback. This switches speech when new
+audio arrives, not immediately when a typed observation is submitted.
+
 AEC3 uses actual speaker output as an echo reference, processing 10 ms frames at
 48 kHz. Input is resampled to Qwen's mono 16 kHz PCM16; output is 24 kHz PCM16.
 High volume can still leave residual echo; reduce volume or use headphones.

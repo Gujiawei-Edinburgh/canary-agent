@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod connection_check;
+mod playback;
 mod qwen;
 mod tools;
 
@@ -105,6 +106,7 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
     let handle = turn.handle();
     let result = async {
         let mut audio = AudioDevices::open(format)?;
+        let mut playback = playback::PlaybackResponses::default();
         let (enabled, input_enabled) = watch::channel(MicrophoneMode::Off);
         let _microphone = forward_microphone(
             audio.microphone.take().expect("microphone receiver"),
@@ -150,15 +152,30 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
                 event = turn.next_event() => match event {
                     Ok(canary_agent_runtime::TurnEvent::SessionReady { .. }) => { ready = true; let _ = enabled.send(if muted { MicrophoneMode::Muted } else { MicrophoneMode::Live }); println!("[listening]"); }
                     Ok(canary_agent_runtime::TurnEvent::Session { event, .. }) => match event {
-                        ModelSessionEvent::AudioDelta { chunk, .. } => audio.enqueue(chunk)?,
-                        ModelSessionEvent::InputStarted { .. } => { audio.interrupt(); println!("\n[user speaking]"); }
+                        ModelSessionEvent::AudioDelta { response_id, chunk, .. } => {
+                            if !chunk.data.is_empty() {
+                                match playback.audio(&response_id) {
+                                    playback::AudioDecision::Replace => { audio.interrupt(); audio.enqueue(chunk)?; }
+                                    playback::AudioDecision::Append => audio.enqueue(chunk)?,
+                                    playback::AudioDecision::Ignore => {},
+                                }
+                            }
+                        }
+                        ModelSessionEvent::InputStarted { .. } => { playback.interrupt(); audio.interrupt(); println!("\n[user speaking]"); }
                         ModelSessionEvent::TranscriptFinalized { text, .. } => println!("\nuser: {text}"),
                         ModelSessionEvent::TextDelta { text, .. } => { print!("{text}"); io::stdout().flush()?; }
-                        ModelSessionEvent::ResponseFinished { status:canary_agent_runtime::ModelResponseStatus::Completed, .. } => audio.finish_response()?,
-                        ModelSessionEvent::ResponseFinished { status:canary_agent_runtime::ModelResponseStatus::Interrupted { .. }, .. } => audio.interrupt(),
+                        ModelSessionEvent::ResponseFinished { response_id, status } => {
+                            if playback.finish(&response_id) {
+                                if matches!(status, canary_agent_runtime::ModelResponseStatus::Completed) {
+                                    audio.finish_response()?;
+                                } else {
+                                    audio.interrupt();
+                                }
+                            }
+                        }
                         _ => {},
                     },
-                    Ok(canary_agent_runtime::TurnEvent::Suspended { suspension }) => { ready = false; let _ = enabled.send(MicrophoneMode::Off); audio.interrupt(); println!("\n[connection suspended] {}\nUse /reconnect or Ctrl+C.",suspension.payload); }
+                    Ok(canary_agent_runtime::TurnEvent::Suspended { suspension }) => { ready = false; let _ = enabled.send(MicrophoneMode::Off); playback.interrupt(); audio.interrupt(); println!("\n[connection suspended] {}\nUse /reconnect or Ctrl+C.",suspension.payload); }
                     Ok(canary_agent_runtime::TurnEvent::ItemCommitted { item }) => match item.kind {
                         TurnItemKind::ToolAccepted { name,operation_id,.. } => println!("\n[tool] {name}: {operation_id}"),
                         TurnItemKind::ToolCompleted { name,.. } => println!("\n[tool completed] {name}"),
