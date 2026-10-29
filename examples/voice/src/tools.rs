@@ -12,6 +12,8 @@ pub fn registry(workspace: PathBuf) -> FunctionRegistry {
     register_time_tools(&mut registry);
     if let Ok(key) = std::env::var("EXA_API_KEY") {
         register_web_search_tools(&mut registry, ExaWebSearchConfig::new(key));
+    } else {
+        eprintln!("web_search unavailable: set EXA_API_KEY");
     }
     registry.register(ExecCommandTool::new(ExecCommandConfig::new(
         workspace.clone(),

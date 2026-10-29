@@ -1,5 +1,21 @@
 # Qwen Voice Assistant
 
+## Live Actor And Worker
+
+Run `cargo run -p voice --bin live` for a Qwen voice actor and a separate
+chat-completions worker. Configure Qwen as below and set `CANARY_AGENT_MODEL`,
+`CANARY_AGENT_API_KEY`, and `CANARY_AGENT_BASE_URL` for the worker. Optionally
+set `CANARY_AGENT_REASONING_EFFORT`.
+
+The actor delegates tasks and refinements to one worker interaction. The
+worker owns the time, search, and sandboxed command tools; text-only worker
+responses are forwarded to the actor. Closing the voice interaction aborts
+the worker. Each run creates a separate worker thread.
+
+This experimental bridge does not retry delivery to a disconnected actor or
+recover the worker across application restarts. Acceptance means submission,
+not completion.
+
 A continuous audio example built on Canary. It uses the official DashScope Python
 SDK through a small IPC bridge; Qwen-specific code lives only in this example.
 

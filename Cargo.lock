@@ -2600,6 +2600,7 @@ dependencies = [
  "base64",
  "canary-agent-kernel",
  "canary-agent-observability",
+ "canary-agent-openai",
  "canary-agent-runtime",
  "canary-agent-store-json",
  "canary-agent-tools",

@@ -2,9 +2,11 @@
 name = "voice"
 version = "0.1.0"
 edition = "2024"
+default-run = "voice"
 
 [dependencies]
 canary-agent-runtime = { path = "../../canary-agent-runtime" }
+canary-agent-openai = { path = "../../canary-agent-openai" }
 canary-agent-kernel = { path = "../../canary-agent-kernel" }
 canary-agent-store-json = { path = "../../canary-agent-store-json" }
 canary-agent-observability = { path = "../../canary-agent-observability" }
