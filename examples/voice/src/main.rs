@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
                     "a new request from a refinement. For requests to stop or change worker ",
                     "work, send the request using delegate; a worker thread ID is not a ",
                     "cancel_operation ID. A delegate acceptance is not a result. Worker ",
-                    "responses arrive later as user messages labeled Worker response; ",
+                    "reports arrive later as user messages labeled Worker report; ",
                     "communicate them accurately. Keep listening while the worker runs. ",
                     "Call end_turn only when the user ends the conversation."
                 ).into()

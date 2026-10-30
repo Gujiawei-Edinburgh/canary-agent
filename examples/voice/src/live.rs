@@ -12,6 +12,7 @@ use canary_agent_store_json::JsonFileThreadStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -48,13 +49,34 @@ mod tests {
 
     #[test]
     fn receipt_represents_acceptance_not_completion() {
-        let receipt = DelegateReceipt {
+        let receipt = DelegateAck {
             status: DelegateStatus::Accepted,
+            delegation_id: "call-1".into(),
             worker_thread: "worker-1".into(),
         };
         assert_eq!(
             serde_json::to_value(receipt).unwrap(),
-            json!({"status": "accepted", "worker_thread": "worker-1"})
+            json!({"status": "accepted", "delegation_id": "call-1", "worker_thread": "worker-1"})
+        );
+    }
+
+    #[test]
+    fn worker_report_preserves_multiple_delegations_and_artifacts() {
+        let value = json!({
+            "delegation_ids": ["call-1", "call-2"],
+            "status": "partial",
+            "summary": "Reviewed cancellation",
+            "artifacts": [{"kind": "file", "path": "ARCHITECTURE.md", "description": "Report"}],
+            "sources": [{"title": "Reference", "url": "https://example.com"}],
+            "limitations": ["Review incomplete"]
+        });
+        let report: WorkerReport = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(report).unwrap(), value);
+        assert!(
+            serde_json::from_value::<WorkerReport>(
+                json!({"delegation_ids": ["call-1"], "status": "completed"})
+            )
+            .is_err()
         );
     }
 }
@@ -73,15 +95,106 @@ impl DelegateRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct DelegateReceipt {
+struct DelegateAck {
     status: DelegateStatus,
+    delegation_id: String,
     worker_thread: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReportStatus {
+    Completed,
+    Partial,
+    Failed,
+    NeedsInput,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Artifact {
+    kind: String,
+    path: String,
+    description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Source {
+    title: String,
+    url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerReport {
+    delegation_ids: Vec<String>,
+    status: ReportStatus,
+    summary: String,
+    artifacts: Vec<Artifact>,
+    sources: Vec<Source>,
+    limitations: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DelegateStatus {
     Accepted,
+}
+
+fn register_report_tool(
+    registry: &mut FunctionRegistry,
+    actor: Arc<OnceLock<TurnHandle>>,
+    known_ids: Arc<Mutex<HashSet<String>>>,
+) {
+    registry.register(SimpleFunction::new(
+        FunctionSpec {
+            name: "report_result".into(),
+            description: "Report a task outcome to the voice actor. Include only delegation IDs addressed by this report.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "delegation_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                    "status": {"type": "string", "enum": ["completed", "partial", "failed", "needs_input"]},
+                    "summary": {"type": "string", "minLength": 1},
+                    "artifacts": {"type": "array", "items": {
+                        "type": "object", "properties": {"kind": {"type": "string"}, "path": {"type": "string"}, "description": {"type": "string"}},
+                        "required": ["kind", "path", "description"], "additionalProperties": false
+                    }},
+                    "sources": {"type": "array", "items": {
+                        "type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}},
+                        "required": ["title", "url"], "additionalProperties": false
+                    }},
+                    "limitations": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["delegation_ids", "status", "summary", "artifacts", "sources", "limitations"],
+                "additionalProperties": false
+            }),
+        },
+        json!({"type": "object", "properties": {"status": {"type": "string", "enum": ["delivered"]}}, "required": ["status"], "additionalProperties": false}),
+        FunctionLimits { time_budget: Duration::from_secs(300), max_output_bytes: 4096 * 1024 },
+        FunctionRecoveryPolicy::NonIdempotent,
+        move |args: Value, _: canary_agent_runtime::FunctionContext| {
+            let actor = actor.clone();
+            let known_ids = known_ids.clone();
+            async move {
+                let report: WorkerReport = serde_json::from_value(args)
+                    .map_err(|error| AgentError::Model(format!("invalid worker report: {error}")))?;
+                if report.delegation_ids.is_empty() || report.summary.trim().is_empty() {
+                    return Err(AgentError::Model("report requires delegation IDs and a nonempty summary".into()));
+                }
+                let known = known_ids.lock().await;
+                if report.delegation_ids.iter().any(|id| !known.contains(id)) {
+                    return Err(AgentError::Model("report contains an unknown delegation ID".into()));
+                }
+                drop(known);
+                let actor = actor.get().ok_or_else(|| AgentError::Model("actor not ready".into()))?;
+                let text = serde_json::to_string(&report)?;
+                actor.append_input(format!("Worker report: {text}")).await?;
+                Ok(FunctionExecution::Completed { output: json!({"status": "delivered"}) })
+            }
+        },
+    ));
 }
 
 #[derive(Clone)]
@@ -91,6 +204,7 @@ pub struct Bridge {
     handle: Arc<Mutex<Option<TurnHandle>>>,
     actor: Arc<OnceLock<TurnHandle>>,
     task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    delegation_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Bridge {
@@ -115,6 +229,10 @@ impl Bridge {
             reasoning_effort: std::env::var("CANARY_AGENT_REASONING_EFFORT")
                 .unwrap_or_else(|_| ModelConfig::default_reasoning_effort()),
         });
+        let actor = Arc::new(OnceLock::<TurnHandle>::new());
+        let delegation_ids = Arc::new(Mutex::new(HashSet::new()));
+        let mut registry = tools::registry(workspace);
+        register_report_tool(&mut registry, actor.clone(), delegation_ids.clone());
         let worker = Agent::new(
             AgentConfig {
                 system_prompt: concat!(
@@ -122,15 +240,16 @@ impl Bridge {
                     "Execute delegated tasks using tools. Later inputs may be refinements ",
                     "or new requests; distinguish them from context. Tool acceptance is ",
                     "not completion; results arrive later. Do not issue sleep or polling ",
-                    "commands to wait for tools. Return concise factual findings to the ",
-                    "actor. Do not call end_turn unless asked to end the interaction."
+                    "commands to wait for tools. Submit findings using report_result with ",
+                    "the delegation IDs addressed. Report artifacts only after verifying ",
+                    "them. Do not call end_turn unless asked to end the interaction."
                 )
                 .into(),
                 ..AgentConfig::default()
             },
             store,
             Arc::new(client),
-            tools::registry(workspace),
+            registry,
             Arc::new(LocalSessionCoordinator::default()),
         )
         .with_shared_trace_collector(trace);
@@ -138,8 +257,9 @@ impl Bridge {
             worker,
             thread_id: new_id("live_worker"),
             handle: Arc::new(Mutex::new(None)),
-            actor: Arc::new(OnceLock::new()),
+            actor,
             task: Arc::new(Mutex::new(None)),
+            delegation_ids,
         })
     }
 
@@ -176,9 +296,10 @@ impl Bridge {
                 "type": "object",
                 "properties": {
                     "status": {"type": "string", "enum": ["accepted"]},
+                    "delegation_id": {"type": "string"},
                     "worker_thread": {"type": "string"}
                 },
-                "required": ["status", "worker_thread"],
+                "required": ["status", "delegation_id", "worker_thread"],
                 "additionalProperties": false
             }),
             FunctionLimits {
@@ -186,17 +307,18 @@ impl Bridge {
                 max_output_bytes: 4096,
             },
             FunctionRecoveryPolicy::NonIdempotent,
-            move |args: Value, _: canary_agent_runtime::FunctionContext| {
+            move |args: Value, context: canary_agent_runtime::FunctionContext| {
                 let bridge = bridge.clone();
                 async move {
                     let request = DelegateRequest::parse(args)?;
-                    bridge.submit(&request.message).await?;
-                    let receipt = DelegateReceipt {
+                    bridge.submit(&context.call_id, &request.message).await?;
+                    let ack = DelegateAck {
                         status: DelegateStatus::Accepted,
+                        delegation_id: context.call_id,
                         worker_thread: bridge.thread_id.clone(),
                     };
                     Ok(FunctionExecution::Completed {
-                        output: serde_json::to_value(receipt)?,
+                        output: serde_json::to_value(ack)?,
                     })
                 }
             },
@@ -204,8 +326,21 @@ impl Bridge {
         registry
     }
 
-    async fn submit(&self, message: &str) -> Result<()> {
+    async fn submit(&self, delegation_id: &str, message: &str) -> Result<()> {
         println!("\n[worker delegation] {message}");
+        self.delegation_ids
+            .lock()
+            .await
+            .insert(delegation_id.into());
+        let input = json!({"delegation_id": delegation_id, "message": message}).to_string();
+        let result = self.submit_input(&input).await;
+        if result.is_err() {
+            self.delegation_ids.lock().await.remove(delegation_id);
+        }
+        result
+    }
+
+    async fn submit_input(&self, message: &str) -> Result<()> {
         let mut handle = self.handle.lock().await;
         if let Some(worker) = handle.as_ref() {
             return worker.append_input(message).await.map(|_| ());
@@ -238,12 +373,7 @@ impl Bridge {
                             && !text.trim().is_empty()
                         {
                             println!("\n[worker] {text}");
-                            if function_calls.is_empty()
-                                && let Err(error) =
-                                    actor.append_input(format!("Worker response: {text}")).await
-                            {
-                                eprintln!("worker response delivery failed: {error}");
-                            }
+                            let _ = function_calls;
                         } else if let TurnItemKind::ToolAccepted {
                             name, operation_id, ..
                         } = &item.kind
