@@ -2,7 +2,7 @@
 use crate::tools;
 use canary_agent_kernel::{TurnItemKind, new_id};
 use canary_agent_observability::JsonlTraceCollector;
-use canary_agent_openai::{ChatCompletionsClient, ModelConfig};
+use canary_agent_openai::{ModelConfig, ResponsesClient};
 use canary_agent_runtime::{
     Agent, AgentConfig, AgentError, FunctionExecution, FunctionLimits, FunctionRecoveryPolicy,
     FunctionRegistry, FunctionSpec, LocalSessionCoordinator, Result, SimpleFunction, TurnConfig,
@@ -221,7 +221,7 @@ impl Bridge {
         let api_key = std::env::var("CANARY_AGENT_API_KEY").map_err(|_| {
             AgentError::Model("set CANARY_AGENT_API_KEY for the live worker".into())
         })?;
-        let client = ChatCompletionsClient::new(ModelConfig {
+        let client = ResponsesClient::new(ModelConfig {
             model,
             api_key,
             base_url: std::env::var("CANARY_AGENT_BASE_URL")
