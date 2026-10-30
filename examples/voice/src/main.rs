@@ -66,24 +66,45 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let agent = Agent::new(
-        AgentConfig {
-        system_prompt:if is_live { concat!("You are a conversational voice actor. Delegate requests needing current facts, weather, stock prices, web search, files, code, or other tools to the worker using delegate, even while another task is running. ",
-            "The worker has tools; never claim you cannot look something up without asking it. Include relevant conversational details and clearly distinguish a new request from a refinement. ",
-            "For requests to stop or change worker work, send the request using delegate; a worker thread ID is not a cancel_operation ID. ",
-            "A delegate acceptance is not a result. Worker responses arrive later as user messages labeled Worker response; communicate them accurately. ",
-            "Keep listening while the worker runs. Call end_turn only when the user ends the conversation.").into() } else { concat!("You are a conversational voice assistant. Respond naturally in the user's language. ",
-            "Keep listening while tools work. A single answer is not the end of the interaction. ",
-            "Call end_turn only when the user explicitly ends the conversation. ",
-            "Use available tools for current facts and project inspection; do not invent tool results. ",
-            "If the user changes their mind, decide whether existing work should continue or use cancel_operation.").into() },
-        ..AgentConfig::default()
-        },
-        store.clone(),
-        Arc::new(QwenClient::new(config.model)),
-        if let Some(bridge) = &bridge { bridge.registry() } else { tools::registry(config.workspace) },
-        Arc::new(LocalSessionCoordinator::default())
-    ).with_shared_trace_collector(trace.clone());
+    let agent =
+        Agent::new(
+            AgentConfig {
+                system_prompt: if is_live {
+                    concat!(
+                    "You are a conversational voice actor. Delegate requests needing current ",
+                    "facts, weather, stock prices, web search, files, code, or other tools ",
+                    "to the worker using delegate, even while another task is running. ",
+                    "The worker has tools; never claim you cannot look something up without ",
+                    "asking it. Include relevant conversational details and clearly distinguish ",
+                    "a new request from a refinement. For requests to stop or change worker ",
+                    "work, send the request using delegate; a worker thread ID is not a ",
+                    "cancel_operation ID. A delegate acceptance is not a result. Worker ",
+                    "responses arrive later as user messages labeled Worker response; ",
+                    "communicate them accurately. Keep listening while the worker runs. ",
+                    "Call end_turn only when the user ends the conversation."
+                ).into()
+                } else {
+                    concat!(
+                    "You are a conversational voice assistant. Respond naturally in the user's ",
+                    "language. Keep listening while tools work. A single answer is not the end ",
+                    "of the interaction. Call end_turn only when the user explicitly ends the ",
+                    "conversation. Use available tools for current facts and project inspection; ",
+                    "do not invent tool results. If the user changes their mind, decide whether ",
+                    "existing work should continue or use cancel_operation."
+                ).into()
+                },
+                ..AgentConfig::default()
+            },
+            store.clone(),
+            Arc::new(QwenClient::new(config.model)),
+            if let Some(bridge) = &bridge {
+                bridge.registry()
+            } else {
+                tools::registry(config.workspace)
+            },
+            Arc::new(LocalSessionCoordinator::default()),
+        )
+        .with_shared_trace_collector(trace.clone());
     println!("thread: {}", config.thread_id);
     let recovering = store
         .load(&config.thread_id)

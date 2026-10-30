@@ -9,13 +9,80 @@ use canary_agent_runtime::{
     TurnEvent, TurnHandle,
 };
 use canary_agent_store_json::JsonFileThreadStore;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::sync::Mutex;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateRequest {
+    message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegation_arguments_are_strict_and_nonempty() {
+        assert_eq!(
+            DelegateRequest::parse(json!({"message": "search the web"}))
+                .unwrap()
+                .message,
+            "search the web"
+        );
+        for value in [
+            json!({}),
+            json!({"message": "  "}),
+            json!({"message": 1}),
+            json!({"message": "x", "tool": "exec_command"}),
+        ] {
+            assert!(DelegateRequest::parse(value).is_err());
+        }
+    }
+
+    #[test]
+    fn receipt_represents_acceptance_not_completion() {
+        let receipt = DelegateReceipt {
+            status: DelegateStatus::Accepted,
+            worker_thread: "worker-1".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap(),
+            json!({"status": "accepted", "worker_thread": "worker-1"})
+        );
+    }
+}
+
+impl DelegateRequest {
+    fn parse(value: Value) -> Result<Self> {
+        let request: Self = serde_json::from_value(value)
+            .map_err(|error| AgentError::Model(format!("invalid delegate arguments: {error}")))?;
+        if request.message.trim().is_empty() {
+            return Err(AgentError::Model(
+                "delegate message must not be empty".into(),
+            ));
+        }
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DelegateReceipt {
+    status: DelegateStatus,
+    worker_thread: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DelegateStatus {
+    Accepted,
+}
 
 #[derive(Clone)]
 pub struct Bridge {
@@ -49,15 +116,24 @@ impl Bridge {
                 .unwrap_or_else(|_| ModelConfig::default_reasoning_effort()),
         });
         let worker = Agent::new(
-            AgentConfig { system_prompt: "You are a worker agent assisting a voice actor. \
-            Execute delegated tasks using tools. Later inputs may be refinements or new requests; distinguish them from context. \
-            Tool acceptance is not completion; results arrive later. Do not issue sleep or polling commands to wait for tools. \
-            Return concise factual findings to the actor. Do not call end_turn unless explicitly asked to end the worker interaction.".into(),
-                ..AgentConfig::default() },
+            AgentConfig {
+                system_prompt: concat!(
+                    "You are a worker agent assisting a voice actor. ",
+                    "Execute delegated tasks using tools. Later inputs may be refinements ",
+                    "or new requests; distinguish them from context. Tool acceptance is ",
+                    "not completion; results arrive later. Do not issue sleep or polling ",
+                    "commands to wait for tools. Return concise factual findings to the ",
+                    "actor. Do not call end_turn unless asked to end the interaction."
+                )
+                .into(),
+                ..AgentConfig::default()
+            },
             store,
             Arc::new(client),
             tools::registry(workspace),
-            Arc::new(LocalSessionCoordinator::default())).with_shared_trace_collector(trace);
+            Arc::new(LocalSessionCoordinator::default()),
+        )
+        .with_shared_trace_collector(trace);
         Ok(Self {
             worker,
             thread_id: new_id("live_worker"),
@@ -74,15 +150,57 @@ impl Bridge {
     pub fn registry(&self) -> FunctionRegistry {
         let mut registry = FunctionRegistry::new();
         let bridge = self.clone();
-        registry.register(SimpleFunction::new(FunctionSpec {
-            name: "delegate".into(), description: "Send a task or refinement to the persistent worker. Acceptance is not completion; results arrive later.".into(),
-            parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
-        }, json!({"type":"object"}), FunctionLimits { time_budget: Duration::from_secs(30), max_output_bytes: 4096 }, FunctionRecoveryPolicy::NonIdempotent,
-        move |args: serde_json::Value, _: canary_agent_runtime::FunctionContext| { let bridge = bridge.clone(); async move {
-            let message = args.get("message").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).ok_or_else(|| AgentError::Model("delegate requires a nonempty message".into()))?;
-            bridge.submit(message).await?;
-            Ok(FunctionExecution::Completed { output: json!({"status":"accepted", "worker_thread":bridge.thread_id}) })
-        }}));
+        registry.register(SimpleFunction::new(
+            FunctionSpec {
+                name: "delegate".into(),
+                description: concat!(
+                    "Submit a task or refinement to the worker, including relevant context. ",
+                    "The worker chooses its tools. Acceptance is not completion; ",
+                    "worker responses arrive separately."
+                )
+                .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Task or refinement with the relevant user context."
+                        }
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+            },
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["accepted"]},
+                    "worker_thread": {"type": "string"}
+                },
+                "required": ["status", "worker_thread"],
+                "additionalProperties": false
+            }),
+            FunctionLimits {
+                time_budget: Duration::from_secs(30),
+                max_output_bytes: 4096,
+            },
+            FunctionRecoveryPolicy::NonIdempotent,
+            move |args: Value, _: canary_agent_runtime::FunctionContext| {
+                let bridge = bridge.clone();
+                async move {
+                    let request = DelegateRequest::parse(args)?;
+                    bridge.submit(&request.message).await?;
+                    let receipt = DelegateReceipt {
+                        status: DelegateStatus::Accepted,
+                        worker_thread: bridge.thread_id.clone(),
+                    };
+                    Ok(FunctionExecution::Completed {
+                        output: serde_json::to_value(receipt)?,
+                    })
+                }
+            },
+        ));
         registry
     }
 
