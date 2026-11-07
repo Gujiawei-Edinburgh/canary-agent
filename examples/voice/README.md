@@ -1,26 +1,22 @@
-# Qwen Voice Assistant
+# Voice Assistant
 
-## Live Actor And Worker
+## Architecture
 
-Run `cargo run -p voice --bin live` for a Qwen voice actor and a separate
-chat-completions worker. Configure Qwen as below and set `CANARY_AGENT_MODEL`,
-`CANARY_AGENT_API_KEY`, and `CANARY_AGENT_BASE_URL` for the worker. Optionally
-set `CANARY_AGENT_REASONING_EFFORT`.
+See [Voice Agent Architecture](doc/architecture.md) for the event-driven loop,
+its comparison with serialized ReAct, and provider support boundaries.
 
-The actor delegates tasks and refinements to one worker interaction. The
-worker owns the time, search, and sandboxed command tools; text-only worker
-responses are forwarded to the actor. Closing the voice interaction aborts
-the worker. Each run creates a separate worker thread.
-
-This experimental bridge does not retry delivery to a disconnected actor or
-recover the worker across application restarts. Acceptance means submission,
-not completion.
+Run `cargo run -p voice --bin live -- --p qwen` to add reasoning delegation to
+the same interaction. `delegate` makes one reasoning-model request and returns
+advice and proposed calls; it does not run a separate worker agent or execute
+those proposals. Domain tools remain directly available to the foreground model.
+Set `CANARY_AGENT_MODEL`, `CANARY_AGENT_API_KEY`, and `CANARY_AGENT_BASE_URL`
+for the reasoning model, optionally `CANARY_AGENT_REASONING_EFFORT`.
 
 A continuous audio example built on Canary. It uses the official DashScope Python
 SDK through a small IPC bridge; Qwen-specific code lives only in this example.
 
 ```text
-microphone -> Rust audio/AEC -> Canary -> Rust QwenClient
+microphone -> Rust audio/AEC -> Canary -> Rust BridgeClient
                                            | JSONL stdin/stdout
                                        Python worker -> DashScope SDK -> Qwen
 speaker <- Rust playback <------------------|
@@ -40,9 +36,9 @@ python3 -m venv examples/voice/.venv
 examples/voice/.venv/bin/python -m pip install -r examples/voice/python/requirements.txt
 export VOICE_PYTHON="$PWD/examples/voice/.venv/bin/python"
 
-cargo run -p voice -- --check-config
-cargo run -p voice -- --check-connection
-cargo run -p voice
+cargo run -p voice --bin voice -- --check-config
+cargo run -p voice --bin voice -- --check-connection
+cargo run -p voice --bin voice
 ```
 
 Fill in `examples/voice/.env` using `.env.example`. Existing environment variables
@@ -56,8 +52,13 @@ Defaults: `REAL_TIME_MODEL=qwen3.8-omni-flash-realtime`,
 present, otherwise `python3`; `VOICE_PYTHON` overrides this choice.
 Use your workspace-specific Qwen endpoint. HTTP bases ending in
 `/compatible-mode/v1` are normalized to `wss://.../api-ws/v1/realtime`.
-The SDK appends the model query itself. This demo is Qwen-only;
-`REAL_TIME_PROTOCOL` can be `qwen` or omitted.
+The SDK appends the model query itself. Select Qwen with `--p qwen` (the default).
+
+For MOSS audio conversation, set `MOSS_API_KEY`, install
+`python/requirements-moss.txt` into the same Python environment, and use
+`cargo run -p voice --bin voice -- --p moss`. Its adapter does not currently
+support Canary custom tools or typed input; live mode requires tool calling.
+See the architecture document for the capability boundary.
 
 ## Interaction
 
