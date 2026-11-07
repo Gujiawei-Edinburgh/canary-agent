@@ -27,6 +27,7 @@ class Worker:
         self.answered = set()
         self.items = {}
         self.arguments = {}
+        self.argument_deltas = {}
         self.text = {}
         self.speaking = False
         self.awaiting_vad = False
@@ -125,6 +126,9 @@ class Worker:
                 key = (event["response_id"], event["item_id"])
                 self.text[key] = self.text.get(key, "") + event["delta"]
                 self.emit({"type": "text_delta", "response_id": key[0], "item_id": key[1], "text": event["delta"]})
+        elif kind == "response.function_call_arguments.delta":
+            key = (event["response_id"], event["item_id"])
+            self.argument_deltas.setdefault(key, []).append(event.get("delta", ""))
         elif kind == "response.function_call_arguments.done":
             self.arguments[(event["response_id"], event["item_id"])] = event
         elif kind == "response.output_item.done":
@@ -136,6 +140,7 @@ class Worker:
         response = event["response"]
         response_id = response["id"]
         items = self.items.pop(response_id, {})
+        completed_items = dict(items)
         for item in response.get("output", []):
             items[item["id"]] = item
         status = response.get("status")
@@ -144,11 +149,33 @@ class Worker:
             for item_id, item in items.items():
                 calls = []
                 if item["type"] == "function_call":
-                    full = self.arguments.get((response_id, item_id), item)
-                    args = json.loads(full["arguments"])
-                    if not isinstance(args, dict):
-                        raise ValueError("function arguments must be a JSON object")
-                    calls.append({"call_id": full["call_id"], "name": full["name"], "arguments": args})
+                    full = self.arguments.get((response_id, item_id), {})
+                    prior = completed_items.get(item_id, {})
+                    call_id = full.get("call_id") or item.get("call_id") or prior.get("call_id")
+                    name = full.get("name") or item.get("name") or prior.get("name")
+                    if not call_id or not name or any(
+                        candidate.get(field) not in (None, expected)
+                        for candidate in (full, item, prior)
+                        for field, expected in (("call_id", call_id), ("name", name))
+                    ):
+                        raise ValueError(f"function call identity missing or inconsistent: response={response_id}, item={item_id}")
+                    candidates = [full.get("arguments"), prior.get("arguments"),
+                                  item.get("arguments"), "".join(self.argument_deltas.get((response_id, item_id), []))]
+                    args = None
+                    for candidate in candidates:
+                        if not isinstance(candidate, str) or not candidate:
+                            continue
+                        try:
+                            parsed = json.loads(candidate)
+                            if isinstance(parsed, dict):
+                                args = parsed
+                                break
+                        except json.JSONDecodeError:
+                            continue
+                    if args is None:
+                        lengths = [len(value) if isinstance(value, str) else None for value in candidates]
+                        raise ValueError(f"invalid function arguments: response={response_id}, item={item_id}, call={call_id}, name={name}, candidate_lengths={lengths}")
+                    calls.append({"call_id": call_id, "name": name, "arguments": args})
                 text = "".join(p.get("transcript", p.get("text", "")) for p in item.get("content", []))
                 text = text or self.text.get((response_id, item_id))
                 completed.append({"type": "item_completed", "response_id": response_id,
@@ -170,6 +197,7 @@ class Worker:
             self.emit({"type": "response_finished", "response_id": response_id,
                        "status": normalized, "error": json.dumps(response.get("status_details"))})
         self.arguments = {key: value for key, value in self.arguments.items() if key[0] != response_id}
+        self.argument_deltas = {key: value for key, value in self.argument_deltas.items() if key[0] != response_id}
         self.text = {key: value for key, value in self.text.items() if key[0] != response_id}
         self.continue_if_idle()
 

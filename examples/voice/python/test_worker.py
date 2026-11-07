@@ -115,6 +115,35 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.sdk.calls.count("response"), 1)
         self.assertEqual(sum("item" in call for call in self.sdk.calls if isinstance(call, dict)), 1)
 
+    def test_partial_done_uses_valid_delta_arguments(self):
+        self.response()
+        self.event("response.function_call_arguments.delta", response_id="response", item_id="tool", delta='{"cmd":')
+        self.event("response.function_call_arguments.delta", response_id="response", item_id="tool", delta='"ls"}')
+        self.event("response.function_call_arguments.done", response_id="response", item_id="tool",
+                   call_id="call", name="exec_command", arguments='{"cmd":"')
+        item = {"id": "tool", "type": "function_call", "call_id": "call", "name": "exec_command", "arguments": '{"cmd":"'}
+        self.event("response.done", response={"id": "response", "status": "completed", "output": [item]})
+        call = next(e for e in self.events if e["type"] == "item_completed")["function_calls"][0]
+        self.assertEqual(call["arguments"], {"cmd": "ls"})
+
+    def test_partial_terminal_uses_completed_item(self):
+        self.response()
+        item = {"id": "tool", "type": "function_call", "call_id": "call", "name": "exec_command", "arguments": '{"cmd":"ls"}'}
+        self.event("response.output_item.done", response_id="response", item=item)
+        self.event("response.done", response={"id": "response", "status": "completed", "output": [{**item, "arguments": '{"cmd":"'}]})
+        call = next(e for e in self.events if e["type"] == "item_completed")["function_calls"][0]
+        self.assertEqual(call["arguments"], {"cmd": "ls"})
+
+    def test_invalid_arguments_never_dispatch_and_report_metadata(self):
+        self.response()
+        item = {"id": "tool", "type": "function_call", "call_id": "call", "name": "exec_command", "arguments": '{"cmd":"'}
+        self.event("response.done", response={"id": "response", "status": "completed", "output": [item]})
+        self.assertFalse(any(e["type"] == "item_completed" for e in self.events))
+        error = next(e["message"] for e in self.events if e["type"] == "error")
+        self.assertIn("candidate_lengths", error)
+        self.assertIn("call=call", error)
+        self.assertNotIn('{"cmd"', error)
+
     def test_interruption_discards_calls_and_preserves_usage(self):
         self.response()
         self.event("input_audio_buffer.speech_started", item_id="interrupt")
