@@ -1,6 +1,7 @@
 """Offline process fixture for the Rust IPC test; does not import DashScope."""
 import json
 import sys
+from bridge_protocol import ready
 
 
 def emit(kind, **fields):
@@ -9,7 +10,7 @@ def emit(kind, **fields):
 
 config = json.loads(sys.stdin.readline())
 assert config["type"] == "connect"
-emit("ready")
+print(json.dumps(ready("qwen", 24000, playback_feedback=False, tool_calls=True, text_input=True)), flush=True)
 for line in sys.stdin:
     command = json.loads(line)
     if command["type"] == "audio":

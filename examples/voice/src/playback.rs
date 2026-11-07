@@ -38,6 +38,13 @@ impl PlaybackResponses {
             self.closed.insert(id);
         }
     }
+
+    pub fn stop(&mut self, id: &str) {
+        self.closed.insert(id.into());
+        if self.current.as_deref() == Some(id) {
+            self.current = None;
+        }
+    }
 }
 
 #[cfg(test)]

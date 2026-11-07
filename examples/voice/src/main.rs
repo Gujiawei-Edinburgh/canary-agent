@@ -1,9 +1,11 @@
 mod audio;
+mod bridge;
 mod config;
 mod connection_check;
+mod feedback;
 mod live;
+mod model_bridge;
 mod playback;
-mod qwen;
 mod tools;
 
 use audio::AudioDevices;
@@ -15,7 +17,7 @@ use canary_agent_runtime::{
 };
 use canary_agent_store_json::JsonFileThreadStore;
 use config::VoiceConfig;
-use qwen::QwenClient;
+use model_bridge::BridgeClient;
 use std::{
     io::{self, BufRead, Write},
     sync::Arc,
@@ -27,24 +29,35 @@ async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "usage: cargo run -p voice -- [--check-config | --check-connection]\nLoads examples/voice/.env. Continuous microphone input; /mute, /unmute, /reconnect, /quit. Ctrl+C exits."
+            "usage: cargo run -p voice --bin voice -- [--p qwen|moss] [--check-config | --check-connection]\nLoads examples/voice/.env. Continuous microphone input; /mute, /unmute, /reconnect, /quit. Ctrl+C exits."
         );
         return Ok(());
     }
-    if args.len() > 1
-        || args
-            .iter()
-            .any(|arg| arg != "--check-config" && arg != "--check-connection" && arg != "--live")
-    {
-        return Err(AgentError::Model("unknown argument; use --help".into()));
+    let mut provider = "qwen";
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--p" => {
+                index += 1;
+                provider = args
+                    .get(index)
+                    .ok_or_else(|| AgentError::Model("--p requires qwen or moss".into()))?;
+                if !matches!(provider, "qwen" | "moss") {
+                    return Err(AgentError::Model("--p requires qwen or moss".into()));
+                }
+            }
+            "--check-config" | "--check-connection" | "--live" => {}
+            _ => return Err(AgentError::Model("unknown argument; use --help".into())),
+        }
+        index += 1;
     }
-    let config = VoiceConfig::load()?;
+    let config = VoiceConfig::load(provider)?;
     if args.iter().any(|arg| arg == "--check-connection") {
         return connection_check::check(config).await;
     }
     if args.iter().any(|arg| arg == "--check-config") {
         println!(
-            "configuration valid: Qwen Python SDK; model={}, voice={}, input={} Hz, output=24000 Hz",
+            "configuration valid: provider={provider}, model={}, voice={}, input={} Hz",
             config.model.model,
             config.model.voice,
             config.model.input_format().sample_rate
@@ -56,6 +69,7 @@ async fn main() -> Result<()> {
     let store = Arc::new(JsonFileThreadStore::open(&config.state_dir)?);
     let trace = Arc::new(JsonlTraceCollector::new(&config.state_dir)?);
     let input_format = config.model.input_format();
+    let (model, playback_events) = BridgeClient::new(config.model).with_playback();
     let is_live = env!("CARGO_BIN_NAME") == "live" || std::env::args().any(|arg| arg == "--live");
     let registry = if is_live {
         live::registry(config.workspace)?
@@ -94,7 +108,7 @@ async fn main() -> Result<()> {
             ..AgentConfig::default()
         },
         store.clone(),
-        Arc::new(QwenClient::new(config.model)),
+        Arc::new(model),
         registry,
         Arc::new(LocalSessionCoordinator::default()),
     )
@@ -124,7 +138,7 @@ async fn main() -> Result<()> {
             )
             .await?
     };
-    let result = interact(turn, input_format).await;
+    let result = interact(turn, input_format, playback_events, is_live).await;
     trace.flush().await;
     if let Ok(thread) = store.load(&config.thread_id).await {
         println!("\nthread token usage: {}", thread.token_usage);
@@ -132,7 +146,12 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioFormat) -> Result<()> {
+async fn interact(
+    mut turn: RunningTurn,
+    format: canary_agent_runtime::AudioFormat,
+    mut playback_events: feedback::Events,
+    requires_tools: bool,
+) -> Result<()> {
     let handle = turn.handle();
     let result = async {
         let mut audio = AudioDevices::open(format)?;
@@ -152,14 +171,70 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
         let mut ready = false;
         let mut muted = false;
         let mut stdin_open = true;
+        let mut text_input = false;
+        let mut tracked_audio = false;
+        let mut playback_events_open = true;
         println!("Connecting. Echo cancellation is active. Speak after [listening].");
         loop {
+            send_feedback(&audio).await;
+            let deadline = audio.feedback_deadline();
+            let feedback_changed = audio.feedback_changed.clone();
             tokio::select! {
+                // Drain already-received media before logical completion can
+                // close the interaction, but always give user abort priority.
+                biased;
                 signal = tokio::signal::ctrl_c() => {
                     signal?;
+                    audio.interrupt(); send_feedback(&audio).await;
                     handle.abort();
                     break;
                 }
+                _ = feedback_changed.notified() => {},
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
+                event = playback_events.recv(), if playback_events_open => match event {
+                    Some(feedback::Event::Ready { connection_id, provider, tool_calls, text_input: supported }) => {
+                        audio.interrupt(); playback.interrupt(); text_input = supported;
+                        println!("[playback connected] {connection_id}");
+                        println!("[bridge capabilities] provider={provider}, custom_tools={tool_calls}, text_input={supported}");
+                        if !tool_calls {
+                            eprintln!("[warning] This bridge does not register Canary tools. Project files, exec_command, web_search, and delegate are unavailable. Any tools mentioned in speech are not evidence of Canary tool access.");
+                            if requires_tools {
+                                return Err(AgentError::Model("live mode requires custom tool calling; this bridge only supports audio conversation. Use a tool-capable provider such as --p qwen".into()));
+                            }
+                        }
+                    }
+                    Some(feedback::Event::Audio { response_id, chunk_id, chunk, target }) => {
+                        if !chunk.data.is_empty() {
+                            match playback.audio(&response_id) {
+                                playback::AudioDecision::Replace => {
+                                    audio.interrupt();
+                                    tracked_audio = target.is_some();
+                                    audio.enqueue(chunk, target.map(|t| (chunk_id, t)))?;
+                                }
+                                playback::AudioDecision::Append => audio.enqueue(chunk, target.map(|t| (chunk_id, t)))?,
+                                playback::AudioDecision::Ignore => {},
+                            }
+                        }
+                    }
+                    Some(feedback::Event::Interrupt) => { playback.interrupt(); audio.interrupt(); }
+                    Some(feedback::Event::Stop { response_id, target }) => { playback.stop(&response_id); audio.stop_target(&target); }
+                    Some(feedback::Event::AudioDone { target }) => { audio.audio_done(target)?; }
+                    Some(feedback::Event::Finished { response_id, status }) => {
+                        if playback.finish(&response_id) {
+                            if !matches!(status, canary_agent_runtime::ModelResponseStatus::Completed) {
+                                audio.interrupt();
+                            } else if !tracked_audio {
+                                audio.finish_response()?;
+                            }
+                        }
+                    }
+                    None => playback_events_open = false,
+                },
                 changed = audio.errors.changed() => {
                     if changed.is_ok() && let Some(error) = audio.errors.borrow().clone() {
                         return Err(AgentError::Model(error));
@@ -168,12 +243,14 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
                 line = lines.recv(), if stdin_open => {
                     match line {
                         Some(Ok(line)) => match line.trim() {
-                            "/quit" => { handle.abort(); break; }
+                            "/quit" => { audio.interrupt(); send_feedback(&audio).await; handle.abort(); break; }
                             "/mute" => { muted = true; let _ = enabled.send(if ready { MicrophoneMode::Muted } else { MicrophoneMode::Off }); println!("\n[muted]"); }
                             "/unmute" => { muted = false; let _ = enabled.send(if ready { MicrophoneMode::Live } else { MicrophoneMode::Off }); println!("\n[listening]"); }
                             "/reconnect" => match handle.reconnect_model().await { Ok(()) => println!("\n[reconnecting]"), Err(error) => eprintln!("{error}") },
                             "" => {},
-                            text => if let Err(error) = handle.append_input(text).await { eprintln!("{error}"); },
+                            text => if !text_input {
+                                eprintln!("This bridge does not support typed input.");
+                            } else if let Err(error) = handle.append_input(text).await { eprintln!("{error}"); },
                         },
                         Some(Err(error)) => return Err(error.into()),
                         None => stdin_open = false,
@@ -182,27 +259,9 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
                 event = turn.next_event() => match event {
                     Ok(canary_agent_runtime::TurnEvent::SessionReady { .. }) => { ready = true; let _ = enabled.send(if muted { MicrophoneMode::Muted } else { MicrophoneMode::Live }); println!("[listening]"); }
                     Ok(canary_agent_runtime::TurnEvent::Session { event, .. }) => match event {
-                        ModelSessionEvent::AudioDelta { response_id, chunk, .. } => {
-                            if !chunk.data.is_empty() {
-                                match playback.audio(&response_id) {
-                                    playback::AudioDecision::Replace => { audio.interrupt(); audio.enqueue(chunk)?; }
-                                    playback::AudioDecision::Append => audio.enqueue(chunk)?,
-                                    playback::AudioDecision::Ignore => {},
-                                }
-                            }
-                        }
-                        ModelSessionEvent::InputStarted { .. } => { playback.interrupt(); audio.interrupt(); println!("\n[user speaking]"); }
+                        ModelSessionEvent::InputStarted { .. } => { println!("\n[user speaking]"); }
                         ModelSessionEvent::TranscriptFinalized { text, .. } => println!("\nuser: {text}"),
                         ModelSessionEvent::TextDelta { text, .. } => { print!("{text}"); io::stdout().flush()?; }
-                        ModelSessionEvent::ResponseFinished { response_id, status } => {
-                            if playback.finish(&response_id) {
-                                if matches!(status, canary_agent_runtime::ModelResponseStatus::Completed) {
-                                    audio.finish_response()?;
-                                } else {
-                                    audio.interrupt();
-                                }
-                            }
-                        }
                         _ => {},
                     },
                     Ok(canary_agent_runtime::TurnEvent::Suspended { suspension }) => { ready = false; let _ = enabled.send(MicrophoneMode::Off); playback.interrupt(); audio.interrupt(); println!("\n[connection suspended] {}\nUse /reconnect or Ctrl+C.",suspension.payload); }
@@ -219,6 +278,7 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
                             _ = audio.wait_drained() => {},
                             signal = tokio::signal::ctrl_c() => { signal?; audio.interrupt(); },
                         }
+                        send_feedback(&audio).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -238,6 +298,16 @@ async fn interact(mut turn: RunningTurn, format: canary_agent_runtime::AudioForm
     match outcome {
         canary_agent_runtime::TurnOutcome::Failed { error } => Err(AgentError::Model(error)),
         _ => Ok(()),
+    }
+}
+
+async fn send_feedback(audio: &AudioDevices) {
+    for delivery in audio.feedback() {
+        if let Err(error) = delivery.send().await {
+            // A disconnected session cannot receive acknowledgments. Never
+            // redirect these to a replacement connection.
+            eprintln!("[playback feedback unavailable] {error}");
+        }
     }
 }
 

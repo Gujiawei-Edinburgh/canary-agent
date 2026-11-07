@@ -4,11 +4,17 @@ import logging
 import sys
 import threading
 
+from bridge_protocol import ready
+
 
 def sdk_conversation(config, callback):
     from dashscope.audio.qwen_omni import OmniRealtimeConversation
+    from urllib.parse import urlsplit, urlunsplit
+    endpoint = urlsplit(config["endpoint"])
+    if endpoint.path.rstrip("/") in ("", "/v1", "/compatible-mode/v1"):
+        endpoint = endpoint._replace(path="/api-ws/v1/realtime")
     return OmniRealtimeConversation(
-        model=config["model"], url=config["endpoint"],
+        model=config["model"], url=urlunsplit(endpoint),
         api_key=config["api_key"], callback=callback,
     )
 
@@ -91,7 +97,8 @@ class Worker:
         if kind == "session.updated":
             if not self.ready.is_set():
                 self.ready.set()
-                self.emit({"type": "ready"})
+                self.emit(ready("qwen", 24000, playback_feedback=False,
+                                tool_calls=True, text_input=True))
         elif kind == "input_audio_buffer.speech_started":
             self.speaking = True
             self.awaiting_vad = True
@@ -213,6 +220,9 @@ class Worker:
             kind = command["type"]
             if kind == "audio":
                 self.conversation.append_audio(command["audio"])
+            elif kind in ("playback_chunk_completed", "playback_completed", "playback_stopped"):
+                # Qwen exposes no documented playback acknowledgment in this adapter.
+                pass
             elif kind == "text":
                 # Already journaled by Canary. Do not echo it as a transcript.
                 self.conversation.create_item({

@@ -58,7 +58,9 @@ class WorkerTests(unittest.TestCase):
         self.event("response.created", response={"id": "response"})
 
     def test_start_restores_context_but_does_not_request_inference(self):
-        self.assertEqual(self.events, [{"type": "ready"}])
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]["type"], "ready")
+        self.assertFalse(self.events[0]["capabilities"]["playback_feedback"])
         self.assertNotIn("response", self.sdk.calls)
         self.assertIn("Historical conversation", self.sdk.calls[1]["update"]["instructions"])
 
@@ -69,7 +71,14 @@ class WorkerTests(unittest.TestCase):
                       "content": [{"type": "input_text", "text": "hello"}]}},
             "response",
         ])
-        self.assertEqual(self.events, [{"type": "ready"}])
+        self.assertEqual(len(self.events), 1)
+        self.assertEqual(self.events[0]["type"], "ready")
+
+    def test_playback_feedback_is_a_noop(self):
+        before = list(self.sdk.calls)
+        for kind in ("playback_chunk_completed", "playback_completed", "playback_stopped"):
+            self.worker.command({"type": kind})
+        self.assertEqual(self.sdk.calls, before)
 
     def test_text_during_response_is_delivered_without_cancellation(self):
         self.response()
