@@ -5,12 +5,13 @@
 See [Voice Agent Architecture](doc/architecture.md) for the event-driven loop,
 its comparison with serialized ReAct, and provider support boundaries.
 
-Run `cargo run -p voice --bin live -- --p qwen` to add reasoning delegation to
-the same interaction. `delegate` makes one reasoning-model request and returns
+Run `cargo run -p voice -- --p qwen`. The single voice agent includes reasoning
+delegation alongside its domain tools. `delegate` makes one reasoning-model request and returns
 advice and proposed calls; it does not run a separate worker agent or execute
 those proposals. Domain tools remain directly available to the foreground model.
-Set `CANARY_AGENT_MODEL`, `CANARY_AGENT_API_KEY`, and `CANARY_AGENT_BASE_URL`
-for the reasoning model, optionally `CANARY_AGENT_REASONING_EFFORT`.
+Set `CANARY_AGENT_MODEL` and `CANARY_AGENT_API_KEY` for the reasoning model.
+Optionally set `CANARY_AGENT_BASE_URL` and `CANARY_AGENT_REASONING_EFFORT`.
+There is no separate `live` binary or `--live` mode.
 
 A continuous audio example built on Canary. It uses the official DashScope Python
 SDK through a small IPC bridge; Qwen-specific code lives only in this example.
@@ -46,7 +47,12 @@ take precedence. `--check-config` only validates local settings.
 `--check-connection` starts the Python SDK and configures the remote session
 without opening audio devices or requesting inference.
 
-Required settings: `REAL_TIME_ENDPOINT` and `REAL_TIME_API_KEY`.
+Required Qwen settings: `REAL_TIME_ENDPOINT` and `REAL_TIME_API_KEY`.
+The unified tool registry also requires `CANARY_AGENT_MODEL` and
+`CANARY_AGENT_API_KEY`; missing reasoning configuration fails before audio opens.
+`--check-config` validates these settings and lists configured tools, including
+`delegate`. `--check-connection` submits the same prompt and tool schemas as the
+normal application, but does not test reasoning-model inference or tool execution.
 Defaults: `REAL_TIME_MODEL=qwen3.8-omni-flash-realtime`,
 `REAL_TIME_VOICE=Tina`. Python defaults to the example's `.venv/bin/python` when
 present, otherwise `python3`; `VOICE_PYTHON` overrides this choice.
@@ -57,7 +63,8 @@ The SDK appends the model query itself. Select Qwen with `--p qwen` (the default
 For MOSS audio conversation, set `MOSS_API_KEY`, install
 `python/requirements-moss.txt` into the same Python environment, and use
 `cargo run -p voice --bin voice -- --p moss`. Its adapter does not currently
-support Canary custom tools or typed input; live mode requires tool calling.
+support Canary custom tools or typed input. Configuring `delegate` locally does
+not make it usable through that adapter; startup warns about this limitation.
 See the architecture document for the capability boundary.
 
 ## Interaction

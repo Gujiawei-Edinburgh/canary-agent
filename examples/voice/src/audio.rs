@@ -198,7 +198,7 @@ impl AudioDevices {
             .playback
             .lock()
             .map_err(|_| audio_error("playback queue poisoned"))?;
-        if queue.samples.len() + output.len() > self.output_rate as usize * 30 {
+        if queue.samples.len() + output.len() > self.output_rate as usize * 300 {
             return Err(audio_error(
                 "playback exceeded the example's 30-second buffer",
             ));

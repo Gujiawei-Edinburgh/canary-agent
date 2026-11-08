@@ -12,9 +12,9 @@ Two choices define the design:
    foreground model using the same interaction history, without creating a
    second autonomous conversation or tool loop.
 
-The `voice` binary exposes domain tools directly. The `live` binary, or `--live`,
-adds the `delegate` tool for more demanding reasoning. Delegation is optional;
-ordinary tools do not have to pass through it.
+The single `voice` binary registers domain tools and `delegate` together, using
+one prompt. Calling delegation is optional; ordinary tools do not have to pass
+through it. There is no separate voice/live mode.
 
 ## From Serialized ReAct To An Event Loop
 
@@ -197,7 +197,7 @@ Current adapter support is deliberately distinguished from the architecture:
 MOSS's advertised tool capabilities do not establish a public registration
 contract for Canary tools. The current MOSS demo cannot perform project
 inspection through `exec_command` or reasoning through `delegate`. Startup
-reports this limitation; live mode requires a tool-capable adapter. Offline
+reports this limitation; using the configured tools requires a tool-capable adapter. Offline
 tests are not a guarantee of live-provider behavior.
 
 ## Lifecycle And Limits
@@ -219,7 +219,7 @@ normal completion.
 ## Code Map
 
 - [Application and audio event handling](../src/main.rs)
-- [Single-request reasoning delegation](../src/live.rs)
+- [Single-request reasoning delegation](../src/delegation.rs)
 - [Provider-neutral Rust IPC client](../src/model_bridge.rs)
 - [Audio processing and playback](../src/audio.rs)
 - [Playback feedback accounting](../src/feedback.rs)

@@ -1,9 +1,9 @@
-use crate::{config::VoiceConfig, feedback, model_bridge::BridgeClient, tools};
-use canary_agent_kernel::{ModelRequest, Thread};
+use crate::{SYSTEM_PROMPT, config::VoiceConfig, feedback, model_bridge::BridgeClient};
+use canary_agent_kernel::{ChatMessage, ModelRequest, Thread};
+use canary_agent_runtime::FunctionSpec;
 use canary_agent_runtime::{ModelClient, ModelSessionCommand, ModelSessionConfig, Result};
 
-pub async fn check(config: VoiceConfig) -> Result<()> {
-    let functions = tools::registry(config.workspace).specs();
+pub async fn check(config: VoiceConfig, functions: Vec<FunctionSpec>) -> Result<()> {
     println!(
         "Checking realtime bridge session: model={}, voice={}, tool schemas={}. No audio or inference.",
         config.model.model,
@@ -16,7 +16,9 @@ pub async fn check(config: VoiceConfig) -> Result<()> {
             connection_id: "connection_check".into(),
             turn_id: "connection_check".into(),
             request: ModelRequest {
-                messages: vec![],
+                messages: vec![ChatMessage::System {
+                    content: SYSTEM_PROMPT.into(),
+                }],
                 functions,
             },
             history: Thread::new("connection_check"),

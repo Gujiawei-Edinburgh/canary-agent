@@ -1,4 +1,4 @@
-//! Single-shot reasoning delegation for the voice interaction.
+//! Reasoning delegation as an ordinary asynchronous voice tool.
 use crate::tools;
 use canary_agent_kernel::{ChatMessage, ModelRequest, ModelResponse};
 use canary_agent_openai::{ModelConfig, ResponsesClient};
@@ -39,18 +39,29 @@ fn registry_with_model(workspace: PathBuf, model: Arc<dyn ModelClient>) -> Funct
         FunctionSpec {
             name: "delegate".into(),
             description: concat!(
-                "Ask a reasoning model for advice and proposed tool calls. ",
-                "It does not execute tools. Consider its result alongside newer inputs " ,
-                "and decide which available tools to call."
+                "Consult a reasoning model asynchronously for difficult analysis, investigation ",
+                "planning, or synthesis. Prefer this for unfamiliar repository architecture, ",
+                "cross-file debugging, complex code changes, and design tradeoffs. Use it to ",
+                "plan evidence gathering or analyze actual tool results. For simple explanations ",
+                "or obvious actions such as listing a directory, answer or call a domain tool ",
+                "directly instead. The reasoner automatically receives an interaction snapshot ",
+                "and returns text plus proposed calls; it does not execute tools, inspect files, ",
+                "or create artifacts. Review its advice against newer inputs, execute useful ",
+                "proposals yourself, and continue the task. Acceptance is not completion."
             ).into(),
             parameters: json!({"type":"object", "properties": {
                 "message": {"type":"string", "minLength":1,
-                    "description":"The task or question to reason about."}
+                    "description": concat!(
+                        "The current objective, relevant refinements and constraints, and the ",
+                        "specific planning, analysis, or synthesis needed. The interaction ",
+                        "history is supplied automatically; do not repeat it. Request evidence ",
+                        "gathering proposals when facts are missing, not unverified conclusions."
+                    )}
             }, "required":["message"], "additionalProperties":false}),
         },
         json!({"type":"object", "properties": {
-            "text": {"type": ["string", "null"]},
-            "proposals": {"type":"array", "items": {"type":"object", "properties": {
+            "text": {"type": ["string", "null"], "description":"Advice or analysis, not proof that any proposed work ran."},
+            "proposals": {"type":"array", "description":"Suggested calls for the foreground model to review and execute; none have run.", "items": {"type":"object", "properties": {
                 "name": {"type":"string"}, "arguments": {"type":"object"}
             }, "required": ["name", "arguments"], "additionalProperties":false}}
         }, "required":["text", "proposals"], "additionalProperties":false}),

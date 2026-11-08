@@ -2,8 +2,8 @@ mod audio;
 mod bridge;
 mod config;
 mod connection_check;
+mod delegation;
 mod feedback;
-mod live;
 mod model_bridge;
 mod playback;
 mod tools;
@@ -23,6 +23,8 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{mpsc, watch};
+
+const SYSTEM_PROMPT: &str = include_str!("../prompts/voice.md");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,14 +48,20 @@ async fn main() -> Result<()> {
                     return Err(AgentError::Model("--p requires qwen or moss".into()));
                 }
             }
-            "--check-config" | "--check-connection" | "--live" => {}
+            "--check-config" | "--check-connection" => {}
             _ => return Err(AgentError::Model("unknown argument; use --help".into())),
         }
         index += 1;
     }
     let config = VoiceConfig::load(provider)?;
+    let registry = delegation::registry(config.workspace.clone())?;
+    let functions = registry.specs();
+    let function_names: Vec<_> = functions
+        .iter()
+        .map(|function| function.name.clone())
+        .collect();
     if args.iter().any(|arg| arg == "--check-connection") {
-        return connection_check::check(config).await;
+        return connection_check::check(config, functions).await;
     }
     if args.iter().any(|arg| arg == "--check-config") {
         println!(
@@ -62,6 +70,7 @@ async fn main() -> Result<()> {
             config.model.voice,
             config.model.input_format().sample_rate
         );
+        println!("configured tools: {}", function_names.join(", "));
         return Ok(());
     }
     let _logging =
@@ -70,41 +79,9 @@ async fn main() -> Result<()> {
     let trace = Arc::new(JsonlTraceCollector::new(&config.state_dir)?);
     let input_format = config.model.input_format();
     let (model, playback_events) = BridgeClient::new(config.model).with_playback();
-    let is_live = env!("CARGO_BIN_NAME") == "live" || std::env::args().any(|arg| arg == "--live");
-    let registry = if is_live {
-        live::registry(config.workspace)?
-    } else {
-        tools::registry(config.workspace)
-    };
     let agent = Agent::new(
         AgentConfig {
-            system_prompt: if is_live {
-                concat!(
-                    "You are a conversational voice actor. Delegate requests needing current ",
-                    "facts, weather, stock prices, web search, files, code, or other tools ",
-                    "to the reasoning model using delegate for complex multi-step planning, ",
-                    "code analysis, or difficult decisions. Its output is advice ",
-                    "and proposed calls, not executed tools or verified results. Review it ",
-                    "alongside newer inputs and call the available tools yourself. A spoken ",
-                    "promise is not a tool call; never claim work is done without a result. ",
-                    "Use cancel_operation for obsolete active operations. Keep track of ",
-                    "unfinished tasks and their actual tool outcomes; a brief unrelated ",
-                    "question does not cancel them. After answering, resume the task unless ",
-                    "the user asks to stop or change it. Keep listening. ",
-                    "Call end_turn only when the user ends the conversation."
-                )
-                .into()
-            } else {
-                concat!(
-                    "You are a conversational voice assistant. Respond naturally in the user's ",
-                    "language. Keep listening while tools work. A single answer is not the end ",
-                    "of the interaction. Call end_turn only when the user explicitly ends the ",
-                    "conversation. Use available tools for current facts and project inspection; ",
-                    "do not invent tool results. If the user changes their mind, decide whether ",
-                    "existing work should continue or use cancel_operation."
-                )
-                .into()
-            },
+            system_prompt: SYSTEM_PROMPT.into(),
             ..AgentConfig::default()
         },
         store.clone(),
@@ -114,6 +91,7 @@ async fn main() -> Result<()> {
     )
     .with_shared_trace_collector(trace.clone());
     println!("thread: {}", config.thread_id);
+    println!("configured tools: {}", function_names.join(", "));
     let recovering = store
         .load(&config.thread_id)
         .await
@@ -133,12 +111,12 @@ async fn main() -> Result<()> {
         agent
             .open_stream_turn(
                 &config.thread_id,
-                serde_json::json!({"application":"voice"}),
+                serde_json::json!({"application":"voice", "configured_tools":function_names}),
                 TurnConfig::default(),
             )
             .await?
     };
-    let result = interact(turn, input_format, playback_events, is_live).await;
+    let result = interact(turn, input_format, playback_events).await;
     trace.flush().await;
     if let Ok(thread) = store.load(&config.thread_id).await {
         println!("\nthread token usage: {}", thread.token_usage);
@@ -150,7 +128,6 @@ async fn interact(
     mut turn: RunningTurn,
     format: canary_agent_runtime::AudioFormat,
     mut playback_events: feedback::Events,
-    requires_tools: bool,
 ) -> Result<()> {
     let handle = turn.handle();
     let result = async {
@@ -203,9 +180,6 @@ async fn interact(
                         println!("[bridge capabilities] provider={provider}, custom_tools={tool_calls}, text_input={supported}");
                         if !tool_calls {
                             eprintln!("[warning] This bridge does not register Canary tools. Project files, exec_command, web_search, and delegate are unavailable. Any tools mentioned in speech are not evidence of Canary tool access.");
-                            if requires_tools {
-                                return Err(AgentError::Model("live mode requires custom tool calling; this bridge only supports audio conversation. Use a tool-capable provider such as --p qwen".into()));
-                            }
                         }
                     }
                     Some(feedback::Event::Audio { response_id, chunk_id, chunk, target }) => {
