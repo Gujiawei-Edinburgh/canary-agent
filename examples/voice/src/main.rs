@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "usage: cargo run -p voice --bin voice -- [--p qwen|moss] [--check-config | --check-connection]\nLoads examples/voice/.env. Continuous microphone input; /mute, /unmute, /reconnect, /quit. Ctrl+C exits."
+            "usage: cargo run -p voice --bin voice -- [--p qwen|moss] [--check-config | --check-connection]\nLoads examples/voice/.env. Continuous microphone input; /mute, /unmute, /stop, /reconnect, /quit. Ctrl+C exits."
         );
         return Ok(());
     }
@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
         index += 1;
     }
     let config = VoiceConfig::load(provider)?;
-    let registry = delegation::registry(config.workspace.clone())?;
+    let playback_control = audio::PlaybackControl::default();
+    let mut registry = delegation::registry(config.workspace.clone())?;
+    playback::register_tools(&mut registry, playback_control.clone());
     let functions = registry.specs();
     let function_names: Vec<_> = functions
         .iter()
@@ -116,7 +118,7 @@ async fn main() -> Result<()> {
             )
             .await?
     };
-    let result = interact(turn, input_format, playback_events).await;
+    let result = interact(turn, input_format, playback_events, playback_control).await;
     trace.flush().await;
     if let Ok(thread) = store.load(&config.thread_id).await {
         println!("\nthread token usage: {}", thread.token_usage);
@@ -128,11 +130,11 @@ async fn interact(
     mut turn: RunningTurn,
     format: canary_agent_runtime::AudioFormat,
     mut playback_events: feedback::Events,
+    playback_control: audio::PlaybackControl,
 ) -> Result<()> {
     let handle = turn.handle();
     let result = async {
-        let mut audio = AudioDevices::open(format)?;
-        let mut playback = playback::PlaybackResponses::default();
+        let mut audio = AudioDevices::open(format, playback_control)?;
         let (enabled, input_enabled) = watch::channel(MicrophoneMode::Off);
         let _microphone = forward_microphone(
             audio.microphone.take().expect("microphone receiver"),
@@ -149,7 +151,6 @@ async fn interact(
         let mut muted = false;
         let mut stdin_open = true;
         let mut text_input = false;
-        let mut tracked_audio = false;
         let mut playback_events_open = true;
         println!("Connecting. Echo cancellation is active. Speak after [listening].");
         loop {
@@ -175,7 +176,7 @@ async fn interact(
                 } => {},
                 event = playback_events.recv(), if playback_events_open => match event {
                     Some(feedback::Event::Ready { connection_id, provider, tool_calls, text_input: supported }) => {
-                        audio.interrupt(); playback.interrupt(); text_input = supported;
+                        audio.connect(&connection_id); text_input = supported;
                         println!("[playback connected] {connection_id}");
                         println!("[bridge capabilities] provider={provider}, custom_tools={tool_calls}, text_input={supported}");
                         if !tool_calls {
@@ -184,28 +185,14 @@ async fn interact(
                     }
                     Some(feedback::Event::Audio { response_id, chunk_id, chunk, target }) => {
                         if !chunk.data.is_empty() {
-                            match playback.audio(&response_id) {
-                                playback::AudioDecision::Replace => {
-                                    audio.interrupt();
-                                    tracked_audio = target.is_some();
-                                    audio.enqueue(chunk, target.map(|t| (chunk_id, t)))?;
-                                }
-                                playback::AudioDecision::Append => audio.enqueue(chunk, target.map(|t| (chunk_id, t)))?,
-                                playback::AudioDecision::Ignore => {},
-                            }
+                            audio.enqueue(&response_id, chunk, target.map(|target| audio::Tracking { chunk_id, target }))?;
                         }
                     }
-                    Some(feedback::Event::Interrupt) => { playback.interrupt(); audio.interrupt(); }
-                    Some(feedback::Event::Stop { response_id, target }) => { playback.stop(&response_id); audio.stop_target(&target); }
+                    Some(feedback::Event::Stop { response_id, target }) => { audio.stop_target(&response_id, &target); }
+                    Some(feedback::Event::TextDelta { response_id, text }) => { audio.text_delta(&response_id, &text); }
                     Some(feedback::Event::AudioDone { target }) => { audio.audio_done(target)?; }
-                    Some(feedback::Event::Finished { response_id, status }) => {
-                        if playback.finish(&response_id) {
-                            if !matches!(status, canary_agent_runtime::ModelResponseStatus::Completed) {
-                                audio.interrupt();
-                            } else if !tracked_audio {
-                                audio.finish_response()?;
-                            }
-                        }
+                    Some(feedback::Event::Finished { response_id, .. }) => {
+                        audio.finish_response(&response_id)?;
                     }
                     None => playback_events_open = false,
                 },
@@ -218,6 +205,7 @@ async fn interact(
                     match line {
                         Some(Ok(line)) => match line.trim() {
                             "/quit" => { audio.interrupt(); send_feedback(&audio).await; handle.abort(); break; }
+                            "/stop" => { audio.interrupt(); send_feedback(&audio).await; println!("\n[playback stopped]"); }
                             "/mute" => { muted = true; let _ = enabled.send(if ready { MicrophoneMode::Muted } else { MicrophoneMode::Off }); println!("\n[muted]"); }
                             "/unmute" => { muted = false; let _ = enabled.send(if ready { MicrophoneMode::Live } else { MicrophoneMode::Off }); println!("\n[listening]"); }
                             "/reconnect" => match handle.reconnect_model().await { Ok(()) => println!("\n[reconnecting]"), Err(error) => eprintln!("{error}") },
@@ -238,7 +226,7 @@ async fn interact(
                         ModelSessionEvent::TextDelta { text, .. } => { print!("{text}"); io::stdout().flush()?; }
                         _ => {},
                     },
-                    Ok(canary_agent_runtime::TurnEvent::Suspended { suspension }) => { ready = false; let _ = enabled.send(MicrophoneMode::Off); playback.interrupt(); audio.interrupt(); println!("\n[connection suspended] {}\nUse /reconnect or Ctrl+C.",suspension.payload); }
+                    Ok(canary_agent_runtime::TurnEvent::Suspended { suspension }) => { ready = false; let _ = enabled.send(MicrophoneMode::Off); audio.interrupt(); println!("\n[connection suspended] {}\nUse /reconnect or Ctrl+C.",suspension.payload); }
                     Ok(canary_agent_runtime::TurnEvent::ItemCommitted { item }) => match item.kind {
                         TurnItemKind::ToolAccepted { name,operation_id,.. } => println!("\n[tool] {name}: {operation_id}"),
                         TurnItemKind::ToolCompleted { name,.. } => println!("\n[tool completed] {name}"),

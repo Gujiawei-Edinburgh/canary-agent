@@ -1,7 +1,7 @@
 //! Local playback accounting. Device timestamps estimate delivery to the DAC,
 //! not whether a person heard the sound. Never acknowledge network receipt.
 use crate::bridge::{BridgeSender, PlaybackFeedback};
-use canary_agent_runtime::{AudioChunk, ModelResponseStatus, Result};
+use canary_agent_runtime::{AudioChunk, Result};
 use std::{
     collections::VecDeque,
     sync::Arc,
@@ -27,7 +27,7 @@ impl Target {
             self.turn_id.clone(),
         )
     }
-    fn same_response(&self, other: &Self) -> bool {
+    pub(crate) fn same_response(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.writer, &other.writer)
             && self.run_id == other.run_id
             && self.turn_id == other.turn_id
@@ -58,7 +58,10 @@ pub enum Event {
         chunk: AudioChunk,
         target: Option<Target>,
     },
-    Interrupt,
+    TextDelta {
+        response_id: String,
+        text: String,
+    },
     Stop {
         response_id: String,
         target: Target,
@@ -68,7 +71,6 @@ pub enum Event {
     },
     Finished {
         response_id: String,
-        status: ModelResponseStatus,
     },
 }
 

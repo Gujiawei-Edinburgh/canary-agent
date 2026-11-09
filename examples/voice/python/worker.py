@@ -28,7 +28,7 @@ class Worker:
         self.closing = False
         self.ending = False
         self.active = set()
-        self.interrupted = set()
+        self.finished = set()
         self.waiting = set()
         self.answered = set()
         self.items = {}
@@ -103,10 +103,6 @@ class Worker:
             self.speaking = True
             self.awaiting_vad = True
             self.emit({"type": "input_started", "item_id": event["item_id"]})
-            for response in self.active - self.interrupted:
-                self.interrupted.add(response)
-                self.emit({"type": "response_finished", "response_id": response,
-                           "status": "interrupted", "error": "new speech"})
         elif kind == "input_audio_buffer.speech_stopped":
             self.emit({"type": "input_ended", "item_id": event["item_id"]})
         elif kind == "input_audio_buffer.committed":
@@ -125,11 +121,11 @@ class Worker:
             self.needs_response = False
             self.emit({"type": "response_started", "response_id": response})
         elif kind in ("response.audio.delta", "response.output_audio.delta"):
-            if event["response_id"] not in self.interrupted:
+            if event["response_id"] in self.active:
                 self.emit({"type": "audio_delta", "response_id": event["response_id"],
                            "item_id": event["item_id"], "audio": event["delta"]})
         elif kind in ("response.audio_transcript.delta", "response.text.delta"):
-            if event["response_id"] not in self.interrupted:
+            if event["response_id"] in self.active:
                 key = (event["response_id"], event["item_id"])
                 self.text[key] = self.text.get(key, "") + event["delta"]
                 self.emit({"type": "text_delta", "response_id": key[0], "item_id": key[1], "text": event["delta"]})
@@ -146,12 +142,14 @@ class Worker:
     def finish_response(self, event):
         response = event["response"]
         response_id = response["id"]
+        if response_id in self.finished:
+            return
         items = self.items.pop(response_id, {})
         completed_items = dict(items)
         for item in response.get("output", []):
             items[item["id"]] = item
         status = response.get("status")
-        if status == "completed" and response_id not in self.interrupted:
+        if status == "completed":
             completed = []
             for item_id, item in items.items():
                 calls = []
@@ -199,10 +197,10 @@ class Worker:
                        "output_tokens": outgoing, "cached_input_tokens": cached,
                        "total_tokens": usage.get("total_tokens", incoming + outgoing)}})
         self.active.discard(response_id)
-        if response_id not in self.interrupted:
-            normalized = "completed" if status == "completed" else "interrupted" if status in ("cancelled", "canceled") else "failed"
-            self.emit({"type": "response_finished", "response_id": response_id,
-                       "status": normalized, "error": json.dumps(response.get("status_details"))})
+        self.finished.add(response_id)
+        normalized = "completed" if status == "completed" else "interrupted" if status in ("cancelled", "canceled") else "failed"
+        self.emit({"type": "response_finished", "response_id": response_id,
+                   "status": normalized, "error": json.dumps(response.get("status_details"))})
         self.arguments = {key: value for key, value in self.arguments.items() if key[0] != response_id}
         self.argument_deltas = {key: value for key, value in self.argument_deltas.items() if key[0] != response_id}
         self.text = {key: value for key, value in self.text.items() if key[0] != response_id}

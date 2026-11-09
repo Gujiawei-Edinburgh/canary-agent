@@ -71,13 +71,21 @@ See the architecture document for the capability boundary.
 
 Grant microphone access to your terminal on macOS. Speak after `[listening]`.
 The microphone stays active during speech and tools. Server VAD detects speech
-boundaries; new speech clears buffered playback. Tools continue unless cancelled.
+boundaries. New speech does not automatically clear buffered playback. Tools
+continue unless cancelled.
 
-Playback uses a latest-audio-response-wins policy: the first audio chunk from a
-new response clears the previous response's queued audio and resampler state.
-Late audio and completion events from superseded responses are ignored. Text-only
-or tool-only responses do not replace playback. This switches speech when new
-audio arrives, not immediately when a typed observation is submitted.
+Playback queues responses in arrival order without replacing older audio. The
+model can call `get_playback_state` for playback IDs, generated-text previews,
+and estimated cursors, then `stop_playback({"playback_id":"..."})` to discard one
+specific response. Late chunks for that stopped response are ignored; other
+responses remain queued. State queries are ordinary journaled tool calls, not
+continuous feedback or native Qwen audio-history truncation.
+
+Explicit provider playback-stop events still apply. Qwen can interrupt server
+generation independently; preserving locally received audio does not prevent
+that service-side behavior. Model-directed stopping has inference latency. Audio
+already submitted to the device cannot be recalled; cursor values are estimates,
+not proof of which words a person heard.
 
 AEC3 uses actual speaker output as an echo reference, processing 10 ms frames at
 48 kHz. Input is resampled to Qwen's mono 16 kHz PCM16; output is 24 kHz PCM16.
@@ -92,6 +100,8 @@ depends on the selected model. Text is not echoed as a second input transcript.
 Local commands:
 
 - `/mute`, `/unmute`: microphone forwarding.
+- `/stop`: immediately discard current and queued local playback, without
+  cancelling model generation or other operations.
 - `/reconnect`: open a new SDK session after a failure.
 - `/quit` or Ctrl+C: abort the interaction and its tools.
 
@@ -103,7 +113,8 @@ Late results from an old session update context rather than using old call IDs.
 
 ## Tools And State
 
-The demo registers current time and sandboxed `exec_command`. Set `EXA_API_KEY`
+The demo registers delegation, playback observation/control, current time, and
+sandboxed `exec_command`. Set `EXA_API_KEY`
 for `web_search`. `VOICE_WORKSPACE` defaults to the current directory; sandbox
 escalation is denied. `VOICE_THREAD_ID` reuses a thread.
 Logs, traces, and thread JSON live in `.canary-agent-voice/` unless

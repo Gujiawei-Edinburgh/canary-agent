@@ -180,10 +180,22 @@ tool-call exchange as native protocol messages to another model provider.
 - **Realtime service:** continuous model session and provider-specific speech
   boundaries, generation, and interruption behavior.
 
-Playback is separate from generation. Replacing speech clears local queued
-audio; generating a chunk does not establish that it was played. Playback
-feedback uses device timing estimates and remains tied to its original
-connection. It does not prove that a person heard the sound.
+Playback is separate from generation. Audio is queued FIFO across responses;
+new input and new responses do not implicitly discard it. The application tools
+`get_playback_state` and `stop_playback` let the model observe estimated cursors
+and stop a specific, connection-scoped playback ID. Generated-text previews
+help identify the response but do not establish which words were played.
+
+Those observations are ordinary tool results in the shared journal, not a
+continuous high-rate cursor stream. Native MOSS playback feedback still uses its
+provider protocol; Qwen's feedback remains a no-op and does not truncate its
+server-side history. Explicit provider playback-stop events are honored. The
+local `/stop` command and caller abort remain immediate, independently of model
+inference. Model generation can still be interrupted by the service itself.
+
+Playback feedback uses device timing estimates and remains tied to its original
+connection. Audio already submitted to the device cannot be recalled. Neither
+generation nor a cursor estimate proves that a person heard the sound.
 
 Current adapter support is deliberately distinguished from the architecture:
 
@@ -222,6 +234,7 @@ normal completion.
 - [Single-request reasoning delegation](../src/delegation.rs)
 - [Provider-neutral Rust IPC client](../src/model_bridge.rs)
 - [Audio processing and playback](../src/audio.rs)
+- [FIFO playback engine](../src/audio/playback.rs) and [playback tools](../src/playback.rs)
 - [Playback feedback accounting](../src/feedback.rs)
 - [Qwen adapter](../python/worker.py) and [MOSS adapter](../python/moss_bridge.py)
 - [Runtime coordinator](../../../canary-agent-runtime/src/turn/runner.rs)

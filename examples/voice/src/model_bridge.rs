@@ -387,10 +387,7 @@ impl ModelSessionReceiver for Receiver {
                         ));
                     }
                     Event::Error { message } => return Err(AgentError::Model(message)),
-                    Event::InputStarted { item_id } => {
-                        self.emit(feedback::Event::Interrupt);
-                        ModelSessionEvent::InputStarted { item_id }
-                    }
+                    Event::InputStarted { item_id } => ModelSessionEvent::InputStarted { item_id },
                     Event::InputEnded { item_id } => ModelSessionEvent::InputEnded { item_id },
                     Event::InputCommitted { item_id } => {
                         ModelSessionEvent::InputCommitted { item_id }
@@ -405,11 +402,17 @@ impl ModelSessionReceiver for Receiver {
                         response_id,
                         item_id,
                         text,
-                    } => ModelSessionEvent::TextDelta {
-                        response_id,
-                        item_id,
-                        text,
-                    },
+                    } => {
+                        self.emit(feedback::Event::TextDelta {
+                            response_id: response_id.clone(),
+                            text: text.clone(),
+                        });
+                        ModelSessionEvent::TextDelta {
+                            response_id,
+                            item_id,
+                            text,
+                        }
+                    }
                     Event::AudioDelta {
                         response_id,
                         item_id,
@@ -475,7 +478,6 @@ impl ModelSessionReceiver for Receiver {
                         };
                         self.emit(feedback::Event::Finished {
                             response_id: response_id.clone(),
-                            status: status.clone(),
                         });
                         ModelSessionEvent::ResponseFinished {
                             response_id,

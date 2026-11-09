@@ -162,6 +162,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(sum(e["type"] == "response_finished" for e in self.events), 1)
         self.assertEqual(next(e for e in self.events if e["type"] == "usage")["usage"]["total_tokens"], 7)
 
+    def test_new_speech_does_not_infer_cancellation_or_discard_output(self):
+        self.response()
+        self.event("input_audio_buffer.speech_started", item_id="next-utterance")
+        self.assertFalse(any(e["type"] == "response_finished" for e in self.events))
+        self.event("response.audio.delta", response_id="response", item_id="audio", delta="AAA=")
+        self.assertEqual(sum(e["type"] == "audio_delta" for e in self.events), 1)
+        self.event("response.done", response={"id": "response", "status": "completed"})
+        self.assertEqual(next(e for e in self.events if e["type"] == "response_finished")["status"], "completed")
+        self.event("response.audio.delta", response_id="response", item_id="audio", delta="AAA=")
+        self.assertEqual(sum(e["type"] == "audio_delta" for e in self.events), 1)
+
     def test_old_result_updates_context_without_reusing_call_id(self):
         self.worker.command({"type": "tool_result", "call_id": "old", "name": "exec_command", "result": {"output": {"stdout": "files"}}})
         self.assertNotIn("response", self.sdk.calls)
