@@ -17,9 +17,6 @@ pub struct TraceEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEventKind {
-    InteractionItem {
-        item: canary_agent_kernel::TurnItem,
-    },
     UserInput {
         text: String,
         response_to: Option<String>,

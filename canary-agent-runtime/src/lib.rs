@@ -1,20 +1,18 @@
-pub mod agent;
+pub mod agent_loop;
 pub mod context;
 pub mod error;
 pub mod functions;
 pub mod metrics;
 pub mod model;
-pub mod model_session;
 pub mod session;
+pub mod steering;
 pub mod store;
 pub mod trace;
-pub mod turn;
-pub use turn::{RunningTurn, TurnConfig, TurnEvent, TurnHandle};
 
-pub use agent::{
+pub use agent_loop::{
     turn_abort_pair, Agent, AgentConfig, FunctionCallHook, FunctionCallHookContext,
-    FunctionCallHookResult, FunctionHookEvent, FunctionHookEventHandler, FunctionHookPhase,
-    TurnAbortHandle, TurnAbortSignal, TurnExecutionLimits, TurnOutcome,
+    FunctionCallHookResult, FunctionHookEvent, FunctionHookPhase, TurnAbortHandle, TurnAbortSignal,
+    TurnExecutionLimits, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 pub use context::{
     ApproximateTokenEstimator, CompactingContextBuilder, CompactionInput, ContextBuildInput,
@@ -34,11 +32,7 @@ pub use model::{
     FunctionSpec, ModelClient, ModelContinuation, ModelDescriptor, ModelFunctionCall, ModelRequest,
     ModelResponse, ModelStreamEvent,
 };
-pub use model_session::{
-    AudioChunk, AudioEncoding, AudioFormat, ModelInput, ModelInteraction, ModelResponseStatus,
-    ModelSession, ModelSessionCommand, ModelSessionConfig, ModelSessionEvent, ModelSessionFuture,
-    ModelSessionReceiver, ModelSessionSender,
-};
 pub use session::{LeaseFence, LocalSessionCoordinator, SessionCoordinator, SessionLease};
+pub use steering::SteeringReceipt;
 pub use store::{ThreadContextCache, ThreadStore};
 pub use trace::{NoopTraceCollector, TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus};

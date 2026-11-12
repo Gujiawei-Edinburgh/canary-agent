@@ -1,4 +1,4 @@
-use crate::agent::TurnAbortSignal;
+use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
 use crate::model::FunctionSpec;
 use canary_agent_kernel::events::Suspension;

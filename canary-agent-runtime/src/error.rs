@@ -5,8 +5,6 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error("turn execution error: {0}")]
-    TurnExecution(String),
     #[error("thread not found: {0}")]
     ThreadNotFound(String),
 
@@ -49,6 +47,15 @@ pub enum AgentError {
 
     #[error("thread already has an active turn: {0}")]
     TurnAlreadyActive(String),
+
+    #[error("turn no longer accepts steering input")]
+    SteeringClosed,
+
+    #[error("steering input queue is full (capacity {capacity})")]
+    SteeringQueueFull { capacity: usize },
+
+    #[error("recording of steering input {input_id} was not confirmed: {reason}")]
+    SteeringInputUnconfirmed { input_id: String, reason: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
